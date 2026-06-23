@@ -942,8 +942,13 @@ final class FocusBrowserViewModel: ObservableObject {
     private var playerStateObservationTask: Task<Void, Never>?
     private var embeddedPlayerDetectionTask: Task<Void, Never>?
     private var pageAugmentationTask: Task<Void, Never>?
+    private var nativeVideoLoadingMaskTask: Task<Void, Never>?
+    private var nativeVideoPlaceholderTask: Task<Void, Never>?
     private var pageAugmentationRevision = 0
     private var pageAugmentCache: [String: FocusNativePageAugmentPayload] = [:]
+    private var scheduledPageAugmentationKey: String?
+    private var pageAugmentationFailureCounts: [String: Int] = [:]
+    private var pageAugmentationRetryAfter: [String: Date] = [:]
     private var appBackStack: [URL] = []
     private var pendingAppBackTarget: URL?
     private var isHandlingAppBackNavigation = false
@@ -1299,8 +1304,13 @@ final class FocusBrowserViewModel: ObservableObject {
             isLoadingPage = false
             hasActiveVideoRoute = true
             schedulePageAugmentationRefresh()
+            if let resolvedURL {
+                installNativeVideoOriginalSectionSuppression(for: resolvedURL)
+            }
             startPlayerStateObservation()
         } else {
+            nativeVideoLoadingMaskTask?.cancel()
+            nativeVideoLoadingMaskTask = nil
             resetPlayerState()
         }
 
@@ -1332,77 +1342,10 @@ final class FocusBrowserViewModel: ObservableObject {
                 updateNavigationMetadata(for: targetURL)
             }
         }
-        if let targetURL, nativePageKind(for: targetURL) != nil {
-            webView?.evaluateJavaScript("""
-        (() => {
-          const id = 'focus-native-video-loading-mask';
-          if (window.__FOCUS_CLEAR_VIDEO_LOADING_MASK__) {
-            try {
-              window.__FOCUS_CLEAR_VIDEO_LOADING_MASK__(true);
-            } catch (_) {}
-          }
-          let mask = document.getElementById(id);
-          if (!mask) {
-            mask = document.createElement('div');
-            mask.id = id;
-            (document.body || document.documentElement).appendChild(mask);
-          }
-          mask.style.position = 'fixed';
-          mask.style.left = '0';
-          mask.style.right = '0';
-          mask.style.top = 'calc(100vw / 1.5 + 88px)';
-          mask.style.bottom = '0';
-          mask.style.background = document.documentElement.getAttribute('data-focus-theme') === 'dark' ? '#0F1115' : '#F6F7FA';
-          mask.style.pointerEvents = 'none';
-          mask.style.zIndex = '20';
-          mask.style.opacity = '1';
-
-          if (window.__FOCUS_LOADING_MASK_OBSERVER__) {
-            try {
-              window.__FOCUS_LOADING_MASK_OBSERVER__.disconnect();
-            } catch (_) {}
-          }
-
-          const clearMask = () => {
-            const current = document.getElementById(id);
-            if (!current) return;
-            current.style.transition = 'opacity 0.18s ease';
-            current.style.opacity = '0';
-            setTimeout(() => current.remove?.(), 220);
-            if (window.__FOCUS_LOADING_MASK_OBSERVER__) {
-              try {
-                window.__FOCUS_LOADING_MASK_OBSERVER__.disconnect();
-              } catch (_) {}
-              window.__FOCUS_LOADING_MASK_OBSERVER__ = null;
-            }
-          };
-          window.__FOCUS_CLEAR_VIDEO_LOADING_MASK__ = clearMask;
-
-          const isPlayerReady = () => {
-            const playerShell = document.querySelector('#playerWrap, .player-wrap, #bilibili-player, .bpx-player-container, .player-container, .bpx-player-video-wrap');
-            const video = Array.from(document.querySelectorAll('video')).find((node) => {
-              const rect = node.getBoundingClientRect?.();
-              return !!rect && rect.width > 120 && rect.height > 68;
-            });
-            return !!playerShell && !!video;
-          };
-
-          if (isPlayerReady()) {
-            clearMask();
-            return;
-          }
-
-          const observer = new MutationObserver(() => {
-            if (isPlayerReady()) {
-              clearMask();
-            }
-          });
-          observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
-          window.__FOCUS_LOADING_MASK_OBSERVER__ = observer;
-
-          setTimeout(clearMask, 3200);
-        })();
-        """, completionHandler: nil)
+        nativeVideoLoadingMaskTask?.cancel()
+        nativeVideoLoadingMaskTask = nil
+        if let targetURL, FocusUserAgent.shouldUseDesktopPlayback(for: targetURL) {
+            dismissNativeVideoPlaceholder(for: targetURL)
         }
         isLoadingPage = true
         debugLog(
@@ -1420,6 +1363,8 @@ final class FocusBrowserViewModel: ObservableObject {
             pendingURL = FocusNavigationPolicy.canonicalWebURL(for: failingURL)
             updateNavigationMetadata(for: pendingURL)
         }
+        nativeVideoLoadingMaskTask?.cancel()
+        nativeVideoLoadingMaskTask = nil
         isLoadingPage = false
         lastIssuedLoadURL = nil
         debugLog(
@@ -1744,26 +1689,40 @@ final class FocusBrowserViewModel: ObservableObject {
                 window.__FOCUS_ACTIVE_VIDEO__ = video;
               }
 
-              if (document.fullscreenElement && typeof document.exitFullscreen === 'function') {
-                try {
-                  document.exitFullscreen();
-                } catch (_) {}
-              }
+              let exited = false;
+              const isNativeFullscreen = !!video && (
+                video.webkitDisplayingFullscreen === true
+                || video.webkitPresentationMode === 'fullscreen'
+              );
 
-              if (video && typeof video.webkitExitFullscreen === 'function') {
-                try {
-                  video.webkitExitFullscreen();
-                } catch (_) {}
-              }
-
-              if (video && typeof video.webkitSetPresentationMode === 'function') {
+              if (isNativeFullscreen && video && typeof video.webkitSetPresentationMode === 'function') {
                 try {
                   video.webkitSetPresentationMode('inline');
+                  exited = true;
                 } catch (_) {}
               }
 
-              const exitButton = document.querySelector('.bpx-player-ctrl-web, .bpx-player-ctrl-full, [class*="web-fullscreen"], [class*="exit-fullscreen"]');
-              exitButton?.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+              if (!exited && isNativeFullscreen && video && typeof video.webkitExitFullscreen === 'function') {
+                try {
+                  video.webkitExitFullscreen();
+                  exited = true;
+                } catch (_) {}
+              }
+
+              if (!exited && document.fullscreenElement && typeof document.exitFullscreen === 'function') {
+                try {
+                  document.exitFullscreen();
+                  exited = true;
+                } catch (_) {}
+              }
+
+              if (!exited) {
+                const exitButton = document.querySelector('.bpx-player-ctrl-web, .bpx-player-ctrl-full, [class*="web-fullscreen"], [class*="exit-fullscreen"]');
+                if (exitButton) {
+                  exitButton.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                  exited = true;
+                }
+              }
 
               if (shouldResumePlayback && video && !video.ended) {
                 const resume = () => {
@@ -1795,15 +1754,15 @@ final class FocusBrowserViewModel: ObservableObject {
                 }, 520);
               }
 
-              return true;
+              return exited;
             })();
             """
         )
     }
 
     @MainActor
-    private func enterLandscapeFullscreen(for orientation: UIDeviceOrientation) {
-        let targetMask: UIInterfaceOrientationMask = orientation == .landscapeRight ? .landscapeRight : .landscapeLeft
+    private func enterLandscapeFullscreen() {
+        let targetMask: UIInterfaceOrientationMask = .landscape
         let requiresNativeRotation = requestedInterfaceOrientationMask != targetMask
 
         if requiresNativeRotation {
@@ -1826,18 +1785,31 @@ final class FocusBrowserViewModel: ObservableObject {
 
     @MainActor
     private func exitLandscapeFullscreen() {
+        let needsPortraitRestore = requestedInterfaceOrientationMask != .portrait
+        let needsFullscreenExit = isImmersiveVideo
+        guard needsFullscreenExit || needsPortraitRestore else {
+            return
+        }
+
         fullscreenTransitionTask?.cancel()
-        if isImmersiveVideo {
-            exitFullscreen()
+        if needsPortraitRestore {
+            requestedInterfaceOrientationMask = .portrait
+            updateSupportedOrientations(to: .portrait)
+        }
+
+        guard needsFullscreenExit else {
+            return
         }
 
         fullscreenTransitionTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 120_000_000)
+            let delay: UInt64 = needsPortraitRestore ? 40_000_000 : 0
+            try? await Task.sleep(nanoseconds: delay)
             guard let self, !Task.isCancelled else {
                 return
             }
-            self.requestedInterfaceOrientationMask = .portrait
-            self.updateSupportedOrientations(to: .portrait)
+            if self.isImmersiveVideo {
+                self.exitFullscreen()
+            }
         }
     }
 
@@ -1845,33 +1817,24 @@ final class FocusBrowserViewModel: ObservableObject {
     private func updateSupportedOrientations(to mask: UIInterfaceOrientationMask) {
         AppDelegate.orientationLock = mask
 
-        guard let windowScene = activeWindowScene else {
-            UIViewController.attemptRotationToDeviceOrientation()
+        guard let rootViewController = activeRootViewController else {
             return
         }
 
-        windowScene.windows.first(where: \.isKeyWindow)?.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
-        windowScene.requestGeometryUpdate(.iOS(interfaceOrientations: mask)) { [weak self] error in
-            guard let self else {
-                return
-            }
-            debugLog(
-                "orientation.geometryUpdate.error",
-                fields: debugStateFields([
-                    "mask": "\(mask.rawValue)",
-                    "error": String(describing: error)
-                ])
-            )
-        }
-        UIViewController.attemptRotationToDeviceOrientation()
+        rootViewController.setNeedsUpdateOfSupportedInterfaceOrientations()
+        rootViewController.navigationController?.setNeedsUpdateOfSupportedInterfaceOrientations()
+        rootViewController.presentedViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
     }
 
-    private var activeWindowScene: UIWindowScene? {
-        UIApplication.shared.connectedScenes
+    private var activeRootViewController: UIViewController? {
+        let activeWindowScene = UIApplication.shared.connectedScenes
             .compactMap { $0 as? UIWindowScene }
             .first { scene in
                 scene.activationState == .foregroundActive
             }
+        return activeWindowScene?
+            .windows.first(where: \.isKeyWindow)?
+            .rootViewController
     }
 
     func toggleSubtitles() {
@@ -1953,7 +1916,7 @@ final class FocusBrowserViewModel: ObservableObject {
         switch orientation {
         case .landscapeLeft, .landscapeRight:
             if !isImmersiveVideo {
-                enterLandscapeFullscreen(for: orientation)
+                enterLandscapeFullscreen()
             }
         case .portrait:
             exitLandscapeFullscreen()
@@ -2494,10 +2457,15 @@ final class FocusBrowserViewModel: ObservableObject {
     }
 
     private func resetPlayerState() {
+        if let currentURL = currentURL ?? pendingURL, FocusUserAgent.shouldUseDesktopPlayback(for: currentURL) {
+            clearNativeVideoOriginalSectionSuppression(for: FocusNavigationPolicy.canonicalWebURL(for: currentURL))
+        }
         playerStateObservationTask?.cancel()
         playerStateObservationTask = nil
         embeddedPlayerDetectionTask?.cancel()
         embeddedPlayerDetectionTask = nil
+        nativeVideoLoadingMaskTask?.cancel()
+        nativeVideoLoadingMaskTask = nil
         pendingOrientationSyncAfterPlayerReady = false
         orientationDebounceTask?.cancel()
         orientationDebounceTask = nil
@@ -2529,6 +2497,13 @@ final class FocusBrowserViewModel: ObservableObject {
         pageAugmentationRevision &+= 1
         pageAugmentationTask?.cancel()
         pageAugmentationTask = nil
+        nativeVideoLoadingMaskTask?.cancel()
+        nativeVideoLoadingMaskTask = nil
+        nativeVideoPlaceholderTask?.cancel()
+        nativeVideoPlaceholderTask = nil
+        scheduledPageAugmentationKey = nil
+        pageAugmentationFailureCounts.removeAll()
+        pageAugmentationRetryAfter.removeAll()
     }
 
     private func loadURLIfNeeded(_ url: URL, on webView: WKWebView, reason: String, force: Bool = false) {
@@ -2587,16 +2562,47 @@ final class FocusBrowserViewModel: ObservableObject {
         }
 
         let canonicalURL = FocusNavigationPolicy.canonicalWebURL(for: activeURL)
-        if kind == .video {
-            installNativeVideoPlaceholder(for: canonicalURL)
+        let scheduleKey = "\(revisionKeyPrefix(for: kind, url: canonicalURL))::rev=\(pageAugmentationRevision)"
+        if let retryAfter = pageAugmentationRetryAfter[scheduleKey], retryAfter > Date() {
+            debugLog(
+                "nativePageAugmentation.skipRetryCooldown",
+                fields: debugStateFields([
+                    "pageKind": kind.rawValue,
+                    "pageURL": canonicalURL.absoluteString,
+                    "retryAfter": ISO8601DateFormatter().string(from: retryAfter)
+                ])
+            )
+            return
         }
+        pageAugmentationRetryAfter[scheduleKey] = nil
+        if scheduledPageAugmentationKey == scheduleKey {
+            debugLog(
+                "nativePageAugmentation.skipDuplicateSchedule",
+                fields: debugStateFields([
+                    "pageKind": kind.rawValue,
+                    "pageURL": canonicalURL.absoluteString
+                ])
+            )
+            return
+        }
+        scheduledPageAugmentationKey = scheduleKey
         let cacheKey = kind.cacheKey(for: canonicalURL)
         let revision = pageAugmentationRevision
 
         if let cachedPayload = pageAugmentCache[cacheKey] {
+            nativeVideoLoadingMaskTask?.cancel()
+            nativeVideoLoadingMaskTask = nil
+            nativeVideoPlaceholderTask?.cancel()
+            nativeVideoPlaceholderTask = nil
+            pageAugmentationFailureCounts[scheduleKey] = nil
+            pageAugmentationRetryAfter[scheduleKey] = nil
             syncNativeVideoMetadata(from: cachedPayload)
             applyPageAugmentation(cachedPayload, for: canonicalURL, revision: revision)
             return
+        }
+
+        if kind == .video && (pageAugmentationFailureCounts[scheduleKey] ?? 0) < 3 {
+            scheduleNativeVideoPlaceholderInstall(for: canonicalURL, revision: revision)
         }
 
         pageAugmentationTask?.cancel()
@@ -2616,13 +2622,27 @@ final class FocusBrowserViewModel: ObservableObject {
                         return
                     }
 
+                    let failureCount = (self.pageAugmentationFailureCounts[scheduleKey] ?? 0) + 1
+                    self.pageAugmentationFailureCounts[scheduleKey] = failureCount
+                    let retryDelay = min(3.0, pow(2.0, Double(max(failureCount - 1, 0))) * 0.35)
+                    self.pageAugmentationRetryAfter[scheduleKey] = Date().addingTimeInterval(retryDelay)
+                    self.scheduledPageAugmentationKey = nil
                     self.debugLog(
                         "nativePageAugmentation.missingPayload",
                         fields: self.debugStateFields([
                             "pageKind": kind.rawValue,
-                            "pageURL": canonicalURL.absoluteString
+                            "pageURL": canonicalURL.absoluteString,
+                            "failures": String(failureCount),
+                            "retryDelayMS": String(Int(retryDelay * 1000))
                         ])
                     )
+
+                    if kind == .video, failureCount >= 3 {
+                        self.nativeVideoPlaceholderTask?.cancel()
+                        self.nativeVideoPlaceholderTask = nil
+                        self.clearNativeVideoOriginalSectionSuppression(for: canonicalURL)
+                        self.dismissNativeVideoPlaceholder(for: canonicalURL)
+                    }
                 }
                 return
             }
@@ -2632,6 +2652,12 @@ final class FocusBrowserViewModel: ObservableObject {
                     return
                 }
 
+                self.nativeVideoLoadingMaskTask?.cancel()
+                self.nativeVideoLoadingMaskTask = nil
+                self.nativeVideoPlaceholderTask?.cancel()
+                self.nativeVideoPlaceholderTask = nil
+                self.pageAugmentationFailureCounts[scheduleKey] = nil
+                self.pageAugmentationRetryAfter[scheduleKey] = nil
                 self.pageAugmentCache[cacheKey] = payload
                 self.syncNativeVideoMetadata(from: payload)
                 print("[Focus Native Augment] loaded kind=\(payload.kind.rawValue) summary=\(payload.summary) url=\(canonicalURL.absoluteString)")
@@ -2640,7 +2666,169 @@ final class FocusBrowserViewModel: ObservableObject {
         }
     }
 
-    private func installNativeVideoPlaceholder(for canonicalURL: URL) {
+    private func revisionKeyPrefix(for kind: FocusNativePageKind, url: URL) -> String {
+        "\(kind.rawValue)::\(url.absoluteString)"
+    }
+
+    private func scheduleNativeVideoLoadingMaskInstall(for canonicalURL: URL, revision: Int) {
+        nativeVideoLoadingMaskTask?.cancel()
+        debugLog(
+            "nativeLoadingMask.scheduled",
+            fields: debugStateFields([
+                "pageURL": canonicalURL.absoluteString,
+                "delayMS": "360",
+                "revision": String(revision)
+            ])
+        )
+        nativeVideoLoadingMaskTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 360_000_000)
+            guard
+                let self,
+                !Task.isCancelled,
+                self.pageAugmentationRevision == revision
+            else {
+                return
+            }
+
+            self.installNativeVideoLoadingMaskIfNeeded(for: canonicalURL)
+            self.nativeVideoLoadingMaskTask = nil
+        }
+    }
+
+    private func installNativeVideoOriginalSectionSuppression(for canonicalURL: URL) {
+        guard let webView else {
+            return
+        }
+
+        webView.evaluateJavaScript(
+            """
+            (() => {
+              const activeURL = location.href ? new URL(location.href, document.baseURI).href : '';
+              const targetURL = '\(canonicalURL.absoluteString.replacingOccurrences(of: "'", with: "\\'"))';
+              if (activeURL && activeURL !== targetURL && !activeURL.startsWith(targetURL)) {
+                return { applied: false, reason: 'url-mismatch' };
+              }
+
+              const id = 'focus-native-video-prehide-style';
+              let style = document.getElementById(id);
+              if (!style) {
+                style = document.createElement('style');
+                style.id = id;
+                document.head.appendChild(style);
+              }
+
+              style.textContent = `
+                .video-pod,
+                .video-pod__head,
+                .video-pod__header,
+                .video-pod__body,
+                .video-pod__list,
+                .right-container,
+                .right-container-inner,
+                .side-toolbar,
+                .right-entry,
+                #viewbox_report,
+                .multi-page,
+                [class*="multi-page"],
+                [class*="episode-list"],
+                [class*="part-list"],
+                [class*="page-list"],
+                #commentapp,
+                #commentapp > *,
+                bili-comments,
+                .comment-container,
+                .bb-comment {
+                  opacity: 0 !important;
+                  pointer-events: none !important;
+                }
+              `;
+
+              return { applied: true, reason: 'installed' };
+            })();
+            """,
+            completionHandler: { [weak self] value, error in
+                guard let self else {
+                    return
+                }
+
+                if let error {
+                    self.debugLog(
+                        "nativeOriginalSectionSuppression.error",
+                        fields: self.debugStateFields([
+                            "pageURL": canonicalURL.absoluteString,
+                            "error": String(describing: error)
+                        ])
+                    )
+                    return
+                }
+
+                let payload = value as? [String: Any]
+                let applied = payload?["applied"] as? Bool
+                let reason = payload?["reason"] as? String
+                self.debugLog(
+                    "nativeOriginalSectionSuppression.install",
+                    fields: self.debugStateFields([
+                        "pageURL": canonicalURL.absoluteString,
+                        "applied": applied == true ? "true" : "false",
+                        "reason": reason,
+                        "resultType": value.map { String(describing: type(of: $0)) } ?? "nil"
+                    ])
+                )
+            }
+        )
+    }
+
+    private func clearNativeVideoOriginalSectionSuppression(for canonicalURL: URL) {
+        guard let webView else {
+            return
+        }
+
+        webView.evaluateJavaScript(
+            """
+            (() => {
+              const activeURL = location.href ? new URL(location.href, document.baseURI).href : '';
+              const targetURL = '\(canonicalURL.absoluteString.replacingOccurrences(of: "'", with: "\\'"))';
+              if (activeURL && activeURL !== targetURL && !activeURL.startsWith(targetURL)) {
+                return { cleared: false, reason: 'url-mismatch' };
+              }
+
+              document.getElementById('focus-native-video-prehide-style')?.remove?.();
+              return { cleared: true, reason: 'removed' };
+            })();
+            """,
+            completionHandler: { [weak self] value, error in
+                guard let self else {
+                    return
+                }
+
+                if let error {
+                    self.debugLog(
+                        "nativeOriginalSectionSuppression.clear.error",
+                        fields: self.debugStateFields([
+                            "pageURL": canonicalURL.absoluteString,
+                            "error": String(describing: error)
+                        ])
+                    )
+                    return
+                }
+
+                let payload = value as? [String: Any]
+                let cleared = payload?["cleared"] as? Bool
+                let reason = payload?["reason"] as? String
+                self.debugLog(
+                    "nativeOriginalSectionSuppression.clear",
+                    fields: self.debugStateFields([
+                        "pageURL": canonicalURL.absoluteString,
+                        "cleared": cleared == true ? "true" : "false",
+                        "reason": reason,
+                        "resultType": value.map { String(describing: type(of: $0)) } ?? "nil"
+                    ])
+                )
+            }
+        )
+    }
+
+    private func installNativeVideoLoadingMaskIfNeeded(for canonicalURL: URL) {
         guard let webView else {
             return
         }
@@ -2654,9 +2842,281 @@ final class FocusBrowserViewModel: ObservableObject {
                 return false;
               }
 
+              const root = document.getElementById('focus-native-video-augment');
+              const hasSettledAugment = (() => {
+                if (!(root instanceof HTMLElement)) {
+                  return false;
+                }
+
+                const renderKey = root.getAttribute('data-focus-render-key');
+                const version = root.getAttribute('data-focus-version');
+                return !!renderKey && !!version && root.children.length > 0 && !root.hasAttribute('data-focus-placeholder');
+              })();
+              const hasPlaceholder = root instanceof HTMLElement
+                && root.hasAttribute('data-focus-placeholder')
+                && root.children.length > 0;
+              const isReady = document.documentElement.classList.contains('focus-native-video-ready')
+                || document.body?.classList?.contains?.('focus-native-video-ready');
+
+              if (hasSettledAugment || hasPlaceholder || isReady) {
+                if (window.__FOCUS_CLEAR_VIDEO_LOADING_MASK__) {
+                  try {
+                    window.__FOCUS_CLEAR_VIDEO_LOADING_MASK__(true);
+                  } catch (_) {}
+                }
+                return false;
+              }
+
+              const id = 'focus-native-video-loading-mask';
+              if (window.__FOCUS_CLEAR_VIDEO_LOADING_MASK__) {
+                try {
+                  window.__FOCUS_CLEAR_VIDEO_LOADING_MASK__(true);
+                } catch (_) {}
+              }
+              let mask = document.getElementById(id);
+              if (!mask) {
+                mask = document.createElement('div');
+                mask.id = id;
+                (document.body || document.documentElement).appendChild(mask);
+              }
+              mask.style.position = 'fixed';
+              mask.style.left = '0';
+              mask.style.right = '0';
+              mask.style.top = 'calc(100vw / 1.5 + 88px)';
+              mask.style.bottom = '0';
+              mask.style.background = document.documentElement.getAttribute('data-focus-theme') === 'dark' ? '#0F1115' : '#F6F7FA';
+              mask.style.pointerEvents = 'none';
+              mask.style.zIndex = '20';
+              mask.style.opacity = '1';
+
+              if (window.__FOCUS_LOADING_MASK_OBSERVER__) {
+                try {
+                  window.__FOCUS_LOADING_MASK_OBSERVER__.disconnect();
+                } catch (_) {}
+              }
+
+              const clearMask = () => {
+                const current = document.getElementById(id);
+                if (!current) {
+                  return;
+                }
+                current.style.transition = 'opacity 0.18s ease';
+                current.style.opacity = '0';
+                setTimeout(() => current.remove?.(), 220);
+                if (window.__FOCUS_LOADING_MASK_OBSERVER__) {
+                  try {
+                    window.__FOCUS_LOADING_MASK_OBSERVER__.disconnect();
+                  } catch (_) {}
+                  window.__FOCUS_LOADING_MASK_OBSERVER__ = null;
+                }
+              };
+              window.__FOCUS_CLEAR_VIDEO_LOADING_MASK__ = clearMask;
+
+              const hasVisiblePlayerLoadingOverlay = () => {
+                return Array.from(document.querySelectorAll([
+                  '#bilibili-player [class*="loading"]',
+                  '#playerWrap [class*="loading"]',
+                  '.bpx-player-container [class*="loading"]',
+                  '#bilibili-player [class*="skeleton"]',
+                  '#playerWrap [class*="skeleton"]',
+                  '.bpx-player-container [class*="skeleton"]'
+                ].join(','))).some((node) => {
+                  if (!(node instanceof HTMLElement)) {
+                    return false;
+                  }
+
+                  const rect = node.getBoundingClientRect();
+                  const style = window.getComputedStyle(node);
+                  return rect.width > 40
+                    && rect.height > 40
+                    && style.display !== 'none'
+                    && style.visibility !== 'hidden'
+                    && style.opacity !== '0';
+                });
+              };
+
+              const shouldClearMask = () => {
+                const liveRoot = document.getElementById('focus-native-video-augment');
+                const playerLoadingVisible = hasVisiblePlayerLoadingOverlay();
+                if (liveRoot instanceof HTMLElement) {
+                  const renderKey = liveRoot.getAttribute('data-focus-render-key');
+                  const version = liveRoot.getAttribute('data-focus-version');
+                  const hasRenderableAugment = !!renderKey && !!version && liveRoot.children.length > 0 && !liveRoot.hasAttribute('data-focus-placeholder');
+                  const hasLivePlaceholder = liveRoot.hasAttribute('data-focus-placeholder') && liveRoot.children.length > 0;
+                  if ((hasRenderableAugment || hasLivePlaceholder) && !playerLoadingVisible) {
+                    return true;
+                  }
+                }
+
+                return (
+                  document.documentElement.classList.contains('focus-native-video-ready')
+                  || document.body?.classList?.contains?.('focus-native-video-ready')
+                ) && !playerLoadingVisible;
+              };
+
+              if (shouldClearMask()) {
+                clearMask();
+                return false;
+              }
+
+              const observer = new MutationObserver(() => {
+                if (shouldClearMask()) {
+                  clearMask();
+                }
+              });
+              observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
+              window.__FOCUS_LOADING_MASK_OBSERVER__ = observer;
+
+              setTimeout(clearMask, 3200);
+              return true;
+            })();
+            """,
+            completionHandler: { [weak self] value, error in
+                guard let self else {
+                    return
+                }
+
+                if let error {
+                    self.debugLog(
+                        "nativeLoadingMask.error",
+                        fields: self.debugStateFields([
+                            "pageURL": canonicalURL.absoluteString,
+                            "error": String(describing: error)
+                        ])
+                    )
+                    return
+                }
+
+                let result = value as? Bool
+                self.debugLog(
+                    "nativeLoadingMask.installAttempt",
+                    fields: self.debugStateFields([
+                        "pageURL": canonicalURL.absoluteString,
+                        "installed": result == true ? "true" : "false",
+                        "resultType": value.map { String(describing: type(of: $0)) } ?? "nil"
+                    ])
+                )
+            }
+        )
+    }
+
+    private func scheduleNativeVideoPlaceholderInstall(for canonicalURL: URL, revision: Int) {
+        nativeVideoPlaceholderTask?.cancel()
+        debugLog(
+            "nativePlaceholder.scheduled",
+            fields: debugStateFields([
+                "pageURL": canonicalURL.absoluteString,
+                "delayMS": "650",
+                "revision": String(revision)
+            ])
+        )
+        nativeVideoPlaceholderTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 650_000_000)
+            guard
+                let self,
+                !Task.isCancelled,
+                self.pageAugmentationRevision == revision
+            else {
+                return
+            }
+
+            self.installNativeVideoPlaceholderIfNeeded(for: canonicalURL)
+            self.nativeVideoPlaceholderTask = nil
+        }
+    }
+
+    private func installNativeVideoPlaceholderIfNeeded(for canonicalURL: URL) {
+        guard let webView else {
+            return
+        }
+
+        webView.evaluateJavaScript(
+            """
+            (() => {
+              const activeURL = location.href ? new URL(location.href, document.baseURI).href : '';
+              const targetURL = '\(canonicalURL.absoluteString.replacingOccurrences(of: "'", with: "\\'"))';
+              if (activeURL && activeURL !== targetURL && !activeURL.startsWith(targetURL)) {
+                return { installed: false, reason: 'url-mismatch' };
+              }
+
               const rootId = 'focus-native-video-augment';
               const styleId = 'focus-native-video-augment-style';
               \(focusNativeVideoAugmentMountHelpersJavaScript)
+              const hasVisibleLoadingMask = () => {
+                const mask = document.getElementById('focus-native-video-loading-mask');
+                if (!(mask instanceof HTMLElement)) {
+                  return false;
+                }
+                const opacity = Number.parseFloat(mask.style.opacity || '1');
+                return mask.isConnected && opacity > 0.01;
+              };
+              const hasVisiblePlayerLoadingOverlay = () => {
+                return Array.from(document.querySelectorAll([
+                  '#bilibili-player [class*="loading"]',
+                  '#playerWrap [class*="loading"]',
+                  '.bpx-player-container [class*="loading"]',
+                  '#bilibili-player [class*="skeleton"]',
+                  '#playerWrap [class*="skeleton"]',
+                  '.bpx-player-container [class*="skeleton"]'
+                ].join(','))).some((node) => {
+                  if (!(node instanceof HTMLElement)) {
+                    return false;
+                  }
+                  const rect = node.getBoundingClientRect?.();
+                  if (!rect) {
+                    return false;
+                  }
+                  const style = window.getComputedStyle(node);
+                  return rect.width > 40
+                    && rect.height > 40
+                    && style.display !== 'none'
+                    && style.visibility !== 'hidden'
+                    && style.opacity !== '0';
+                });
+              };
+              const hasVisiblePlayer = () => {
+                const playerShell = document.querySelector('#playerWrap, .player-wrap, #bilibili-player, .bpx-player-container, .player-container, .bpx-player-video-wrap');
+                if (!playerShell) {
+                  return false;
+                }
+
+                const video = Array.from(document.querySelectorAll('video')).find((node) => {
+                  if (!(node instanceof HTMLVideoElement)) {
+                    return false;
+                  }
+                  const rect = node.getBoundingClientRect?.();
+                  if (!rect) {
+                    return false;
+                  }
+                  const style = window.getComputedStyle(node);
+                  return rect.width > 120
+                    && rect.height > 68
+                    && style.display !== 'none'
+                    && style.visibility !== 'hidden'
+                    && style.opacity !== '0';
+                });
+
+                return !!video;
+              };
+              const hasSettledAugment = () => {
+                const existingRoot = document.getElementById(rootId);
+                if (!(existingRoot instanceof HTMLElement)) {
+                  return false;
+                }
+
+                const renderKey = existingRoot.getAttribute('data-focus-render-key');
+                const version = existingRoot.getAttribute('data-focus-version');
+                return !!renderKey && !!version && existingRoot.children.length > 0 && !existingRoot.hasAttribute('data-focus-placeholder');
+              };
+
+              if (hasSettledAugment()) {
+                return { installed: false, reason: 'augment-ready' };
+              }
+
+              if (!hasVisiblePlayer()) {
+                return { installed: false, reason: 'player-not-visible' };
+              }
+
               const ensureStyle = () => {
                 let style = document.getElementById(styleId);
                 if (!style) {
@@ -2766,6 +3226,11 @@ final class FocusBrowserViewModel: ObservableObject {
               root.style.setProperty('z-index', '21', 'important');
               root.style.setProperty('order', '2', 'important');
               root.style.setProperty('flex', '0 0 auto', 'important');
+              if (hasVisibleLoadingMask()) {
+                return { installed: false, reason: 'loading-mask-visible' };
+              }
+              root.style.setProperty('opacity', '1', 'important');
+              root.style.removeProperty('pointer-events');
 
               if (!root.querySelector('.focus-native-skeleton-header')) {
                 root.innerHTML = `
@@ -2795,10 +3260,98 @@ final class FocusBrowserViewModel: ObservableObject {
               }
 
               mountNativeVideoAugmentRoot(root);
+              return { installed: true, reason: 'installed' };
+            })();
+            """,
+            completionHandler: { [weak self] value, error in
+                guard let self else {
+                    return
+                }
+
+                if let error {
+                    self.debugLog(
+                        "nativePlaceholder.error",
+                        fields: self.debugStateFields([
+                            "pageURL": canonicalURL.absoluteString,
+                            "error": String(describing: error)
+                        ])
+                    )
+                    return
+                }
+
+                let payload = value as? [String: Any]
+                let result = payload?["installed"] as? Bool
+                let reason = payload?["reason"] as? String
+                self.debugLog(
+                    "nativePlaceholder.installAttempt",
+                    fields: self.debugStateFields([
+                        "pageURL": canonicalURL.absoluteString,
+                        "installed": result == true ? "true" : "false",
+                        "reason": reason,
+                        "resultType": value.map { String(describing: type(of: $0)) } ?? "nil"
+                    ])
+                )
+            }
+        )
+    }
+
+    private func dismissNativeVideoPlaceholder(for canonicalURL: URL) {
+        guard let webView else {
+            return
+        }
+
+        webView.evaluateJavaScript(
+            """
+            (() => {
+              const activeURL = location.href ? new URL(location.href, document.baseURI).href : '';
+              const targetURL = '\(canonicalURL.absoluteString.replacingOccurrences(of: "'", with: "\\'"))';
+              if (activeURL && activeURL !== targetURL && !activeURL.startsWith(targetURL)) {
+                return false;
+              }
+
+              const root = document.getElementById('focus-native-video-augment');
+              if (root instanceof HTMLElement && (root.hasAttribute('data-focus-placeholder') || root.children.length === 0)) {
+                root.remove();
+              }
+
+              document.documentElement.classList.remove('focus-native-video-ready');
+              document.body?.classList?.remove?.('focus-native-video-ready');
+
+              if (window.__FOCUS_CLEAR_VIDEO_LOADING_MASK__) {
+                try {
+                  window.__FOCUS_CLEAR_VIDEO_LOADING_MASK__(true);
+                } catch (_) {}
+              }
+
               return true;
             })();
             """,
-            completionHandler: nil
+            completionHandler: { [weak self] value, error in
+                guard let self else {
+                    return
+                }
+
+                if let error {
+                    self.debugLog(
+                        "nativePlaceholder.dismiss.error",
+                        fields: self.debugStateFields([
+                            "pageURL": canonicalURL.absoluteString,
+                            "error": String(describing: error)
+                        ])
+                    )
+                    return
+                }
+
+                let result = value as? Bool
+                self.debugLog(
+                    "nativePlaceholder.dismiss",
+                    fields: self.debugStateFields([
+                        "pageURL": canonicalURL.absoluteString,
+                        "dismissed": result == true ? "true" : "false",
+                        "resultType": value.map { String(describing: type(of: $0)) } ?? "nil"
+                    ])
+                )
+            }
         )
     }
 
@@ -2939,6 +3492,7 @@ final class FocusBrowserViewModel: ObservableObject {
         revision: Int
     ) {
         let delays: [UInt64] = [0, 150_000_000, 500_000_000, 1_200_000_000, 3_000_000_000]
+        let expectedRenderKey = payload.renderKey
 
         for (index, delay) in delays.enumerated() {
             Task { @MainActor [weak self] in
@@ -2963,8 +3517,55 @@ final class FocusBrowserViewModel: ObservableObject {
                     return
                 }
 
+                if let expectedRenderKey, index > 0 {
+                    let existingRenderKey = await withCheckedContinuation { continuation in
+                        webView.evaluateJavaScript(
+                            "document.getElementById('focus-native-video-augment')?.getAttribute('data-focus-render-key')"
+                        ) { value, _ in
+                            continuation.resume(returning: value as? String)
+                        }
+                    }
+
+                    if existingRenderKey == expectedRenderKey {
+                        self.debugLog(
+                            "nativePageAugmentation.skipStableReplay",
+                            fields: self.debugStateFields([
+                                "pageURL": canonicalURL.absoluteString,
+                                "pageKind": payload.kind.rawValue,
+                                "attempt": String(index),
+                                "delayMS": String(delay / 1_000_000)
+                            ])
+                        )
+                        return
+                    }
+                }
+
                 let preflightScript = """
                 (() => {
+                  const hasVisiblePlayerLoadingOverlay = () => {
+                    return Array.from(document.querySelectorAll([
+                      '#bilibili-player [class*="loading"]',
+                      '#playerWrap [class*="loading"]',
+                      '.bpx-player-container [class*="loading"]',
+                      '#bilibili-player [class*="skeleton"]',
+                      '#playerWrap [class*="skeleton"]',
+                      '.bpx-player-container [class*="skeleton"]'
+                    ].join(','))).some((node) => {
+                      if (!(node instanceof HTMLElement)) {
+                        return false;
+                      }
+                      const rect = node.getBoundingClientRect?.();
+                      if (!rect) {
+                        return false;
+                      }
+                      const style = window.getComputedStyle(node);
+                      return rect.width > 40
+                        && rect.height > 40
+                        && style.display !== 'none'
+                        && style.visibility !== 'hidden'
+                        && style.opacity !== '0';
+                    });
+                  };
                   const checkTargets = () => {
                     let score = 0;
                     const hasPlayer = !!document.querySelector('#playerWrap, .player-wrap, #bilibili-player');
@@ -2973,6 +3574,7 @@ final class FocusBrowserViewModel: ObservableObject {
                     const hasCommentAnchor = !!document.querySelector('#commentapp, .comment-container, .bb-comment');
                     const hasEpisodeAnchor = !!document.querySelector('.video-pod, .multi-page, [class*="episode-list"], [class*="part-list"], [class*="page-list"]');
                     const hasViewbox = !!document.querySelector('#viewbox_report');
+                    const playerLoadingVisible = hasVisiblePlayerLoadingOverlay();
 
                     if (hasPlayer) score += 25;
                     if (hasContainer) score += 20;
@@ -2990,7 +3592,8 @@ final class FocusBrowserViewModel: ObservableObject {
                         hasToolbar: hasToolbar,
                         hasCommentAnchor: hasCommentAnchor,
                         hasEpisodeAnchor: hasEpisodeAnchor,
-                        hasViewbox: hasViewbox
+                        hasViewbox: hasViewbox,
+                        playerLoadingVisible: playerLoadingVisible
                       }
                     };
                   };
@@ -2999,19 +3602,33 @@ final class FocusBrowserViewModel: ObservableObject {
                 })();
                 """
 
-                let (isReady, score) = await withCheckedContinuation { continuation in
+                let (isReady, score, playerLoadingVisible) = await withCheckedContinuation { continuation in
                     webView.evaluateJavaScript(preflightScript) { value, error in
                         if let dict = value as? [String: Any],
                            let ready = dict["ready"] as? Bool,
                            let score = dict["score"] as? Int {
-                            continuation.resume(returning: (ready, score))
+                            let details = dict["details"] as? [String: Any]
+                            let playerLoadingVisible = details?["playerLoadingVisible"] as? Bool ?? false
+                            continuation.resume(returning: (ready, score, playerLoadingVisible))
                         } else {
-                            continuation.resume(returning: (false, 0))
+                            continuation.resume(returning: (false, 0, false))
                         }
                     }
                 }
 
-                print("[Focus Native Augment] preflight attempt=\(index) delay=\(delay/1_000_000)ms ready=\(isReady) score=\(score)")
+                print("[Focus Native Augment] preflight attempt=\(index) delay=\(delay/1_000_000)ms ready=\(isReady) score=\(score) playerLoadingVisible=\(playerLoadingVisible)")
+                self.debugLog(
+                    "nativePageAugmentation.preflight",
+                    fields: self.debugStateFields([
+                        "pageURL": canonicalURL.absoluteString,
+                        "pageKind": payload.kind.rawValue,
+                        "attempt": String(index),
+                        "delayMS": String(delay / 1_000_000),
+                        "ready": isReady ? "true" : "false",
+                        "score": String(score),
+                        "playerLoadingVisible": playerLoadingVisible ? "true" : "false"
+                    ])
+                )
 
                 guard isReady || index == delays.count - 1 else {
                     print("[Focus Native Augment] skip-not-ready attempt=\(index)")
@@ -3039,6 +3656,28 @@ final class FocusBrowserViewModel: ObservableObject {
                     }
 
                     print("[Focus Native Augment] applied attempt=\(index) kind=\(payload.kind.rawValue) delayMS=\(delay / 1_000_000) url=\(canonicalURL.absoluteString)")
+                    if payload.kind == .video {
+                        Task { @MainActor [weak self] in
+                            try? await Task.sleep(nanoseconds: 220_000_000)
+                            guard let self, self.pageAugmentationRevision == revision else {
+                                return
+                            }
+                            let activeURL = (self.webView?.url ?? self.currentURL ?? self.pendingURL)
+                                .map(FocusNavigationPolicy.canonicalWebURL(for:))
+                            guard activeURL == canonicalURL else {
+                                return
+                            }
+                            self.debugLog(
+                                "nativeOriginalSectionSuppression.clearScheduled",
+                                fields: self.debugStateFields([
+                                    "pageURL": canonicalURL.absoluteString,
+                                    "delayMS": "220",
+                                    "attempt": String(index)
+                                ])
+                            )
+                            self.clearNativeVideoOriginalSectionSuppression(for: canonicalURL)
+                        }
+                    }
 
                     let probeScript = """
                     (() => {
@@ -3052,19 +3691,173 @@ final class FocusBrowserViewModel: ObservableObject {
                         top: Math.round(rect.top),
                         height: Math.round(rect.height),
                         childCount: root.children.length,
+                        mountCount: root.getAttribute ? (root.getAttribute('data-focus-mount-count') || '') : '',
+                        mountPhase: root.getAttribute ? (root.getAttribute('data-focus-mount-phase') || '') : '',
+                        isPlaceholder: root.hasAttribute ? root.hasAttribute('data-focus-placeholder') : false,
+                        renderKey: root.getAttribute ? (root.getAttribute('data-focus-render-key') || '') : '',
+                        version: root.getAttribute ? (root.getAttribute('data-focus-version') || '') : '',
+                        loadingMaskPresent: !!document.getElementById('focus-native-video-loading-mask'),
+                        readyClass: document.documentElement.classList.contains('focus-native-video-ready') || !!document.body?.classList?.contains?.('focus-native-video-ready'),
                         textSample: String(root.textContent || '').trim().slice(0, 120),
                         parentTag: root.parentElement?.tagName || '',
                         previousTag: root.previousElementSibling?.tagName || '',
-                        previousClass: root.previousElementSibling?.className || ''
+                        previousClass: root.previousElementSibling?.className || '',
+                        domProbe: (() => {
+                          const sample = (selector) => {
+                            const node = document.querySelector(selector);
+                            if (!(node instanceof HTMLElement)) {
+                              return '0';
+                            }
+                            const rect = node.getBoundingClientRect();
+                            const style = window.getComputedStyle(node);
+                            return [
+                              '1',
+                              Math.round(rect.height),
+                              style.display,
+                              style.visibility,
+                              style.opacity
+                            ].join(':');
+                          };
+                          return {
+                            rightContainer: sample('.right-container'),
+                            rightContainerInner: sample('.right-container-inner'),
+                            sideToolbar: sample('.side-toolbar, .right-entry, [class*="side-toolbar"], [class*="right-entry"]'),
+                            toolbar: sample('.video-toolbar-container, #arc_toolbar_report'),
+                            playerLoading: sample('#bilibili-player [class*="loading"], #playerWrap [class*="loading"], .bpx-player-container [class*="loading"], #bilibili-player [class*="skeleton"], #playerWrap [class*="skeleton"], .bpx-player-container [class*="skeleton"]'),
+                            viewbox: sample('#viewbox_report'),
+                            videoPod: sample('.video-pod, .video-pod__body'),
+                            commentApp: sample('#commentapp, bili-comments, .comment-container'),
+                            skeleton: sample('[class*="skeleton"]'),
+                            loading: sample('[class*="loading"]'),
+                            scrollY: Math.round(window.scrollY || document.documentElement.scrollTop || document.body.scrollTop || 0)
+                          };
+                        })()
                       };
+                    })();
+                    """
+                    let traceScript = """
+                    (() => {
+                      const root = document.getElementById('focus-native-video-augment');
+                      if (!(root instanceof HTMLElement)) {
+                        return { stage: 'missing-root' };
+                      }
+                      const trace = (label) => {
+                        const y = Math.round(window.scrollY || document.documentElement.scrollTop || document.body.scrollTop || 0);
+                        const rect = root.getBoundingClientRect();
+                        return {
+                          stage: label,
+                          scrollY: y,
+                          rootTop: Math.round(rect.top),
+                          rootHeight: Math.round(rect.height),
+                          mountCount: root.getAttribute('data-focus-mount-count') || '',
+                          mountPhase: root.getAttribute('data-focus-mount-phase') || '',
+                          readyClass: document.documentElement.classList.contains('focus-native-video-ready') || !!document.body?.classList?.contains?.('focus-native-video-ready'),
+                          toolbarHeight: (() => {
+                            const node = document.querySelector('.video-toolbar-container, #arc_toolbar_report');
+                            if (!(node instanceof HTMLElement)) {
+                              return 0;
+                            }
+                            return Math.round(node.getBoundingClientRect().height);
+                          })(),
+                          sideToolbarHeight: (() => {
+                            const node = document.querySelector('.side-toolbar, .right-entry, [class*="side-toolbar"], [class*="right-entry"]');
+                            if (!(node instanceof HTMLElement)) {
+                              return 0;
+                            }
+                            return Math.round(node.getBoundingClientRect().height);
+                          })()
+                        };
+                      };
+                      window.__FOCUS_TRACE_NATIVE_AUGMENT__ = trace;
+                      return trace('trace-installed');
                     })();
                     """
                     Task { @MainActor in
                         do {
+                            let value = try await webView.evaluateJavaScript(traceScript)
+                            self.debugLog(
+                                "nativePageAugmentation.traceInstalled",
+                                fields: self.debugStateFields([
+                                    "pageURL": canonicalURL.absoluteString,
+                                    "pageKind": payload.kind.rawValue,
+                                    "attempt": String(index),
+                                    "trace": String(describing: value)
+                                ])
+                            )
+                        } catch {
+                            self.debugLog(
+                                "nativePageAugmentation.traceInstallError",
+                                fields: self.debugStateFields([
+                                    "pageURL": canonicalURL.absoluteString,
+                                    "pageKind": payload.kind.rawValue,
+                                    "attempt": String(index),
+                                    "error": String(describing: error)
+                                ])
+                            )
+                        }
+                    }
+                    Task { @MainActor in
+                        do {
                             let value = try await webView.evaluateJavaScript(probeScript)
                             print("[Focus Native Augment] probe attempt=\(index) kind=\(payload.kind.rawValue) url=\(canonicalURL.absoluteString) value=\(String(describing: value))")
+                            self.debugLog(
+                                "nativePageAugmentation.probeCaptured",
+                                fields: self.debugStateFields([
+                                    "pageURL": canonicalURL.absoluteString,
+                                    "pageKind": payload.kind.rawValue,
+                                    "attempt": String(index),
+                                    "probeType": value.map { String(describing: type(of: $0)) } ?? "nil"
+                                ])
+                            )
                         } catch {
                             print("[Focus Native Augment] probe-error attempt=\(index) kind=\(payload.kind.rawValue) url=\(canonicalURL.absoluteString) error=\(error)")
+                        }
+                    }
+                    let traceSampleDelays: [UInt64] = [0, 120_000_000, 260_000_000]
+                    for (sampleIndex, sampleDelay) in traceSampleDelays.enumerated() {
+                        Task { @MainActor [weak self] in
+                            guard let self else {
+                                return
+                            }
+                            if sampleDelay > 0 {
+                                try? await Task.sleep(nanoseconds: sampleDelay)
+                            }
+                            guard
+                                self.pageAugmentationRevision == revision,
+                                let activeWebView = self.webView,
+                                (activeWebView.url ?? self.currentURL ?? self.pendingURL).map(FocusNavigationPolicy.canonicalWebURL(for:)) == canonicalURL
+                            else {
+                                return
+                            }
+
+                            do {
+                                let value = try await activeWebView.evaluateJavaScript(
+                                    "window.__FOCUS_TRACE_NATIVE_AUGMENT__ ? window.__FOCUS_TRACE_NATIVE_AUGMENT__('sample-\(sampleIndex)') : { stage: 'trace-missing' }"
+                                )
+                                self.debugLog(
+                                    "nativePageAugmentation.traceSample",
+                                    fields: self.debugStateFields([
+                                        "pageURL": canonicalURL.absoluteString,
+                                        "pageKind": payload.kind.rawValue,
+                                        "attempt": String(index),
+                                        "sampleIndex": String(sampleIndex),
+                                        "sampleDelayMS": String(sampleDelay / 1_000_000),
+                                        "trace": String(describing: value)
+                                    ])
+                                )
+                            } catch {
+                                self.debugLog(
+                                    "nativePageAugmentation.traceSampleError",
+                                    fields: self.debugStateFields([
+                                        "pageURL": canonicalURL.absoluteString,
+                                        "pageKind": payload.kind.rawValue,
+                                        "attempt": String(index),
+                                        "sampleIndex": String(sampleIndex),
+                                        "sampleDelayMS": String(sampleDelay / 1_000_000),
+                                        "error": String(describing: error)
+                                    ])
+                                )
+                            }
                         }
                     }
 
@@ -3300,6 +4093,18 @@ final class FocusBrowserViewModel: ObservableObject {
             self.applyDetectedPageState(self.makeDetectedPageState(from: payload), fallbackURL: self.currentURL ?? self.pendingURL)
             if hasPlayer {
                 self.isLoadingPage = false
+                if let activeURL = self.currentURL ?? self.pendingURL,
+                   self.nativePageKind(for: activeURL) == .video,
+                   self.nativeVideoPlaceholderTask != nil
+                {
+                    let canonicalURL = FocusNavigationPolicy.canonicalWebURL(for: activeURL)
+                    self.nativeVideoPlaceholderTask?.cancel()
+                    self.nativeVideoPlaceholderTask = nil
+                    self.installNativeVideoPlaceholderIfNeeded(for: canonicalURL)
+                }
+                if self.hasActiveVideoRoute, self.scheduledPageAugmentationKey == nil {
+                    self.schedulePageAugmentationRefresh()
+                }
             }
             self.isPlaying = payload["isPlaying"] as? Bool ?? false
             self.playbackRate = payload["playbackRate"] as? Double ?? 1.0
@@ -3947,6 +4752,15 @@ private enum FocusNativePageAugmentPayload {
             return payload.javaScript
         }
     }
+
+    var renderKey: String? {
+        switch self {
+        case let .video(payload):
+            return payload.renderKey
+        case .opus:
+            return nil
+        }
+    }
 }
 
 private struct FocusNativeVideoAugmentPayload: Encodable {
@@ -3960,6 +4774,11 @@ private struct FocusNativeVideoAugmentPayload: Encodable {
     let authorIsFollowing: Bool
     let groups: [FocusNativeEpisodeGroupPayload]
     let comments: [FocusNativeCommentPayload]
+
+    var renderKey: String {
+        let episodeCount = groups.reduce(0) { $0 + $1.items.count }
+        return "\(title)::\(authorName)::\(episodeCount)::\(comments.count)"
+    }
 }
 
 private struct FocusNativeOpusAugmentPayload: Encodable {
@@ -4085,8 +4904,12 @@ fileprivate actor FocusNativePageAugmentService {
         let isFollowing = await followStateTask
 
         let meaningfulGroups = groups.filter { $0.items.count > 1 }
+        let hasMeaningfulMeta = !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !authorName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !authorAvatarURL.isEmpty
+            || !authorSpaceURL.isEmpty
 
-        if meaningfulGroups.isEmpty, comments.isEmpty {
+        if meaningfulGroups.isEmpty, comments.isEmpty, !hasMeaningfulMeta {
             return nil
         }
 
@@ -4547,7 +5370,7 @@ fileprivate actor FocusNativePageAugmentService {
     }
 }
 
-private let focusNativeVideoAugmentComponentVersion = "2026-06-23-augment-stability-fix"
+private let focusNativeVideoAugmentComponentVersion = "2026-06-24-video-mask-waits-player"
 
 private let focusNativeVideoAugmentMountHelpersJavaScript = #"""
               const ensureNativeVideoAugmentHelpers = () => {
@@ -4660,12 +5483,13 @@ private let focusNativeVideoAugmentMountHelpersJavaScript = #"""
 private extension FocusNativeVideoAugmentPayload {
     var javaScript: String {
         let payloadJSON = focusJSONString
+        let componentVersion = focusNativeVideoAugmentComponentVersion
         return #"""
         (() => {
           const payload = \#(payloadJSON);
           const styleId = 'focus-native-video-augment-style';
           const rootId = 'focus-native-video-augment';
-          const componentVersion = '2026-06-23-augment-self-remount';
+          const componentVersion = '\#(componentVersion)';
           \#(focusNativeVideoAugmentMountHelpersJavaScript)
           const hasRenderableContent = !!payload && (
             !!payload.authorName
@@ -4713,6 +5537,7 @@ private extension FocusNativeVideoAugmentPayload {
               style.id = styleId;
               document.head.appendChild(style);
             }
+            style.removeAttribute('data-focus-placeholder');
             style.textContent = `
               #${rootId} {
                 display: block !important;
@@ -4740,6 +5565,55 @@ private extension FocusNativeVideoAugmentPayload {
                 background: rgba(17, 24, 39, 0.96) !important;
                 border-color: rgba(255, 255, 255, 0.08) !important;
                 box-shadow: 0 12px 24px rgba(0, 0, 0, 0.22) !important;
+              }
+              html.focus-native-video-ready .right-container,
+              body.focus-native-video-ready .right-container,
+              html.focus-native-video-ready .right-container-inner,
+              body.focus-native-video-ready .right-container-inner,
+              html.focus-native-video-ready .side-toolbar,
+              body.focus-native-video-ready .side-toolbar,
+              html.focus-native-video-ready .right-entry,
+              body.focus-native-video-ready .right-entry,
+              html.focus-native-video-ready #viewbox_report,
+              body.focus-native-video-ready #viewbox_report,
+              html.focus-native-video-ready .video-pod,
+              body.focus-native-video-ready .video-pod,
+              html.focus-native-video-ready .video-pod__head,
+              body.focus-native-video-ready .video-pod__head,
+              html.focus-native-video-ready .video-pod__header,
+              body.focus-native-video-ready .video-pod__header,
+              html.focus-native-video-ready .video-pod__body,
+              body.focus-native-video-ready .video-pod__body,
+              html.focus-native-video-ready .video-pod__list,
+              body.focus-native-video-ready .video-pod__list,
+              html.focus-native-video-ready .multi-page,
+              body.focus-native-video-ready .multi-page,
+              html.focus-native-video-ready [class*="multi-page"],
+              body.focus-native-video-ready [class*="multi-page"],
+              html.focus-native-video-ready [class*="episode-list"],
+              body.focus-native-video-ready [class*="episode-list"],
+              html.focus-native-video-ready [class*="part-list"],
+              body.focus-native-video-ready [class*="part-list"],
+              html.focus-native-video-ready [class*="page-list"],
+              body.focus-native-video-ready [class*="page-list"],
+              html.focus-native-video-ready #commentapp,
+              body.focus-native-video-ready #commentapp,
+              html.focus-native-video-ready #commentapp > *,
+              body.focus-native-video-ready #commentapp > *,
+              html.focus-native-video-ready bili-comments,
+              body.focus-native-video-ready bili-comments,
+              html.focus-native-video-ready .comment-container,
+              body.focus-native-video-ready .comment-container,
+              html.focus-native-video-ready .bb-comment,
+              body.focus-native-video-ready .bb-comment,
+              html.focus-native-video-ready .comment-container,
+              body.focus-native-video-ready .comment-container,
+              html.focus-native-video-ready .bb-comment,
+              body.focus-native-video-ready .bb-comment {
+                display: none !important;
+                visibility: hidden !important;
+                opacity: 0 !important;
+                pointer-events: none !important;
               }
               #${rootId} .focus-native-video-meta {
                 display: flex !important;
@@ -4961,48 +5835,58 @@ private extension FocusNativeVideoAugmentPayload {
             `;
           };
 
+          const isPlayerRelatedNode = (node) => {
+            if (!(node instanceof Element)) {
+              return false;
+            }
+            return !!node.closest([
+              '#bilibili-player',
+              '#playerWrap',
+              '.player-wrap',
+              '.bpx-player-container',
+              '.bpx-player-video-wrap',
+              '.bpx-player-video-area',
+              '.bpx-player-state-wrap'
+            ].join(','));
+          };
+
           const hideOriginalSections = () => {
-            if (payload.groups && payload.groups.length > 0) {
-              [
-                '.video-pod',
-                '.video-pod__head',
-                '.video-pod__header',
-                '.video-pod__body',
-                '.video-pod__list',
-                '.multi-page',
-                '[class*="multi-page"]',
-                '[class*="episode-list"]',
-                '[class*="part-list"]',
-                '[class*="page-list"]'
-              ].forEach((selector) => {
-                document.querySelectorAll(selector).forEach((node) => {
-                  if (!node.closest(`#${rootId}`)) {
-                    node.style.setProperty('display', 'none', 'important');
-                    node.style.setProperty('visibility', 'hidden', 'important');
-                    node.style.setProperty('position', 'absolute', 'important');
-                    node.style.setProperty('z-index', '-9999', 'important');
-                  }
-                });
+            [
+              '.right-container',
+              '.right-container-inner',
+              '.side-toolbar',
+              '.right-entry',
+              '#viewbox_report',
+              '.video-pod',
+              '.video-pod__head',
+              '.video-pod__header',
+              '.video-pod__body',
+              '.video-pod__list',
+              '.multi-page',
+              '[class*="multi-page"]',
+              '[class*="episode-list"]',
+              '[class*="part-list"]',
+              '[class*="page-list"]',
+              '#commentapp',
+              '#commentapp > *',
+              'bili-comments',
+              '.comment-container',
+              '.bb-comment',
+              '[class*="skeleton"]',
+              '[class*="loading"]'
+            ].forEach((selector) => {
+              document.querySelectorAll(selector).forEach((node) => {
+                if (node.closest(`#${rootId}`) || isPlayerRelatedNode(node)) {
+                  return;
+                }
+                node.style.setProperty('display', 'none', 'important');
+                node.style.setProperty('visibility', 'hidden', 'important');
+                node.style.setProperty('position', 'absolute', 'important');
+                node.style.setProperty('z-index', '-9999', 'important');
+                node.style.setProperty('opacity', '0', 'important');
+                node.style.setProperty('pointer-events', 'none', 'important');
               });
-            }
-            if (payload.comments && payload.comments.length > 0) {
-              [
-                '#commentapp',
-                '#commentapp > *',
-                'bili-comments',
-                '.comment-container',
-                '.bb-comment'
-              ].forEach((selector) => {
-                document.querySelectorAll(selector).forEach((node) => {
-                  if (!node.closest(`#${rootId}`)) {
-                    node.style.setProperty('display', 'none', 'important');
-                    node.style.setProperty('visibility', 'hidden', 'important');
-                    node.style.setProperty('position', 'absolute', 'important');
-                    node.style.setProperty('z-index', '-9999', 'important');
-                  }
-                });
-              });
-            }
+            });
           };
 
           const buildGroupsHTML = () => (payload.groups || []).map((group) => {
@@ -5078,6 +5962,25 @@ private extension FocusNativeVideoAugmentPayload {
           root.id = rootId;
           const renderKey = `${payload.title || ''}::${payload.authorName || ''}::${(payload.groups || []).reduce((sum, group) => sum + ((group.items || []).length), 0)}::${(payload.comments || []).length}`;
           const loadingMaskId = 'focus-native-video-loading-mask';
+          const setMountPhase = (phase) => {
+            root.setAttribute('data-focus-mount-phase', phase);
+          };
+          const bumpMountCount = () => {
+            const previousCount = Number.parseInt(root.getAttribute('data-focus-mount-count') || '0', 10);
+            const nextCount = (Number.isFinite(previousCount) ? previousCount : 0) + 1;
+            root.setAttribute('data-focus-mount-count', String(nextCount));
+            return nextCount;
+          };
+          const mountPreparedRoot = (phase) => {
+            bumpMountCount();
+            setMountPhase(phase);
+            mountNativeVideoAugmentRoot(root);
+          };
+          const applyReadyState = (phase) => {
+            document.documentElement.classList.add('focus-native-video-ready');
+            document.body?.classList?.add('focus-native-video-ready');
+            setMountPhase(phase);
+          };
           const clearLoadingMask = () => {
             if (window.__FOCUS_CLEAR_VIDEO_LOADING_MASK__) {
               try {
@@ -5101,31 +6004,13 @@ private extension FocusNativeVideoAugmentPayload {
 
           if (root.getAttribute('data-focus-render-key') === renderKey && checkExistingComponent(root)) {
             hideOriginalSections();
+            setMountPhase('sections-hidden');
             root.removeAttribute('data-focus-placeholder');
-            mountNativeVideoAugmentRoot(root);
-            document.documentElement.classList.add('focus-native-video-ready');
-            document.body?.classList?.add('focus-native-video-ready');
+            mountPreparedRoot('existing-fast-path-mounted');
+            applyReadyState('existing-fast-path-ready');
             clearLoadingMask();
             return;
           }
-
-          mountNativeVideoAugmentRoot(root);
-          let loadingMask = document.getElementById(loadingMaskId);
-          if (!loadingMask) {
-            loadingMask = document.createElement('div');
-            loadingMask.id = loadingMaskId;
-            (document.querySelector('.left-container') || document.querySelector('main') || document.body || document.documentElement).appendChild(loadingMask);
-          }
-          loadingMask.style.position = 'fixed';
-          loadingMask.style.left = '0';
-          loadingMask.style.right = '0';
-          loadingMask.style.top = 'calc(100vw / 1.5 + 88px)';
-          loadingMask.style.bottom = '0';
-          loadingMask.style.background = document.documentElement.getAttribute('data-focus-theme') === 'dark' ? '#0F1115' : '#F6F7FA';
-          loadingMask.style.pointerEvents = 'none';
-          loadingMask.style.zIndex = '20';
-          loadingMask.style.opacity = '1';
-          loadingMask.style.transition = 'opacity 0.18s ease';
 
           root.setAttribute('data-focus-version', componentVersion);
           root.setAttribute('data-focus-render-key', renderKey);
@@ -5134,21 +6019,46 @@ private extension FocusNativeVideoAugmentPayload {
           root.style.setProperty('width', '100%', 'important');
           root.style.setProperty('visibility', 'visible', 'important');
           root.style.setProperty('opacity', '1', 'important');
+          setMountPhase('content-prepared');
           root.innerHTML = `${buildMetaHTML()}${buildGroupsHTML()}${buildCommentsHTML()}`;
 
           hideOriginalSections();
-          mountNativeVideoAugmentRoot(root);
+          setMountPhase('sections-hidden');
+          mountPreparedRoot('single-mount-attached');
 
-          Array.from(document.querySelectorAll('button, a, div, span')).forEach((node) => {
-            const text = String(node.textContent || '').trim();
-            if (text === '顶部' || text === '小窗' || text === '客服') {
-              const element = node.closest('button, a, [role="button"], div') || node;
-              element.style.setProperty('display', 'none', 'important');
-              element.style.setProperty('visibility', 'hidden', 'important');
-              element.style.setProperty('opacity', '0', 'important');
-              element.style.setProperty('pointer-events', 'none', 'important');
-            }
-          });
+          const hideFloatingToolbar = () => {
+            document.querySelectorAll([
+              '.side-toolbar',
+              '.right-entry',
+              '[class*="side-toolbar"]',
+              '[class*="right-entry"]'
+            ].join(',')).forEach((node) => {
+              if (!(node instanceof HTMLElement) || node.closest(`#${rootId}`)) {
+                return;
+              }
+              node.style.setProperty('display', 'none', 'important');
+              node.style.setProperty('visibility', 'hidden', 'important');
+              node.style.setProperty('opacity', '0', 'important');
+              node.style.setProperty('pointer-events', 'none', 'important');
+            });
+
+            Array.from(document.querySelectorAll('button, a, div, span')).forEach((node) => {
+              const text = String(node.textContent || '').trim();
+              if (text === '顶部' || text === '小窗' || text === '客服') {
+                const element = node.closest('.side-toolbar, .right-entry, button, a, [role="button"], div') || node;
+                if (element instanceof HTMLElement && !element.closest(`#${rootId}`)) {
+                  element.style.setProperty('display', 'none', 'important');
+                  element.style.setProperty('visibility', 'hidden', 'important');
+                  element.style.setProperty('opacity', '0', 'important');
+                  element.style.setProperty('pointer-events', 'none', 'important');
+                }
+              }
+            });
+          };
+
+          hideFloatingToolbar();
+          requestAnimationFrame(hideFloatingToolbar);
+          setTimeout(hideFloatingToolbar, 160);
 
           const focusCurrentEpisodeCard = () => {
             const currentCard = root.querySelector('.focus-native-episode-card.is-current');
@@ -5162,12 +6072,13 @@ private extension FocusNativeVideoAugmentPayload {
             );
             scroller.scrollTo({ left: targetLeft, behavior: 'auto' });
           };
-          requestAnimationFrame(focusCurrentEpisodeCard);
-          setTimeout(focusCurrentEpisodeCard, 120);
+          if (payload.groups && payload.groups.length > 0) {
+            requestAnimationFrame(focusCurrentEpisodeCard);
+          }
 
-          document.documentElement.classList.add('focus-native-video-ready');
-          document.body?.classList?.add('focus-native-video-ready');
+          applyReadyState('ready-class-applied');
           requestAnimationFrame(() => {
+            setMountPhase('mask-clearing');
             clearLoadingMask();
           });
 
@@ -5177,9 +6088,11 @@ private extension FocusNativeVideoAugmentPayload {
               window.scrollTo(0, preservedScrollY);
             }
           };
-          requestAnimationFrame(restoreScroll);
-          setTimeout(restoreScroll, 80);
-          setTimeout(restoreScroll, 260);
+          requestAnimationFrame(() => {
+            setMountPhase('scroll-restoring');
+            restoreScroll();
+          });
+          setTimeout(restoreScroll, 90);
         })();
         """#
     }

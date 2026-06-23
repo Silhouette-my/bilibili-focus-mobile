@@ -178,6 +178,14 @@ struct FocusWebView: UIViewRepresentable {
             }
         }
 
+        private func shouldSkipFinishScriptReplay(for url: URL?) -> Bool {
+            guard let url else {
+                return false
+            }
+
+            return FocusUserAgent.shouldUseDesktopPlayback(for: url)
+        }
+
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
             switch message.name {
             case "getConfig":
@@ -193,7 +201,9 @@ struct FocusWebView: UIViewRepresentable {
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-            reapplyCurrentPageScripts(on: webView)
+            if !shouldSkipFinishScriptReplay(for: webView.url) {
+                reapplyCurrentPageScripts(on: webView)
+            }
             viewModel.updateNavigationState(from: webView)
         }
 

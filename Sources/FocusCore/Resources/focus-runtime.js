@@ -6,6 +6,7 @@
   const configKey = "__FOCUS_CONFIG__";
   const stylePrefix = "bili-focus-style-";
   const scriptStateKey = "__FOCUS_FEATURE_SCRIPT_STATE__";
+  const runtimeVersion = "2026-06-24-runtime-trace-d-app";
 
   function makeStyleId(ruleId, featureId) {
     return (stylePrefix + ruleId + "-" + featureId).replace(/[^a-zA-Z0-9_-]/g, "-");
@@ -13,10 +14,15 @@
 
   function createRuntime() {
     const state = {
+      runtimeVersion,
+      currentPhase: phase,
       observerInstalled: false,
       historyInstalled: false,
       applyTimer: null,
+      applyTimerToken: 0,
+      applyTimerMetadata: null,
       lastApplyAt: 0,
+      lastAppliedComparableURL: null,
       featureScriptState: window[scriptStateKey] || {}
     };
 
@@ -42,6 +48,13 @@
       try {
         console.debug("[Focus]", message, extra || "");
       } catch (_) {}
+    }
+
+    function runtimeLabel(extra) {
+      return Object.assign({
+        runtimeVersion: state.runtimeVersion,
+        phase: state.currentPhase
+      }, extra || {});
     }
 
     function ensureStyle(styleId, css) {
@@ -117,6 +130,52 @@
       } catch (_) {
         return rawValue;
       }
+    }
+
+    function comparableFocusURL(rawValue) {
+      try {
+        const url = new URL(rawValue, location.href);
+        const host = (url.hostname || "").toLowerCase();
+        const path = (url.pathname || "").toLowerCase();
+        const isBilibiliHost = host === "www.bilibili.com" || host === "bilibili.com" || host === "m.bilibili.com";
+
+        if (isBilibiliHost && (path.indexOf("/video/") === 0 || path.indexOf("/bangumi/play/") === 0)) {
+          url.protocol = "https:";
+          url.hostname = "www.bilibili.com";
+          if (path.indexOf("/video/") === 0 && !url.pathname.endsWith("/")) {
+            url.pathname = url.pathname + "/";
+          }
+          if (path.indexOf("/video/") === 0) {
+            const preservedNames = new Set([
+              "p",
+              "t",
+              "start_progress",
+              "start_progress_ms",
+              "spm_id_from",
+              "from_spmid",
+              "from_source"
+            ]);
+            Array.from(url.searchParams.keys()).forEach((key) => {
+              if (!preservedNames.has(String(key).toLowerCase())) {
+                url.searchParams.delete(key);
+              }
+            });
+          }
+        }
+
+        return url.toString();
+      } catch (_) {
+        return rawValue;
+      }
+    }
+
+    function normalizeHistoryURLArgument(rawValue) {
+      if (rawValue == null || rawValue === "") {
+        return rawValue;
+      }
+
+      const canonicalURL = comparableFocusURL(String(rawValue));
+      return canonicalURL || rawValue;
     }
 
     function featureState(ruleId, featureId) {
@@ -198,7 +257,8 @@
     function applyPhase(requestedPhase) {
       const applicableRules = (window.__FOCUS_RULES__ || []).filter((rule) => rule.runPhase === requestedPhase);
       applicableRules.forEach(applyRule);
-      postDebug("applyPhase", requestedPhase);
+      state.lastAppliedComparableURL = comparableFocusURL(location.href);
+      postDebug("applyPhase", runtimeLabel({ requestedPhase }));
     }
 
     function applyAll() {
@@ -206,22 +266,109 @@
       applyPhase("documentEnd");
     }
 
+    function stableFocusVideoState() {
+      const path = location.pathname || "/";
+      const isVideoPage = path.indexOf("/video/") === 0 || path.indexOf("/bangumi/play/") === 0;
+      const ready = isVideoPage && (
+        document.documentElement.classList.contains("focus-native-video-ready")
+        || document.body?.classList?.contains?.("focus-native-video-ready")
+      );
+      const renderableNativeAugment = ready && hasRenderableNativeVideoAugment();
+      const visiblePrimaryVideo = ready && hasVisiblePrimaryVideo();
+
+      return {
+        isVideoPage,
+        ready,
+        renderableNativeAugment,
+        visiblePrimaryVideo,
+        stable: isVideoPage && ready && renderableNativeAugment && visiblePrimaryVideo
+      };
+    }
+
+    function clearPendingApplyTimer() {
+      state.applyTimerToken += 1;
+      if (state.applyTimer !== null) {
+        clearTimeout(state.applyTimer);
+      }
+      state.applyTimer = null;
+      state.applyTimerMetadata = null;
+    }
+
+    function cancelPendingApply(cancelReason, extra) {
+      if (state.applyTimer === null) {
+        return false;
+      }
+
+      const pendingMetadata = state.applyTimerMetadata || {};
+      clearPendingApplyTimer();
+      postDebug("scheduleApply-cancelled", runtimeLabel(Object.assign({
+        reason: pendingMetadata.reason || null,
+        delay: pendingMetadata.delay,
+        branch: "pending-cleared",
+        cancelReason
+      }, extra || {})));
+      return true;
+    }
+
     function scheduleApply(reason) {
-      clearTimeout(state.applyTimer);
+      clearPendingApplyTimer();
       const now = Date.now();
-      const isVideoPage = location.pathname.indexOf("/video/") === 0 || location.pathname.indexOf("/bangumi/play/") === 0;
+      const stableState = stableFocusVideoState();
+      const isVideoPage = stableState.isVideoPage;
+      const isHistoryReason = reason === "pushState" || reason === "replaceState" || reason === "popstate" || reason === "hashchange";
+      if (isVideoPage && isHistoryReason && comparableFocusURL(location.href) === state.lastAppliedComparableURL) {
+        postDebug("scheduleApply-skipped", runtimeLabel({ reason, branch: "history-comparable" }));
+        return;
+      }
       const delay = isVideoPage ? 120 : Math.max(40, 80 - (now - state.lastApplyAt));
 
       if (delay === 0) {
+        state.applyTimerToken += 1;
         state.lastApplyAt = Date.now();
         applyAll();
-        postDebug("scheduleApply-immediate", reason);
+        postDebug("scheduleApply-immediate", runtimeLabel({ reason, delay, branch: "immediate" }));
       } else {
+        const token = state.applyTimerToken + 1;
+        state.applyTimerToken = token;
+        state.applyTimerMetadata = {
+          reason,
+          delay,
+          token
+        };
         state.applyTimer = setTimeout(() => {
+          if (token !== state.applyTimerToken) {
+            postDebug("scheduleApply-cancelled", runtimeLabel({
+              reason,
+              delay,
+              branch: "token-stale",
+              cancelReason: "superseded",
+              token,
+              activeToken: state.applyTimerToken
+            }));
+            return;
+          }
+
+          state.applyTimer = null;
+          state.applyTimerMetadata = null;
+          const firedStableState = stableFocusVideoState();
+          if (firedStableState.stable) {
+            postDebug("scheduleApply-cancelled", runtimeLabel({
+              reason,
+              delay,
+              branch: "stable-before-fire",
+              cancelReason: "stable-before-fire",
+              stableReady: firedStableState.ready ? 1 : 0,
+              stableRenderable: firedStableState.renderableNativeAugment ? 1 : 0,
+              stableVisibleVideo: firedStableState.visiblePrimaryVideo ? 1 : 0
+            }));
+            return;
+          }
+
           state.lastApplyAt = Date.now();
           applyAll();
-          postDebug("scheduleApply", reason);
+          postDebug("scheduleApply", runtimeLabel({ reason, delay, branch: "timer-fired" }));
         }, delay);
+        postDebug("scheduleApply-queued", runtimeLabel({ reason, delay, branch: "timer-queued" }));
       }
     }
 
@@ -272,6 +419,74 @@
       ].join(","));
     }
 
+    function isSuppressedVideoAuxiliaryNode(node) {
+      if (!node) {
+        return false;
+      }
+
+      const element = node.nodeType === 1 ? node : node.parentElement;
+      if (!element) {
+        return false;
+      }
+
+      return !!element.closest([
+        ".side-toolbar",
+        ".right-entry",
+        "[class*='side-toolbar']",
+        "[class*='right-entry']"
+      ].join(","));
+    }
+
+    function hasRenderableNativeVideoAugment() {
+      const root = document.getElementById("focus-native-video-augment");
+      if (!(root instanceof HTMLElement)) {
+        return false;
+      }
+
+      const renderKey = root.getAttribute("data-focus-render-key");
+      const version = root.getAttribute("data-focus-version");
+      const isPlaceholder = root.hasAttribute("data-focus-placeholder");
+      return !!renderKey && !!version && !isPlaceholder && root.children.length > 0;
+    }
+
+    function hasVisiblePrimaryVideo() {
+      return Array.from(document.querySelectorAll("video")).some((node) => {
+        if (!(node instanceof HTMLVideoElement)) {
+          return false;
+        }
+
+        const rect = node.getBoundingClientRect();
+        return rect.width > 120 && rect.height > 68;
+      });
+    }
+
+    function hasVisiblePlayerLoadingOverlay() {
+      return Array.from(document.querySelectorAll([
+        "#bilibili-player [class*='loading']",
+        "#playerWrap [class*='loading']",
+        ".bpx-player-container [class*='loading']",
+        "#bilibili-player [class*='skeleton']",
+        "#playerWrap [class*='skeleton']",
+        ".bpx-player-container [class*='skeleton']"
+      ].join(","))).some((node) => {
+        if (!(node instanceof HTMLElement)) {
+          return false;
+        }
+
+        const rect = node.getBoundingClientRect();
+        const style = window.getComputedStyle(node);
+        return rect.width > 40
+          && rect.height > 40
+          && style.display !== "none"
+          && style.visibility !== "hidden"
+          && style.opacity !== "0";
+      });
+    }
+
+    function isStableFocusVideoPage() {
+      return stableFocusVideoState().stable;
+    }
+
     function shouldScheduleForMutations(mutations) {
       if (!mutations || mutations.length === 0) {
         return false;
@@ -281,6 +496,35 @@
       const isVideoPage = path.indexOf("/video/") === 0 || path.indexOf("/bangumi/play/") === 0;
       if (!isVideoPage) {
         return true;
+      }
+
+      if (hasVisiblePrimaryVideo() && hasVisiblePlayerLoadingOverlay()) {
+        cancelPendingApply("player-loading-overlay-visible", {
+          mutationCount: mutations.length,
+          playerLoadingVisible: 1
+        });
+        postDebug("mutation-skip-player-loading", runtimeLabel({
+          mutationCount: mutations.length,
+          playerLoadingVisible: 1
+        }));
+        return false;
+      }
+
+      if (isStableFocusVideoPage()) {
+        const currentStableState = stableFocusVideoState();
+        cancelPendingApply("stable-mutation-skip", {
+          mutationCount: mutations.length,
+          stableReady: currentStableState.ready ? 1 : 0,
+          stableRenderable: currentStableState.renderableNativeAugment ? 1 : 0,
+          stableVisibleVideo: currentStableState.visiblePrimaryVideo ? 1 : 0
+        });
+        postDebug("mutation-skip-stable-video", runtimeLabel({
+          mutationCount: mutations.length,
+          stableReady: currentStableState.ready ? 1 : 0,
+          stableRenderable: currentStableState.renderableNativeAugment ? 1 : 0,
+          stableVisibleVideo: currentStableState.visiblePrimaryVideo ? 1 : 0
+        }));
+        return false;
       }
 
       return mutations.some((mutation) => {
@@ -297,6 +541,10 @@
           return false;
         }
 
+        if (target && target.nodeType === 1 && isSuppressedVideoAuxiliaryNode(target)) {
+          return false;
+        }
+
         if (target && target.nodeType === 1 && !isIgnoredPlayerMutationTarget(target)) {
           return true;
         }
@@ -307,6 +555,10 @@
           }
 
           if (isFocusManagedNode(node)) {
+            return false;
+          }
+
+          if (isSuppressedVideoAuxiliaryNode(node)) {
             return false;
           }
 
@@ -327,14 +579,20 @@
 
     function installHistoryHooks() {
       if (state.historyInstalled) {
+        postDebug("installHistoryHooks-skipped", runtimeLabel({ reason: "already-installed" }));
         return;
       }
 
       state.historyInstalled = true;
+      postDebug("installHistoryHooks", runtimeLabel());
       const wrap = (method) => {
         const original = history[method];
         history[method] = function () {
-          const result = original.apply(this, arguments);
+          const args = Array.from(arguments);
+          if (args.length >= 3) {
+            args[2] = normalizeHistoryURLArgument(args[2]);
+          }
+          const result = original.apply(this, args);
           scheduleApply(method);
           return result;
         };
@@ -348,10 +606,12 @@
 
     function installObserver() {
       if (state.observerInstalled) {
+        postDebug("installObserver-skipped", runtimeLabel({ reason: "already-installed" }));
         return;
       }
 
       state.observerInstalled = true;
+      postDebug("installObserver", runtimeLabel());
       const observer = new MutationObserver((mutations) => {
         if (shouldScheduleForMutations(mutations)) {
           scheduleApply("mutation");
@@ -364,19 +624,23 @@
     }
 
     return {
-      update(config, rules) {
+      update(config, rules, currentPhase) {
         window[configKey] = config;
         window.__FOCUS_RULES__ = rules;
+        if (currentPhase) {
+          state.currentPhase = currentPhase;
+        }
       },
       applyPhase,
       applyAll,
+      cancelPendingApply,
       installHistoryHooks,
       installObserver
     };
   }
 
   const runtime = window[runtimeKey] || createRuntime();
-  runtime.update(incomingConfig, incomingRules);
+  runtime.update(incomingConfig, incomingRules, phase);
   window[runtimeKey] = runtime;
 
   if (phase === "documentEnd") {
