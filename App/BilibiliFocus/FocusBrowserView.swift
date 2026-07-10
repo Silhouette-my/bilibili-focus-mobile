@@ -156,7 +156,8 @@ struct FocusBrowserView: View {
 
     @ViewBuilder
     private var nativeContentLayer: some View {
-        ZStack {
+        switch viewModel.route {
+        case .dynamicFeed:
             FocusDynamicFeedView(
                 viewModel: viewModel.dynamicFeedViewModel,
                 settingsStore: settingsStore,
@@ -171,10 +172,7 @@ struct FocusBrowserView: View {
                     viewModel.presentSearchEntry()
                 }
             )
-            .opacity(isDynamicRouteActive ? 1 : 0)
-            .allowsHitTesting(isDynamicRouteActive)
-            .accessibilityHidden(!isDynamicRouteActive)
-
+        case .searchResults:
             FocusSearchResultsView(
                 viewModel: viewModel.searchResultsViewModel,
                 onOpenItem: { item in
@@ -187,10 +185,7 @@ struct FocusBrowserView: View {
                     viewModel.presentSearchEntry()
                 }
             )
-            .opacity(isSearchRouteActive ? 1 : 0)
-            .allowsHitTesting(isSearchRouteActive)
-            .accessibilityHidden(!isSearchRouteActive)
-
+        case .my:
             FocusMyView(
                 viewModel: viewModel.myViewModel,
                 onOpenLogin: viewModel.openLogin,
@@ -202,32 +197,23 @@ struct FocusBrowserView: View {
                     viewModel.openMyVideo(url)
                 }
             )
-            .opacity(isMyRouteActive ? 1 : 0)
-            .allowsHitTesting(isMyRouteActive)
-            .accessibilityHidden(!isMyRouteActive)
-
+        case .history:
             FocusHistoryView(
                 viewModel: viewModel.historyViewModel,
                 onOpenVideo: { url in
                     viewModel.openMyVideo(url)
                 }
             )
-            .opacity(isHistoryRouteActive ? 1 : 0)
-            .allowsHitTesting(isHistoryRouteActive)
-            .accessibilityHidden(!isHistoryRouteActive)
-
+        case .favoriteFolder:
             FocusFavoriteFolderView(
                 viewModel: viewModel.favoriteFolderViewModel,
                 onOpenVideo: { url in
                     viewModel.openMyVideo(url)
                 }
             )
-            .opacity(isFavoriteFolderRouteActive ? 1 : 0)
-            .allowsHitTesting(isFavoriteFolderRouteActive)
-            .accessibilityHidden(!isFavoriteFolderRouteActive)
-
+        case let .userSpace(routeID, _):
             FocusUserSpaceView(
-                viewModel: viewModel.userSpaceViewModel,
+                viewModel: viewModel.userSpaceViewModel(for: routeID),
                 onOpenVideo: { url in
                     viewModel.openOpusRelatedURL(url)
                 },
@@ -238,22 +224,16 @@ struct FocusBrowserView: View {
                     viewModel.openOpusRelatedURL(url)
                 }
             )
-            .opacity(isUserSpaceRouteActive ? 1 : 0)
-            .allowsHitTesting(isUserSpaceRouteActive)
-            .accessibilityHidden(!isUserSpaceRouteActive)
-
+        case let .userCollection(routeID, _):
             FocusUserCollectionView(
-                viewModel: viewModel.userCollectionViewModel,
+                viewModel: viewModel.userCollectionViewModel(for: routeID),
                 onOpenVideo: { url in
                     viewModel.openOpusRelatedURL(url)
                 }
             )
-            .opacity(isUserCollectionRouteActive ? 1 : 0)
-            .allowsHitTesting(isUserCollectionRouteActive)
-            .accessibilityHidden(!isUserCollectionRouteActive)
-
+        case let .article(routeID, _):
             FocusArticleView(
-                viewModel: viewModel.articleViewModel,
+                viewModel: viewModel.articleViewModel(for: routeID),
                 onOpenUser: { mid in
                     guard let url = URL(string: "https://space.bilibili.com/\(mid)") else {
                         return
@@ -261,83 +241,16 @@ struct FocusBrowserView: View {
                     viewModel.openNativeUserSpace(url)
                 }
             )
-            .opacity(isArticleRouteActive ? 1 : 0)
-            .allowsHitTesting(isArticleRouteActive)
-            .accessibilityHidden(!isArticleRouteActive)
-
+        case let .opus(routeID, _):
             FocusOpusDetailView(
-                viewModel: viewModel.opusDetailViewModel,
+                viewModel: viewModel.opusDetailViewModel(for: routeID),
                 onOpenURL: { url in
                     viewModel.openOpusRelatedURL(url)
                 }
             )
-            .opacity(isOpusRouteActive ? 1 : 0)
-            .allowsHitTesting(isOpusRouteActive)
-            .accessibilityHidden(!isOpusRouteActive)
+        case .browser:
+            EmptyView()
         }
-    }
-
-    private var isDynamicRouteActive: Bool {
-        if case .dynamicFeed = viewModel.route {
-            return true
-        }
-        return false
-    }
-
-    private var isSearchRouteActive: Bool {
-        if case .searchResults(_) = viewModel.route {
-            return true
-        }
-        return false
-    }
-
-    private var isMyRouteActive: Bool {
-        if case .my = viewModel.route {
-            return true
-        }
-        return false
-    }
-
-    private var isHistoryRouteActive: Bool {
-        if case .history = viewModel.route {
-            return true
-        }
-        return false
-    }
-
-    private var isFavoriteFolderRouteActive: Bool {
-        if case .favoriteFolder(_) = viewModel.route {
-            return true
-        }
-        return false
-    }
-
-    private var isUserSpaceRouteActive: Bool {
-        if case .userSpace(_) = viewModel.route {
-            return true
-        }
-        return false
-    }
-
-    private var isUserCollectionRouteActive: Bool {
-        if case .userCollection(_) = viewModel.route {
-            return true
-        }
-        return false
-    }
-
-    private var isArticleRouteActive: Bool {
-        if case .article(_) = viewModel.route {
-            return true
-        }
-        return false
-    }
-
-    private var isOpusRouteActive: Bool {
-        if case .opus(_) = viewModel.route {
-            return true
-        }
-        return false
     }
 
     private func bottomChrome(safeAreaBottom: CGFloat) -> some View {

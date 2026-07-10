@@ -49,22 +49,30 @@ final class FocusAppViewModel: ObservableObject {
         case my
     }
 
-    enum Route {
+    struct RouteID: Hashable, Sendable {
+        let rawValue: UUID
+
+        init(rawValue: UUID = UUID()) {
+            self.rawValue = rawValue
+        }
+    }
+
+    enum AppRoute {
         case dynamicFeed
         case searchResults(SearchQuery)
         case my
         case history
         case favoriteFolder(FocusMyFolder)
-        case userSpace(URL)
-        case userCollection(FocusUserSpaceCollection)
-        case article(URL)
-        case opus(URL)
-        case browser(URL)
+        case userSpace(RouteID, URL)
+        case userCollection(RouteID, FocusUserSpaceCollection)
+        case article(RouteID, URL)
+        case opus(RouteID, URL)
+        case browser(URL, FocusBrowserViewModel.EntryContext)
     }
 
     private static let loginURL = URL(string: "https://passport.bilibili.com/login")!
 
-    @Published private(set) var route: Route = .dynamicFeed
+    @Published private(set) var routeStack: [AppRoute] = [.dynamicFeed]
     @Published private(set) var hasInstantiatedBrowser = false
     @Published var showSettings = false
     @Published var showSearch = false
@@ -77,23 +85,24 @@ final class FocusAppViewModel: ObservableObject {
     let myViewModel: FocusMyViewModel
     let historyViewModel: FocusHistoryViewModel
     let favoriteFolderViewModel: FocusFavoriteFolderViewModel
-    let userSpaceViewModel: FocusUserSpaceViewModel
-    let userCollectionViewModel: FocusUserCollectionViewModel
-    let articleViewModel: FocusArticleViewModel
-    let opusDetailViewModel: FocusOpusDetailViewModel
     private let cookieProvider: WebViewCookieSnapshotProvider
     private let nativePageAugmentService: FocusNativePageAugmentService
+    private let userSpaceService: FocusUserSpaceService
+    private let userCollectionService: FocusUserSpaceService
+    private let articleService: FocusArticleService
+    private let opusDetailService: FocusOpusDetailService
+    private var userSpaceViewModels: [RouteID: FocusUserSpaceViewModel] = [:]
+    private var userCollectionViewModels: [RouteID: FocusUserCollectionViewModel] = [:]
+    private var articleViewModels: [RouteID: FocusArticleViewModel] = [:]
+    private var opusDetailViewModels: [RouteID: FocusOpusDetailViewModel] = [:]
 
     private var didHandleLaunchEntry = false
     private var didRefreshOnBecomeActive = false
-    private var browserReturnRoute: Route = .dynamicFeed
-    private var historyReturnRoute: Route = .my
-    private var favoriteFolderReturnRoute: Route = .my
-    private var userSpaceReturnRoute: Route = .dynamicFeed
-    private var userCollectionReturnRoute: Route = .dynamicFeed
-    private var articleReturnRoute: Route = .dynamicFeed
-    private var opusReturnRoute: Route = .dynamicFeed
-    private var cancellables: Set<AnyCancellable> = []
+    private var activeRouteCancellables: Set<AnyCancellable> = []
+
+    var route: AppRoute {
+        routeStack.last ?? .dynamicFeed
+    }
 
     init(settingsStore: FocusSettingsStore) {
         self.settingsStore = settingsStore
@@ -111,19 +120,10 @@ final class FocusAppViewModel: ObservableObject {
         let myViewModel = FocusMyViewModel(service: myDataService)
         let historyViewModel = FocusHistoryViewModel(service: myDataService)
         let favoriteFolderViewModel = FocusFavoriteFolderViewModel(service: myDataService)
-        let userSpaceViewModel = FocusUserSpaceViewModel(
-            service: FocusUserSpaceService(cookieProvider: cookieProvider)
-        )
-        let userCollectionViewModel = FocusUserCollectionViewModel(
-            service: FocusUserSpaceService(cookieProvider: cookieProvider)
-        )
-        let articleViewModel = FocusArticleViewModel(
-            service: FocusArticleService(cookieProvider: cookieProvider)
-        )
-        let opusDetailViewModel = FocusOpusDetailViewModel(
-            detailService: FocusOpusDetailService(cookieProvider: cookieProvider),
-            augmentService: nativePageAugmentService
-        )
+        let userSpaceService = FocusUserSpaceService(cookieProvider: cookieProvider)
+        let userCollectionService = FocusUserSpaceService(cookieProvider: cookieProvider)
+        let articleService = FocusArticleService(cookieProvider: cookieProvider)
+        let opusDetailService = FocusOpusDetailService(cookieProvider: cookieProvider)
 
         self.browserViewModel = browserViewModel
         self.cookieProvider = cookieProvider
@@ -133,10 +133,10 @@ final class FocusAppViewModel: ObservableObject {
         self.myViewModel = myViewModel
         self.historyViewModel = historyViewModel
         self.favoriteFolderViewModel = favoriteFolderViewModel
-        self.userSpaceViewModel = userSpaceViewModel
-        self.userCollectionViewModel = userCollectionViewModel
-        self.articleViewModel = articleViewModel
-        self.opusDetailViewModel = opusDetailViewModel
+        self.userSpaceService = userSpaceService
+        self.userCollectionService = userCollectionService
+        self.articleService = articleService
+        self.opusDetailService = opusDetailService
         browserViewModel.nativePageAugmentService = nativePageAugmentService
 
         browserViewModel.onEntryRequest = { [weak self] entry in
@@ -151,20 +151,92 @@ final class FocusAppViewModel: ObservableObject {
             }
         }
 
-        let browserPresentationChanges: [AnyPublisher<Void, Never>] = [
-            browserViewModel.$navigationTitle.removeDuplicates().dropFirst().map { _ in () }.eraseToAnyPublisher(),
-            browserViewModel.$currentURL.removeDuplicates().dropFirst().map { _ in () }.eraseToAnyPublisher(),
-            browserViewModel.$entryContext.removeDuplicates().dropFirst().map { _ in () }.eraseToAnyPublisher(),
-            browserViewModel.$hasActiveVideoRoute.removeDuplicates().dropFirst().map { _ in () }.eraseToAnyPublisher(),
-            browserViewModel.$playerSnapshot.removeDuplicates().dropFirst().map { _ in () }.eraseToAnyPublisher(),
-            browserViewModel.$isLoadingPage.removeDuplicates().dropFirst().map { _ in () }.eraseToAnyPublisher(),
-            browserViewModel.$webContentFailureMessage.removeDuplicates().dropFirst().map { _ in () }.eraseToAnyPublisher()
-        ]
-        Publishers.MergeMany(browserPresentationChanges)
-            .sink { [weak self] in
-                self?.objectWillChange.send()
-            }
-            .store(in: &cancellables)
+        observeActiveRoute()
+    }
+
+    func userSpaceViewModel(for routeID: RouteID) -> FocusUserSpaceViewModel {
+        if let viewModel = userSpaceViewModels[routeID] {
+            return viewModel
+        }
+        let viewModel = FocusUserSpaceViewModel(service: userSpaceService)
+        userSpaceViewModels[routeID] = viewModel
+        return viewModel
+    }
+
+    func userCollectionViewModel(for routeID: RouteID) -> FocusUserCollectionViewModel {
+        if let viewModel = userCollectionViewModels[routeID] {
+            return viewModel
+        }
+        let viewModel = FocusUserCollectionViewModel(service: userCollectionService)
+        userCollectionViewModels[routeID] = viewModel
+        return viewModel
+    }
+
+    func articleViewModel(for routeID: RouteID) -> FocusArticleViewModel {
+        if let viewModel = articleViewModels[routeID] {
+            return viewModel
+        }
+        let viewModel = FocusArticleViewModel(service: articleService)
+        articleViewModels[routeID] = viewModel
+        return viewModel
+    }
+
+    func opusDetailViewModel(for routeID: RouteID) -> FocusOpusDetailViewModel {
+        if let viewModel = opusDetailViewModels[routeID] {
+            return viewModel
+        }
+        let viewModel = FocusOpusDetailViewModel(
+            detailService: opusDetailService,
+            augmentService: nativePageAugmentService
+        )
+        opusDetailViewModels[routeID] = viewModel
+        return viewModel
+    }
+
+    private func observeActiveRoute() {
+        activeRouteCancellables.removeAll()
+
+        switch route {
+        case .dynamicFeed:
+            forwardActiveChanges(from: dynamicFeedViewModel)
+        case .searchResults:
+            forwardActiveChanges(from: searchResultsViewModel)
+        case .my:
+            forwardActiveChanges(from: myViewModel)
+        case .history:
+            forwardActiveChanges(from: historyViewModel)
+        case .favoriteFolder:
+            forwardActiveChanges(from: favoriteFolderViewModel)
+        case let .userSpace(routeID, _):
+            forwardActiveChanges(from: userSpaceViewModel(for: routeID))
+        case let .userCollection(routeID, _):
+            forwardActiveChanges(from: userCollectionViewModel(for: routeID))
+        case let .article(routeID, _):
+            forwardActiveChanges(from: articleViewModel(for: routeID))
+        case let .opus(routeID, _):
+            forwardActiveChanges(from: opusDetailViewModel(for: routeID))
+        case .browser:
+            let presentationChanges: [AnyPublisher<Void, Never>] = [
+                browserViewModel.$navigationTitle.removeDuplicates().map { _ in () }.eraseToAnyPublisher(),
+                browserViewModel.$currentURL.removeDuplicates().map { _ in () }.eraseToAnyPublisher(),
+                browserViewModel.$entryContext.removeDuplicates().map { _ in () }.eraseToAnyPublisher(),
+                browserViewModel.$hasActiveVideoRoute.removeDuplicates().map { _ in () }.eraseToAnyPublisher(),
+                browserViewModel.$playerSnapshot.removeDuplicates().map { _ in () }.eraseToAnyPublisher(),
+                browserViewModel.$isLoadingPage.removeDuplicates().map { _ in () }.eraseToAnyPublisher(),
+                browserViewModel.$webContentFailureMessage.removeDuplicates().map { _ in () }.eraseToAnyPublisher()
+            ]
+            Publishers.MergeMany(presentationChanges)
+                .dropFirst(presentationChanges.count)
+                .sink { [weak self] in self?.objectWillChange.send() }
+                .store(in: &activeRouteCancellables)
+        }
+    }
+
+    private func forwardActiveChanges<Object: ObservableObject>(from object: Object)
+    where Object.ObjectWillChangePublisher == ObservableObjectPublisher {
+        object.objectWillChange
+            .sink { [weak self] in self?.objectWillChange.send() }
+            .store(in: &activeRouteCancellables)
     }
 
     var navigationTitle: String {
@@ -177,55 +249,27 @@ final class FocusAppViewModel: ObservableObject {
             return myViewModel.navigationTitle
         case .history:
             return historyViewModel.navigationTitle
-        case .favoriteFolder(_):
+        case .favoriteFolder:
             return favoriteFolderViewModel.navigationTitle
-        case .userSpace(_):
-            return userSpaceViewModel.navigationTitle
-        case .userCollection(_):
-            return userCollectionViewModel.navigationTitle
-        case .article(_):
-            return articleViewModel.navigationTitle
-        case .opus(_):
-            return opusDetailViewModel.navigationTitle
-        case .browser(_):
+        case let .userSpace(routeID, _):
+            return userSpaceViewModel(for: routeID).navigationTitle
+        case let .userCollection(routeID, _):
+            return userCollectionViewModel(for: routeID).navigationTitle
+        case let .article(routeID, _):
+            return articleViewModel(for: routeID).navigationTitle
+        case let .opus(routeID, _):
+            return opusDetailViewModel(for: routeID).navigationTitle
+        case .browser:
             return browserViewModel.navigationTitle
         }
     }
 
     var activePrimaryTab: PrimaryTab {
-        switch route {
-        case .dynamicFeed:
-            return .dynamic
-        case .searchResults(_):
-            return .search
-        case .my:
-            return .my
-        case .history:
-            return .my
-        case .favoriteFolder(_):
-            return .my
-        case .userSpace(_):
-            return primaryTab(for: userSpaceReturnRoute)
-        case .userCollection(_):
-            return primaryTab(for: userCollectionReturnRoute)
-        case .article(_):
-            return primaryTab(for: articleReturnRoute)
-        case .opus(_):
-            return primaryTab(for: opusReturnRoute)
-        case .browser(_):
-            switch browserViewModel.entryContext {
-            case .dynamic:
-                return .dynamic
-            case .search:
-                return .search
-            case .my:
-                return .my
-            }
-        }
+        primaryTab(for: routeStack.first ?? .dynamicFeed)
     }
 
     var isBrowserActive: Bool {
-        if case .browser(_) = route {
+        if case .browser = route {
             return true
         }
         return false
@@ -236,28 +280,122 @@ final class FocusAppViewModel: ObservableObject {
     }
 
     var showsBackButton: Bool {
-        if isBrowserActive {
-            return true
+        routeStack.count > 1
+    }
+
+    private func setRootRoute(_ newRoute: AppRoute) {
+        suspend(route)
+        routeStack.dropFirst().forEach(cleanUpRoute)
+        routeStack = [newRoute]
+        observeActiveRoute()
+        activate(newRoute)
+    }
+
+    private func pushRoute(_ newRoute: AppRoute) {
+        snapshotActiveBrowserURL()
+        suspend(route)
+        routeStack.append(newRoute)
+        observeActiveRoute()
+        activate(newRoute)
+    }
+
+    @discardableResult
+    private func popRoute() -> Bool {
+        guard routeStack.count > 1, let removedRoute = routeStack.last else {
+            return false
         }
-        if case .opus(_) = route {
-            return true
+        suspend(removedRoute)
+        cleanUpRoute(removedRoute)
+        routeStack.removeLast()
+        observeActiveRoute()
+        activate(route)
+        return true
+    }
+
+    private func snapshotActiveBrowserURL() {
+        guard
+            case let .browser(_, context) = route,
+            let currentURL = browserViewModel.currentURL.map(FocusNavigationPolicy.canonicalWebURL(for:)),
+            !routeStack.isEmpty
+        else {
+            return
         }
-        if case .history = route {
-            return true
+        routeStack[routeStack.count - 1] = .browser(currentURL, context)
+    }
+
+    private func suspend(_ route: AppRoute) {
+        switch route {
+        case .dynamicFeed:
+            dynamicFeedViewModel.suspend()
+        case .searchResults:
+            searchResultsViewModel.suspend()
+        case .my:
+            myViewModel.suspend()
+        case .history:
+            historyViewModel.suspend()
+        case .favoriteFolder:
+            favoriteFolderViewModel.suspend()
+        case let .userSpace(routeID, _):
+            userSpaceViewModels[routeID]?.suspend()
+        case let .userCollection(routeID, _):
+            userCollectionViewModels[routeID]?.suspend()
+        case let .article(routeID, _):
+            articleViewModels[routeID]?.suspend()
+        case let .opus(routeID, _):
+            opusDetailViewModels[routeID]?.suspend()
+        case .browser:
+            browserViewModel.prepareForDismiss()
         }
-        if case .favoriteFolder(_) = route {
-            return true
+    }
+
+    private func activate(_ route: AppRoute) {
+        switch route {
+        case .dynamicFeed:
+            dynamicFeedViewModel.loadIfNeeded()
+        case .searchResults:
+            searchResultsViewModel.loadIfNeeded()
+        case .my:
+            myViewModel.refreshForAppearance()
+        case .history:
+            historyViewModel.loadIfNeeded()
+        case .favoriteFolder:
+            favoriteFolderViewModel.loadIfNeeded()
+        case let .userSpace(routeID, url):
+            let viewModel = userSpaceViewModel(for: routeID)
+            viewModel.open(url)
+            viewModel.loadIfNeeded()
+        case let .userCollection(routeID, collection):
+            let viewModel = userCollectionViewModel(for: routeID)
+            viewModel.open(collection)
+            viewModel.loadIfNeeded()
+        case let .article(routeID, url):
+            let viewModel = articleViewModel(for: routeID)
+            viewModel.open(url)
+            viewModel.loadIfNeeded()
+        case let .opus(routeID, url):
+            opusDetailViewModel(for: routeID).open(url)
+        case let .browser(url, context):
+            if !browserViewModel.isSessionActive
+                || browserViewModel.currentURL.map(FocusNavigationPolicy.canonicalWebURL(for:)) != url
+            {
+                browserViewModel.open(url, context: context)
+            }
         }
-        if case .userSpace(_) = route {
-            return true
+    }
+
+    private func cleanUpRoute(_ route: AppRoute) {
+        switch route {
+        case let .userSpace(routeID, _):
+            userSpaceViewModels[routeID] = nil
+        case let .userCollection(routeID, _):
+            userCollectionViewModels[routeID] = nil
+        case let .article(routeID, _):
+            articleViewModels[routeID] = nil
+        case let .opus(routeID, _):
+            opusDetailViewModels[routeID] = nil
+        default:
+            break
         }
-        if case .userCollection(_) = route {
-            return true
-        }
-        if case .article(_) = route {
-            return true
-        }
-        return false
     }
 
     func handleLaunchEntryIfNeeded() {
@@ -276,11 +414,7 @@ final class FocusAppViewModel: ObservableObject {
     func open(_ entry: FocusEntry) {
         switch entry {
         case .dynamic:
-            if isBrowserActive {
-                browserViewModel.prepareForDismiss()
-            }
-            route = .dynamicFeed
-            dynamicFeedViewModel.loadIfNeeded()
+            setRootRoute(.dynamicFeed)
         case .search:
             presentSearchEntry()
         }
@@ -348,9 +482,9 @@ final class FocusAppViewModel: ObservableObject {
     }
 
     func openUserCollection(_ collection: FocusUserSpaceCollection) {
-        userCollectionReturnRoute = routeForCurrentNativeContext()
-        route = .userCollection(collection)
-        userCollectionViewModel.open(collection)
+        let routeID = RouteID()
+        _ = userCollectionViewModel(for: routeID)
+        pushRoute(.userCollection(routeID, collection))
     }
 
     func submitSearch() {
@@ -360,7 +494,7 @@ final class FocusAppViewModel: ObservableObject {
         }
 
         showSearch = false
-        route = .searchResults(query)
+        setRootRoute(.searchResults(query))
         searchResultsViewModel.search(query)
         searchKeyword = ""
     }
@@ -375,29 +509,16 @@ final class FocusAppViewModel: ObservableObject {
     }
 
     func openMy() {
-        if isBrowserActive {
-            browserViewModel.prepareForDismiss()
-        }
-        route = .my
-        myViewModel.refreshForAppearance()
+        setRootRoute(.my)
     }
 
     func openHistory() {
-        if isBrowserActive {
-            browserViewModel.prepareForDismiss()
-        }
-        historyReturnRoute = routeForCurrentNativeContext()
-        route = .history
-        historyViewModel.loadIfNeeded()
+        pushRoute(.history)
     }
 
     func openFavoriteFolder(_ folder: FocusMyFolder) {
-        if isBrowserActive {
-            browserViewModel.prepareForDismiss()
-        }
-        favoriteFolderReturnRoute = routeForCurrentNativeContext()
-        route = .favoriteFolder(folder)
         favoriteFolderViewModel.open(folder)
+        pushRoute(.favoriteFolder(folder))
     }
 
     func openLogin() {
@@ -414,17 +535,17 @@ final class FocusAppViewModel: ObservableObject {
             myViewModel.reload()
         case .history:
             historyViewModel.reload()
-        case .favoriteFolder(_):
+        case .favoriteFolder:
             favoriteFolderViewModel.reload()
-        case .userSpace(_):
-            userSpaceViewModel.reload()
-        case .userCollection(_):
-            userCollectionViewModel.reload()
-        case .article(_):
-            articleViewModel.reload()
-        case .opus(_):
-            opusDetailViewModel.reload()
-        case .browser(_):
+        case let .userSpace(routeID, _):
+            userSpaceViewModel(for: routeID).reload()
+        case let .userCollection(routeID, _):
+            userCollectionViewModel(for: routeID).reload()
+        case let .article(routeID, _):
+            articleViewModel(for: routeID).reload()
+        case let .opus(routeID, _):
+            opusDetailViewModel(for: routeID).reload()
+        case .browser:
             browserViewModel.reload()
         }
     }
@@ -443,27 +564,7 @@ final class FocusAppViewModel: ObservableObject {
     }
 
     func goBack() {
-        if isBrowserActive {
-            browserViewModel.goBack()
-            return
-        }
-
-        switch route {
-        case .history:
-            closeHistory()
-        case .favoriteFolder(_):
-            closeFavoriteFolder()
-        case .userSpace(_):
-            closeUserSpace()
-        case .userCollection(_):
-            closeUserCollection()
-        case .article(_):
-            closeArticle()
-        case .opus(_):
-            closeOpus()
-        default:
-            break
-        }
+        handleTopLevelBack()
     }
 
     func handleBrowserBack() {
@@ -484,36 +585,7 @@ final class FocusAppViewModel: ObservableObject {
             handleBrowserBack()
             return
         }
-
-        if case .opus(_) = route {
-            closeOpus()
-            return
-        }
-
-        if case .history = route {
-            closeHistory()
-            return
-        }
-
-        if case .favoriteFolder(_) = route {
-            closeFavoriteFolder()
-            return
-        }
-
-        if case .userSpace(_) = route {
-            closeUserSpace()
-            return
-        }
-
-        if case .userCollection(_) = route {
-            closeUserCollection()
-            return
-        }
-
-        if case .article(_) = route {
-            closeArticle()
-            return
-        }
+        _ = popRoute()
     }
 
     func goForward() {
@@ -524,57 +596,26 @@ final class FocusAppViewModel: ObservableObject {
     }
 
     func closeBrowser() {
-        browserViewModel.prepareForDismiss()
-        switch browserReturnRoute {
-        case .dynamicFeed:
-            route = .dynamicFeed
-        case .searchResults(_):
-            route = browserReturnRoute
-        case .my:
-            route = .my
-        case .history:
-            route = browserReturnRoute
-        case .favoriteFolder(_):
-            route = browserReturnRoute
-        case .userSpace(_):
-            route = browserReturnRoute
-        case .userCollection(_):
-            route = browserReturnRoute
-        case .article(_):
-            route = browserReturnRoute
-        case .opus(_):
-            route = browserReturnRoute
-        case .browser(_):
-            route = .dynamicFeed
-        }
+        _ = popRoute()
     }
 
     private func openBrowser(_ url: URL, context: FocusBrowserViewModel.EntryContext) {
         let canonicalURL = FocusNavigationPolicy.canonicalWebURL(for: url)
         hasInstantiatedBrowser = true
-        if case .browser(_) = route {
-            // Keep the current return route while navigating within the browser shell.
+        if case .browser = route, !routeStack.isEmpty {
+            routeStack[routeStack.count - 1] = .browser(canonicalURL, context)
+            observeActiveRoute()
+            browserViewModel.open(canonicalURL, context: context)
         } else {
-            browserReturnRoute = route
+            pushRoute(.browser(canonicalURL, context))
         }
-        route = .browser(canonicalURL)
-        browserViewModel.open(canonicalURL, context: context)
-    }
-
-    private func warmBrowserShell(_ url: URL, context: FocusBrowserViewModel.EntryContext) {
-        let canonicalURL = FocusNavigationPolicy.canonicalWebURL(for: url)
-        hasInstantiatedBrowser = true
-        browserViewModel.open(canonicalURL, context: context)
     }
 
     private func openOpus(_ url: URL) {
         let canonicalURL = FocusNavigationPolicy.canonicalWebURL(for: url)
-        if isBrowserActive {
-            browserViewModel.prepareForDismiss()
-        }
-        opusReturnRoute = routeForCurrentNativeContext()
-        route = .opus(canonicalURL)
-        opusDetailViewModel.open(canonicalURL)
+        let routeID = RouteID()
+        _ = opusDetailViewModel(for: routeID)
+        pushRoute(.opus(routeID, canonicalURL))
     }
 
     private func openUserSpace(_ url: URL) {
@@ -584,12 +625,9 @@ final class FocusAppViewModel: ObservableObject {
             return
         }
 
-        if isBrowserActive {
-            browserViewModel.prepareForDismiss()
-        }
-        userSpaceReturnRoute = routeForCurrentNativeContext()
-        route = .userSpace(canonicalURL)
-        userSpaceViewModel.open(canonicalURL)
+        let routeID = RouteID()
+        _ = userSpaceViewModel(for: routeID)
+        pushRoute(.userSpace(routeID, canonicalURL))
     }
 
     private func openArticle(_ url: URL) {
@@ -599,171 +637,17 @@ final class FocusAppViewModel: ObservableObject {
             return
         }
 
-        if isBrowserActive {
-            browserViewModel.prepareForDismiss()
-        }
-        articleReturnRoute = routeForCurrentNativeContext()
-        route = .article(canonicalURL)
-        articleViewModel.open(canonicalURL)
+        let routeID = RouteID()
+        _ = articleViewModel(for: routeID)
+        pushRoute(.article(routeID, canonicalURL))
     }
 
     private func openVideo(_ url: URL) {
         let canonicalURL = FocusNavigationPolicy.canonicalWebURL(for: url)
 
         // 直接在 WebView 中打开视频页面
-        let returnRoute = routeForCurrentNativeContext()
-        let context = entryContext(for: primaryTab(for: returnRoute))
+        let context = entryContext(for: activePrimaryTab)
         openBrowser(canonicalURL, context: context)
-    }
-
-    private func closeOpus() {
-        switch opusReturnRoute {
-        case .dynamicFeed:
-            route = .dynamicFeed
-        case .searchResults(_):
-            route = opusReturnRoute
-        case .my:
-            route = .my
-        case .history:
-            route = opusReturnRoute
-        case .favoriteFolder(_):
-            route = opusReturnRoute
-        case .userSpace(_):
-            route = opusReturnRoute
-        case .userCollection(_):
-            route = opusReturnRoute
-        case .article(_):
-            route = opusReturnRoute
-        case .opus(_):
-            route = .dynamicFeed
-        case .browser(_):
-            route = .dynamicFeed
-        }
-    }
-
-    private func closeHistory() {
-        switch historyReturnRoute {
-        case .dynamicFeed:
-            route = .dynamicFeed
-        case .searchResults(_):
-            route = historyReturnRoute
-        case .my:
-            route = .my
-        case .history:
-            route = .my
-        case .userSpace(_):
-            route = historyReturnRoute
-        case .userCollection(_):
-            route = historyReturnRoute
-        case .favoriteFolder(_):
-            route = historyReturnRoute
-        case .article(_):
-            route = historyReturnRoute
-        case .opus(_):
-            route = historyReturnRoute
-        case .browser(_):
-            route = .my
-        }
-    }
-
-    private func closeFavoriteFolder() {
-        switch favoriteFolderReturnRoute {
-        case .dynamicFeed:
-            route = .dynamicFeed
-        case .searchResults(_):
-            route = favoriteFolderReturnRoute
-        case .my:
-            route = .my
-        case .history:
-            route = favoriteFolderReturnRoute
-        case .favoriteFolder(_):
-            route = .my
-        case .userSpace(_):
-            route = favoriteFolderReturnRoute
-        case .userCollection(_):
-            route = favoriteFolderReturnRoute
-        case .article(_):
-            route = favoriteFolderReturnRoute
-        case .opus(_):
-            route = favoriteFolderReturnRoute
-        case .browser(_):
-            route = .my
-        }
-    }
-
-    private func closeUserSpace() {
-        switch userSpaceReturnRoute {
-        case .dynamicFeed:
-            route = .dynamicFeed
-        case .searchResults(_):
-            route = userSpaceReturnRoute
-        case .my:
-            route = .my
-        case .history:
-            route = userSpaceReturnRoute
-        case .favoriteFolder(_):
-            route = userSpaceReturnRoute
-        case .userSpace(_):
-            route = .dynamicFeed
-        case .userCollection(_):
-            route = userSpaceReturnRoute
-        case .article(_):
-            route = userSpaceReturnRoute
-        case .opus(_):
-            route = userSpaceReturnRoute
-        case .browser(_):
-            route = .dynamicFeed
-        }
-    }
-
-    private func closeUserCollection() {
-        switch userCollectionReturnRoute {
-        case .dynamicFeed:
-            route = .dynamicFeed
-        case .searchResults(_):
-            route = userCollectionReturnRoute
-        case .my:
-            route = .my
-        case .history:
-            route = userCollectionReturnRoute
-        case .favoriteFolder(_):
-            route = userCollectionReturnRoute
-        case .userSpace(_):
-            route = userCollectionReturnRoute
-        case .userCollection(_):
-            route = .dynamicFeed
-        case .article(_):
-            route = userCollectionReturnRoute
-        case .opus(_):
-            route = userCollectionReturnRoute
-        case .browser(_):
-            route = .dynamicFeed
-        }
-    }
-
-    private func closeArticle() {
-        switch articleReturnRoute {
-        case .dynamicFeed:
-            route = .dynamicFeed
-        case .searchResults(_):
-            route = articleReturnRoute
-        case .my:
-            route = .my
-        case .history:
-            route = articleReturnRoute
-        case .favoriteFolder(_):
-            route = articleReturnRoute
-        case .userSpace(_):
-            route = articleReturnRoute
-        case .userCollection(_):
-            route = articleReturnRoute
-        case .article(_):
-            route = .dynamicFeed
-        case .opus(_):
-            route = articleReturnRoute
-        case .browser(_):
-            route = .dynamicFeed
-        }
     }
 
     private func refreshLoginSensitiveContent(reloadDynamicFeed: Bool) {
@@ -784,47 +668,34 @@ final class FocusAppViewModel: ObservableObject {
                 myViewModel.reload()
             case .history:
                 historyViewModel.reload()
-            case .favoriteFolder(_):
+            case .favoriteFolder:
                 favoriteFolderViewModel.reload()
-            case .userSpace(_):
-                userSpaceViewModel.reload()
-            case .userCollection(_):
-                userCollectionViewModel.reload()
-            case .article(_):
-                articleViewModel.reload()
-            case .opus(_):
+            case let .userSpace(routeID, _):
+                userSpaceViewModel(for: routeID).reload()
+            case let .userCollection(routeID, _):
+                userCollectionViewModel(for: routeID).reload()
+            case let .article(routeID, _):
+                articleViewModel(for: routeID).reload()
+            case .opus:
                 break
-            case .browser(_):
+            case .browser:
                 break
             }
         }
     }
 
-    private func primaryTab(for route: Route) -> PrimaryTab {
+    private func primaryTab(for route: AppRoute) -> PrimaryTab {
         switch route {
-        case .dynamicFeed, .opus(_):
+        case .dynamicFeed, .opus:
             return .dynamic
-        case .searchResults(_):
+        case .searchResults:
             return .search
-        case .my, .history, .favoriteFolder(_):
+        case .my, .history, .favoriteFolder:
             return .my
-        case .userSpace(_):
-            switch userSpaceReturnRoute {
-            case .searchResults(_):
-                return .search
-            case .my:
-                return .my
-            case .history:
-                return .my
-            default:
-                return .dynamic
-            }
-        case .userCollection(_):
-            return primaryTab(for: userCollectionReturnRoute)
-        case .article(_):
-            return primaryTab(for: articleReturnRoute)
-        case .browser(_):
-            switch browserViewModel.entryContext {
+        case .userSpace, .userCollection, .article:
+            return routeStack.first.map(primaryTab(for:)) ?? .dynamic
+        case let .browser(_, context):
+            switch context {
             case .dynamic:
                 return .dynamic
             case .search:
@@ -832,15 +703,6 @@ final class FocusAppViewModel: ObservableObject {
             case .my:
                 return .my
             }
-        }
-    }
-
-    private func routeForCurrentNativeContext() -> Route {
-        switch route {
-        case .browser(_):
-            return browserReturnRoute
-        default:
-            return route
         }
     }
 
@@ -4760,6 +4622,24 @@ final class FocusSearchResultsViewModel: ObservableObject {
         loadMoreTask?.cancel()
     }
 
+    func loadIfNeeded() {
+        guard currentQuery != nil, case .idle = state else {
+            return
+        }
+        reload()
+    }
+
+    func suspend() {
+        task?.cancel()
+        task = nil
+        loadMoreTask?.cancel()
+        loadMoreTask = nil
+        isLoadingMore = false
+        if case .loading = state {
+            state = .idle
+        }
+    }
+
     func search(_ query: SearchQuery) {
         currentQuery = query
         selectedFilter = .all
@@ -5029,6 +4909,17 @@ final class FocusDynamicFeedViewModel: ObservableObject {
     deinit {
         task?.cancel()
         loadMoreTask?.cancel()
+    }
+
+    func suspend() {
+        task?.cancel()
+        task = nil
+        loadMoreTask?.cancel()
+        loadMoreTask = nil
+        isLoadingMore = false
+        if case .loading = state {
+            state = .idle
+        }
     }
 
     func loadIfNeeded() {
@@ -7326,6 +7217,14 @@ final class FocusMyViewModel: ObservableObject {
         task?.cancel()
     }
 
+    func suspend() {
+        task?.cancel()
+        task = nil
+        if case .loading = state {
+            state = .idle
+        }
+    }
+
     var navigationTitle: String {
         "我的"
     }
@@ -7427,6 +7326,17 @@ final class FocusHistoryViewModel: ObservableObject {
     deinit {
         task?.cancel()
         loadMoreTask?.cancel()
+    }
+
+    func suspend() {
+        task?.cancel()
+        task = nil
+        loadMoreTask?.cancel()
+        loadMoreTask = nil
+        isLoadingMore = false
+        if case .loading = state {
+            state = .idle
+        }
     }
 
     var navigationTitle: String {
@@ -7540,6 +7450,17 @@ final class FocusUserSpaceViewModel: ObservableObject {
     deinit {
         task?.cancel()
         loadMoreTask?.cancel()
+    }
+
+    func suspend() {
+        task?.cancel()
+        task = nil
+        loadMoreTask?.cancel()
+        loadMoreTask = nil
+        isLoadingMoreVideos = false
+        if case .loading = state {
+            state = .idle
+        }
     }
 
     var navigationTitle: String {
@@ -7708,6 +7629,24 @@ final class FocusFavoriteFolderViewModel: ObservableObject {
     deinit {
         task?.cancel()
         loadMoreTask?.cancel()
+    }
+
+    func loadIfNeeded() {
+        guard folder != nil, case .idle = state else {
+            return
+        }
+        reload()
+    }
+
+    func suspend() {
+        task?.cancel()
+        task = nil
+        loadMoreTask?.cancel()
+        loadMoreTask = nil
+        isLoadingMore = false
+        if case .loading = state {
+            state = .idle
+        }
     }
 
     var navigationTitle: String {
@@ -8679,6 +8618,17 @@ final class FocusUserCollectionViewModel: ObservableObject {
         loadMoreTask?.cancel()
     }
 
+    func suspend() {
+        task?.cancel()
+        task = nil
+        loadMoreTask?.cancel()
+        loadMoreTask = nil
+        isLoadingMoreVideos = false
+        if case .loading = state {
+            state = .idle
+        }
+    }
+
     var navigationTitle: String {
         switch state {
         case let .loaded(page):
@@ -8814,6 +8764,14 @@ final class FocusArticleViewModel: ObservableObject {
 
     deinit {
         task?.cancel()
+    }
+
+    func suspend() {
+        task?.cancel()
+        task = nil
+        if case .loading = state {
+            state = .idle
+        }
     }
 
     var navigationTitle: String {
@@ -9145,6 +9103,14 @@ final class FocusOpusDetailViewModel: ObservableObject {
 
     deinit {
         task?.cancel()
+    }
+
+    func suspend() {
+        task?.cancel()
+        task = nil
+        if case .loading = state {
+            state = .idle
+        }
     }
 
     var navigationTitle: String {
