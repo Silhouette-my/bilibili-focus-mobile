@@ -1,9 +1,7 @@
 #if canImport(UIKit)
 import FocusCore
-import ImageIO
 import SwiftUI
 import UIKit
-import WebKit
 
 private enum FocusDesign {
     static let primary = Color(red: 0.984, green: 0.447, blue: 0.600) // Bilibili pink #FB7299
@@ -614,7 +612,7 @@ private struct FocusDynamicFeedView: View {
                 await viewModel.refresh()
             }
             .task(id: filteredCards.map(\.id)) {
-                prefetchImages(for: filteredCards)
+                await prefetchImages(for: filteredCards)
             }
 
         case let .loginRequired(message):
@@ -636,13 +634,13 @@ private struct FocusDynamicFeedView: View {
         }
     }
 
-    private func prefetchImages(for cards: [DynamicCard]) {
+    private func prefetchImages(for cards: [DynamicCard]) async {
         for card in cards.prefix(8) {
             let urls = ([card.author.avatarURL] + Array(card.coverURLs.prefix(2))).compactMap { $0 }
             guard !urls.isEmpty else {
                 continue
             }
-            FocusRemoteImageLoader.prefetch(urls: urls, referer: card.targetURL.absoluteString)
+            await FocusRemoteImageLoader.prefetch(urls: urls, referer: card.targetURL.absoluteString)
         }
     }
 
@@ -757,7 +755,9 @@ private struct FocusDynamicCardView: View {
                         .resizable()
                         .scaledToFill()
                 case .failure:
-                    FocusRemoteImageWebFallback(url: avatarURL, referer: card.targetURL.absoluteString)
+                    Circle()
+                        .fill(Color(uiColor: .secondarySystemFill))
+                        .overlay(Image(systemName: "person.fill").foregroundStyle(.secondary))
                 case .empty:
                     Circle()
                         .fill(Color(uiColor: .secondarySystemFill))
@@ -796,11 +796,9 @@ private struct FocusDynamicMediaCover: View {
                         .scaledToFill()
                         .frame(width: proxy.size.width, height: proxy.size.height)
                 case .failure:
-                    FocusRemoteImageWebFallback(
-                        url: url,
-                        referer: referer,
-                        objectFit: "cover"
-                    )
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .fill(Color(uiColor: .secondarySystemFill))
+                        .overlay(Image(systemName: "photo").foregroundStyle(.secondary))
                     .frame(width: proxy.size.width, height: proxy.size.height)
                 case .empty:
                     ZStack {
@@ -920,7 +918,7 @@ private struct FocusSearchResultsView: View {
                     await viewModel.refresh()
                 }
                 .task(id: prefetchSignature(for: sections)) {
-                    prefetchImages(for: sections)
+                    await prefetchImages(for: sections)
                 }
             }
 
@@ -942,14 +940,14 @@ private struct FocusSearchResultsView: View {
             .joined(separator: "|")
     }
 
-    private func prefetchImages(for sections: [SearchResultSection]) {
+    private func prefetchImages(for sections: [SearchResultSection]) async {
         for item in sections.flatMap(\.items).prefix(10) {
             let urls = ([item.coverURL, item.avatarURL] + item.previews.prefix(3).map(\.coverURL)).compactMap { $0 }
             guard !urls.isEmpty else {
                 continue
             }
 
-            FocusRemoteImageLoader.prefetch(
+            await FocusRemoteImageLoader.prefetch(
                 urls: urls,
                 referer: item.targetURL.absoluteString
             )
@@ -1254,7 +1252,9 @@ private struct FocusSearchUserCard: View {
                         .resizable()
                         .scaledToFill()
                 case .failure:
-                    FocusRemoteImageWebFallback(url: avatarURL, referer: item.targetURL.absoluteString)
+                    Circle()
+                        .fill(Color(uiColor: .tertiarySystemFill))
+                        .overlay(Image(systemName: "person.fill").foregroundStyle(.secondary))
                 case .empty:
                     Circle()
                         .fill(Color(uiColor: .tertiarySystemFill))
@@ -1542,7 +1542,9 @@ private struct FocusSearchCover: View {
                                 .resizable()
                                 .scaledToFill()
                         case .failure:
-                            FocusRemoteImageWebFallback(url: url, referer: referer)
+                            Rectangle()
+                                .fill(Color(uiColor: .tertiarySystemFill))
+                                .overlay(Image(systemName: "photo").foregroundStyle(.secondary))
                         case .empty:
                             ZStack {
                                 RoundedRectangle(cornerRadius: 0)
@@ -1728,7 +1730,7 @@ private struct FocusMyView: View {
             }
             .background(Color(uiColor: .systemGroupedBackground))
             .task(id: page.history.map(\.id).joined(separator: "|")) {
-                prefetchAssets(for: page)
+                await prefetchAssets(for: page)
             }
             .refreshable {
                 viewModel.reload()
@@ -1736,17 +1738,17 @@ private struct FocusMyView: View {
         }
     }
 
-    private func prefetchAssets(for page: FocusMyPage) {
+    private func prefetchAssets(for page: FocusMyPage) async {
         let historyURLs = page.history.compactMap(\.coverURL)
         if !historyURLs.isEmpty {
-            FocusRemoteImageLoader.prefetch(urls: historyURLs, referer: "https://www.bilibili.com/")
+            await FocusRemoteImageLoader.prefetch(urls: historyURLs, referer: "https://www.bilibili.com/")
         }
 
         let folderURLs = page.folders.flatMap { folder in
             folder.previews.compactMap(\.coverURL)
         }
         if !folderURLs.isEmpty {
-            FocusRemoteImageLoader.prefetch(urls: folderURLs, referer: "https://www.bilibili.com/")
+            await FocusRemoteImageLoader.prefetch(urls: folderURLs, referer: "https://www.bilibili.com/")
         }
     }
 }
@@ -2023,7 +2025,7 @@ private struct FocusHistoryView: View {
                 }
                 .background(Color(uiColor: .systemGroupedBackground))
                 .task(id: items.map(\.id).joined(separator: "|")) {
-                    prefetchAssets(items)
+                    await prefetchAssets(items)
                 }
                 .refreshable {
                     viewModel.reload()
@@ -2032,12 +2034,12 @@ private struct FocusHistoryView: View {
         }
     }
 
-    private func prefetchAssets(_ items: [FocusMyHistoryItem]) {
+    private func prefetchAssets(_ items: [FocusMyHistoryItem]) async {
         let urls = items.prefix(20).compactMap(\.coverURL)
         guard !urls.isEmpty else {
             return
         }
-        FocusRemoteImageLoader.prefetch(urls: urls, referer: "https://www.bilibili.com/")
+        await FocusRemoteImageLoader.prefetch(urls: urls, referer: "https://www.bilibili.com/")
     }
 }
 
@@ -2120,7 +2122,7 @@ private struct FocusFavoriteFolderView: View {
                 guard !urls.isEmpty else {
                     return
                 }
-                FocusRemoteImageLoader.prefetch(urls: urls, referer: "https://www.bilibili.com/")
+                await FocusRemoteImageLoader.prefetch(urls: urls, referer: "https://www.bilibili.com/")
             }
             .refreshable {
                 viewModel.reload()
@@ -2249,7 +2251,7 @@ private struct FocusUserSpaceView: View {
             }
             .background(Color(uiColor: .systemGroupedBackground))
             .task(id: page.profile.mid) {
-                prefetchAssets(for: page)
+                await prefetchAssets(for: page)
                 if !sections.contains(selectedSection) {
                     selectedSection = sections.first ?? .videos
                 }
@@ -2280,7 +2282,7 @@ private struct FocusUserSpaceView: View {
             .padding(.horizontal, 2)
     }
 
-    private func prefetchAssets(for page: FocusUserSpacePage) {
+    private func prefetchAssets(for page: FocusUserSpacePage) async {
         let referer = "https://space.bilibili.com/\(page.profile.mid)"
         let urls = (
             [page.profile.avatarURL]
@@ -2292,7 +2294,7 @@ private struct FocusUserSpaceView: View {
         guard !urls.isEmpty else {
             return
         }
-        FocusRemoteImageLoader.prefetch(urls: urls, referer: referer)
+        await FocusRemoteImageLoader.prefetch(urls: urls, referer: referer)
     }
 }
 
@@ -2554,17 +2556,17 @@ private struct FocusUserCollectionView: View {
                 viewModel.reload()
             }
             .task(id: page.collection.id + "-\(page.videos.count)") {
-                prefetchAssets(for: page)
+                await prefetchAssets(for: page)
             }
         }
     }
 
-    private func prefetchAssets(for page: FocusUserCollectionPage) {
+    private func prefetchAssets(for page: FocusUserCollectionPage) async {
         let urls = ([page.collection.coverURL] + page.videos.prefix(10).compactMap(\.coverURL)).compactMap { $0 }
         guard !urls.isEmpty else {
             return
         }
-        FocusRemoteImageLoader.prefetch(urls: urls, referer: "https://space.bilibili.com/\(page.collection.ownerMID)")
+        await FocusRemoteImageLoader.prefetch(urls: urls, referer: "https://space.bilibili.com/\(page.collection.ownerMID)")
     }
 }
 
@@ -2834,206 +2836,103 @@ private struct FocusArticleStatItem: View {
 
 private struct FocusArticleHTMLCard: View {
     let htmlContent: String
-    @Environment(\.colorScheme) private var colorScheme
-    @State private var contentHeight: CGFloat = 1
 
     var body: some View {
-        FocusArticleHTMLWebView(
-            html: styledHTML,
-            contentHeight: $contentHeight
+        Text(Self.nativeText(from: htmlContent))
+            .font(.body)
+            .foregroundStyle(.primary)
+            .lineSpacing(7)
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(16)
+            .background(
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(Color(uiColor: .secondarySystemGroupedBackground))
+            )
+    }
+
+    private static func nativeText(from html: String) -> String {
+        var text = html
+        text = text.replacingOccurrences(
+            of: #"(?is)<(script|style)[^>]*>.*?</\1>"#,
+            with: "",
+            options: .regularExpression
         )
-        .frame(height: max(contentHeight, 1))
-        .frame(maxWidth: .infinity)
-        .padding(16)
-        .background(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(Color(uiColor: .secondarySystemGroupedBackground))
+        text = text.replacingOccurrences(
+            of: #"(?i)<img[^>]*alt=[\"']([^\"']+)[\"'][^>]*>"#,
+            with: "\n[图片：$1]\n",
+            options: .regularExpression
         )
+        text = text.replacingOccurrences(
+            of: #"(?i)<img[^>]*>"#,
+            with: "\n[图片]\n",
+            options: .regularExpression
+        )
+        text = text.replacingOccurrences(
+            of: #"(?i)<li[^>]*>"#,
+            with: "\n• ",
+            options: .regularExpression
+        )
+        text = text.replacingOccurrences(
+            of: #"(?i)<br\s*/?>|</(p|div|section|article|li|h[1-6]|blockquote|pre|tr)>"#,
+            with: "\n",
+            options: .regularExpression
+        )
+        text = text.replacingOccurrences(
+            of: #"<[^>]+>"#,
+            with: "",
+            options: .regularExpression
+        )
+        text = decodeHTMLEntities(text)
+        text = text.replacingOccurrences(
+            of: #"[ \t]+\n"#,
+            with: "\n",
+            options: .regularExpression
+        )
+        text = text.replacingOccurrences(
+            of: #"\n{3,}"#,
+            with: "\n\n",
+            options: .regularExpression
+        )
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private var styledHTML: String {
-        let isDark = colorScheme == .dark
-        let background = "transparent"
-        let textColor = isDark ? "#E8ECF2" : "#1F2937"
-        let secondaryColor = isDark ? "#A7B0BE" : "#5B6472"
-        let linkColor = isDark ? "#FF9FBC" : "#FB7299"
-        let codeBackground = isDark ? "#1A2230" : "#F4F6F9"
-        let quoteBackground = isDark ? "#151C27" : "#F8FAFC"
-        let borderColor = isDark ? "rgba(255,255,255,0.08)" : "rgba(15,23,42,0.08)"
+    private static func decodeHTMLEntities(_ value: String) -> String {
+        var result = value
+        let namedEntities = [
+            "&nbsp;": " ",
+            "&amp;": "&",
+            "&lt;": "<",
+            "&gt;": ">",
+            "&quot;": "\"",
+            "&#39;": "'",
+            "&apos;": "'"
+        ]
+        namedEntities.forEach { result = result.replacingOccurrences(of: $0.key, with: $0.value) }
 
-        return """
-        <!doctype html>
-        <html>
-        <head>
-          <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-          <style>
-            :root { color-scheme: \(isDark ? "dark" : "light"); }
-            html, body {
-              margin: 0;
-              padding: 0;
-              background: \(background);
-              color: \(textColor);
-              font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif;
-              font-size: 17px;
-              line-height: 1.72;
-            }
-            body { overflow-x: hidden; }
-            article { width: 100%; box-sizing: border-box; }
-            p, li, blockquote, pre { margin: 0 0 14px 0; }
-            h1, h2, h3, h4 {
-              color: \(textColor);
-              margin: 22px 0 12px 0;
-              line-height: 1.35;
-            }
-            a {
-              color: \(linkColor);
-              text-decoration: none;
-            }
-            img, video, iframe {
-              display: block;
-              width: 100%;
-              max-width: 100%;
-              height: auto;
-              border-radius: 14px;
-              overflow: hidden;
-              margin: 14px 0;
-            }
-            blockquote {
-              padding: 12px 14px;
-              border-radius: 14px;
-              background: \(quoteBackground);
-              border: 1px solid \(borderColor);
-              color: \(secondaryColor);
-            }
-            pre, code {
-              font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-            }
-            pre {
-              padding: 14px;
-              border-radius: 14px;
-              background: \(codeBackground);
-              overflow-x: auto;
-            }
-            table {
-              width: 100%;
-              border-collapse: collapse;
-              margin: 14px 0;
-              font-size: 15px;
-            }
-            th, td {
-              padding: 8px 10px;
-              border: 1px solid \(borderColor);
-            }
-          </style>
-        </head>
-        <body>
-          <article>\(htmlContent)</article>
-        </body>
-        </html>
-        """
-    }
-}
-
-private struct FocusArticleHTMLWebView: UIViewRepresentable {
-    let html: String
-    @Binding var contentHeight: CGFloat
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(contentHeight: $contentHeight)
-    }
-
-    func makeUIView(context: Context) -> WKWebView {
-        let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = .default()
-
-        let webView = WKWebView(frame: .zero, configuration: configuration)
-        webView.isOpaque = true
-        webView.backgroundColor = UIColor.secondarySystemBackground
-        webView.scrollView.backgroundColor = webView.backgroundColor
-        webView.scrollView.isScrollEnabled = false
-        webView.navigationDelegate = context.coordinator
-        return webView
-    }
-
-    func updateUIView(_ webView: WKWebView, context: Context) {
-        guard context.coordinator.lastHTML != html else {
-            context.coordinator.updateHeightIfNeeded(for: webView)
-            return
+        guard let expression = try? NSRegularExpression(pattern: #"&#(x?[0-9A-Fa-f]+);"#) else {
+            return result
         }
-        context.coordinator.lastHTML = html
-        webView.loadHTMLString(html, baseURL: URL(string: "https://www.bilibili.com/"))
-    }
-
-    final class Coordinator: NSObject, WKNavigationDelegate {
-        @Binding var contentHeight: CGFloat
-        var lastHTML = ""
-
-        init(contentHeight: Binding<CGFloat>) {
-            _contentHeight = contentHeight
+        while let match = expression.firstMatch(
+            in: result,
+            range: NSRange(result.startIndex..., in: result)
+        ), let fullRange = Range(match.range(at: 0), in: result),
+           let valueRange = Range(match.range(at: 1), in: result)
+        {
+            let rawValue = String(result[valueRange])
+            let scalarValue: UInt32?
+            if rawValue.lowercased().hasPrefix("x") {
+                scalarValue = UInt32(rawValue.dropFirst(), radix: 16)
+            } else {
+                scalarValue = UInt32(rawValue, radix: 10)
+            }
+            let replacement = scalarValue
+                .flatMap(UnicodeScalar.init)
+                .map(String.init)
+                ?? ""
+            result.replaceSubrange(fullRange, with: replacement)
         }
-
-        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-            updateHeightIfNeeded(for: webView)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
-                self.updateHeightIfNeeded(for: webView)
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.28) {
-                self.updateHeightIfNeeded(for: webView)
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) {
-                self.updateHeightIfNeeded(for: webView)
-            }
-        }
-
-        func updateHeightIfNeeded(for webView: WKWebView) {
-            let script = #"""
-            (() => {
-              const doc = document.documentElement;
-              const body = document.body;
-              const article = document.querySelector('article');
-              [doc, body, article].filter(Boolean).forEach((node) => {
-                node.style.height = 'auto';
-                node.style.minHeight = '0';
-                node.style.overflow = 'visible';
-              });
-              document.querySelectorAll('img[data-src],img[data-original]').forEach((img) => {
-                if (!img.getAttribute('src')) {
-                  img.setAttribute('src', img.getAttribute('data-src') || img.getAttribute('data-original') || '');
-                }
-              });
-              return Math.max(
-                doc ? doc.scrollHeight : 0,
-                doc ? doc.offsetHeight : 0,
-                doc ? doc.clientHeight : 0,
-                body ? body.scrollHeight : 0,
-                body ? body.offsetHeight : 0,
-                body ? body.clientHeight : 0,
-                article ? article.scrollHeight : 0,
-                article ? article.offsetHeight : 0
-              );
-            })();
-            """#
-            webView.evaluateJavaScript(script) { [weak self] result, _ in
-                guard let self else {
-                    return
-                }
-                let resolvedHeight: CGFloat?
-                if let value = result as? Double {
-                    resolvedHeight = CGFloat(value)
-                } else if let value = result as? NSNumber {
-                    resolvedHeight = CGFloat(truncating: value)
-                } else {
-                    resolvedHeight = nil
-                }
-
-                guard let resolvedHeight else {
-                    return
-                }
-                DispatchQueue.main.async {
-                    self.contentHeight = max(resolvedHeight, 1)
-                }
-            }
-        }
+        return result
     }
 }
 

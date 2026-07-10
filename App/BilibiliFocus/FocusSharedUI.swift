@@ -2,6 +2,7 @@
 import SwiftUI
 import UIKit
 import WebKit
+import ImageIO
 
 enum FocusSharedDesign {
     static let primary = Color(red: 0.984, green: 0.447, blue: 0.600)
@@ -113,94 +114,28 @@ struct FocusRemoteImage<Content: View>: View {
     }
 
     private var displayPhase: FocusRemoteImagePhase {
-        if case .empty = loader.phase,
-           let url,
-           let cachedImage = FocusRemoteImageLoader.cachedUIImage(for: url)
-        {
-            return .success(Image(uiImage: cachedImage))
-        }
-
         return loader.phase
     }
 }
 
-struct FocusRemoteImageWebFallback: UIViewRepresentable {
-    let url: URL?
-    let referer: String
-    var objectFit: String = "cover"
+actor FocusImageRepository {
+    static let shared = FocusImageRepository()
 
-    func makeUIView(context: Context) -> WKWebView {
-        let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = .default()
-        let webView = WKWebView(frame: .zero, configuration: configuration)
-        webView.isOpaque = true
-        webView.backgroundColor = UIColor.secondarySystemBackground
-        webView.scrollView.isScrollEnabled = false
-        webView.scrollView.bounces = false
-        webView.scrollView.backgroundColor = webView.backgroundColor
-        webView.isUserInteractionEnabled = false
-        webView.customUserAgent = FocusUserAgent.mobileSafari()
-        return webView
+    private struct InFlightRequest {
+        let task: Task<UIImage, Error>
+        var consumers: Set<UUID>
     }
 
-    func updateUIView(_ webView: WKWebView, context: Context) {
-        guard let url else {
-            webView.loadHTMLString("", baseURL: nil)
-            return
-        }
+    private let cache: NSCache<NSURL, UIImage>
+    private let session: URLSession
+    private var inFlight: [URL: InFlightRequest] = [:]
 
-        let escapedURL = url.absoluteString
-            .replacingOccurrences(of: "&", with: "&amp;")
-            .replacingOccurrences(of: "\"", with: "&quot;")
-        let html = """
-        <!doctype html>
-        <html>
-          <head>
-            <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-            <style>
-              html, body {
-                margin: 0;
-                padding: 0;
-                width: 100%;
-                height: 100%;
-                overflow: hidden;
-                background: transparent;
-              }
-
-              body {
-                display: flex;
-                align-items: stretch;
-                justify-content: stretch;
-              }
-
-              img {
-                width: 100%;
-                height: 100%;
-                object-fit: \(objectFit);
-                display: block;
-              }
-            </style>
-          </head>
-          <body>
-            <img src="\(escapedURL)" loading="eager" referrerpolicy="origin">
-          </body>
-        </html>
-        """
-
-        let baseURL = URL(string: referer) ?? URL(string: "https://www.bilibili.com/")
-        webView.loadHTMLString(html, baseURL: baseURL)
-    }
-}
-
-@MainActor
-final class FocusRemoteImageLoader: ObservableObject {
-    private static let cache: NSCache<NSURL, UIImage> = {
+    init() {
         let cache = NSCache<NSURL, UIImage>()
         cache.countLimit = 192
-        cache.totalCostLimit = 48 * 1024 * 1024
-        return cache
-    }()
-    private static let session: URLSession = {
+        cache.totalCostLimit = 64 * 1024 * 1024
+        self.cache = cache
+
         let configuration = URLSessionConfiguration.default
         configuration.urlCache = URLCache(
             memoryCapacity: 48 * 1024 * 1024,
@@ -209,80 +144,89 @@ final class FocusRemoteImageLoader: ObservableObject {
         )
         configuration.requestCachePolicy = .returnCacheDataElseLoad
         configuration.timeoutIntervalForRequest = 20
-        return URLSession(configuration: configuration)
-    }()
-
-    @Published fileprivate var phase: FocusRemoteImagePhase = .empty
-
-    private var currentURL: URL?
-    private var task: Task<Void, Never>?
-
-    deinit {
-        task?.cancel()
+        configuration.httpCookieAcceptPolicy = .always
+        self.session = URLSession(configuration: configuration)
     }
 
-    func load(url: URL?, referer: String) async {
-        task?.cancel()
-        currentURL = url
-
-        guard let url else {
-            phase = .failure
-            return
+    func image(for url: URL, preferredReferer: String) async throws -> UIImage {
+        let canonicalURL = Self.canonicalImageURL(url)
+        if let cached = cache.object(forKey: canonicalURL as NSURL) {
+            return cached
         }
 
-        if let cachedImage = Self.cache.object(forKey: url as NSURL) {
-            phase = .success(Image(uiImage: cachedImage))
-            return
+        let cookieHeader = await Self.cookieHeaderValue()
+        if let cached = cache.object(forKey: canonicalURL as NSURL) {
+            return cached
         }
 
-        phase = .empty
+        let consumerID = UUID()
+        let fetchTask: Task<UIImage, Error>
+        if var request = inFlight[canonicalURL] {
+            request.consumers.insert(consumerID)
+            inFlight[canonicalURL] = request
+            fetchTask = request.task
+        } else {
+            let session = self.session
+            fetchTask = Task.detached(priority: .utility) {
+                try await Self.fetchImage(
+                    from: canonicalURL,
+                    preferredReferer: preferredReferer,
+                    cookieHeader: cookieHeader,
+                    session: session
+                )
+            }
+            inFlight[canonicalURL] = InFlightRequest(
+                task: fetchTask,
+                consumers: [consumerID]
+            )
+        }
 
-        task = Task {
+        return try await withTaskCancellationHandler {
             do {
-                let uiImage = try await Self.fetchImage(from: url, preferredReferer: referer)
-                guard !Task.isCancelled, self.currentURL == url else {
-                    return
-                }
-
-                Self.cache.setObject(uiImage, forKey: url as NSURL, cost: Self.cacheCost(for: uiImage))
-                phase = .success(Image(uiImage: uiImage))
+                let image = try await fetchTask.value
+                try Task.checkCancellation()
+                cache.setObject(image, forKey: canonicalURL as NSURL, cost: Self.cacheCost(for: image))
+                releaseConsumer(consumerID, for: canonicalURL)
+                return image
             } catch {
-                guard !Task.isCancelled else {
-                    return
-                }
-                phase = .failure
+                releaseConsumer(consumerID, for: canonicalURL)
+                throw error
             }
-        }
-
-        await task?.value
-    }
-
-    static func cachedUIImage(for url: URL) -> UIImage? {
-        cache.object(forKey: url as NSURL)
-    }
-
-    static func prefetch(urls: [URL], referer: String) {
-        Task(priority: .utility) { @MainActor in
-            for url in urls {
-                if cache.object(forKey: url as NSURL) != nil {
-                    continue
-                }
-
-                guard let image = try? await fetchImage(from: url, preferredReferer: referer) else {
-                    continue
-                }
-
-                cache.setObject(image, forKey: url as NSURL, cost: cacheCost(for: image))
+        } onCancel: {
+            Task {
+                await self.releaseConsumer(consumerID, for: canonicalURL)
             }
         }
     }
 
-    private static func fetchImage(from url: URL, preferredReferer: String) async throws -> UIImage {
-        let cookieHeader = await cookieHeaderValue()
+    private func releaseConsumer(_ consumerID: UUID, for url: URL) {
+        guard var request = inFlight[url], request.consumers.remove(consumerID) != nil else {
+            return
+        }
+        guard !request.consumers.isEmpty else {
+            request.task.cancel()
+            inFlight[url] = nil
+            return
+        }
+        inFlight[url] = request
+    }
+
+    private static func fetchImage(
+        from url: URL,
+        preferredReferer: String,
+        cookieHeader: String?,
+        session: URLSession
+    ) async throws -> UIImage {
         let referers = [preferredReferer, "https://t.bilibili.com/", "https://www.bilibili.com/", ""]
+            .reduce(into: [String]()) { values, referer in
+                if !values.contains(referer) {
+                    values.append(referer)
+                }
+            }
 
         for referer in referers {
             for candidate in imageURLCandidates(for: url) {
+                try Task.checkCancellation()
                 do {
                     var request = URLRequest(url: candidate)
                     request.timeoutInterval = 20
@@ -298,19 +242,20 @@ final class FocusRemoteImageLoader: ObservableObject {
                         forHTTPHeaderField: "User-Agent"
                     )
                     request.setValue("https://www.bilibili.com", forHTTPHeaderField: "Origin")
-                    request.setValue("image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
+                    request.setValue("image/avif,image/webp,image/apng,image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
                     request.setValue("zh-CN,zh-Hans;q=0.9", forHTTPHeaderField: "Accept-Language")
 
                     let (data, response) = try await session.data(for: request)
                     guard
-                        let httpResponse = response as? HTTPURLResponse,
-                        (200 ..< 300).contains(httpResponse.statusCode),
-                        let image = decodeImage(from: data)
+                        let response = response as? HTTPURLResponse,
+                        (200 ..< 300).contains(response.statusCode),
+                        let image = downsampledImage(from: data, maxPixelSize: 1_600)
                     else {
                         continue
                     }
-
                     return image
+                } catch is CancellationError {
+                    throw CancellationError()
                 } catch {
                     continue
                 }
@@ -320,53 +265,108 @@ final class FocusRemoteImageLoader: ObservableObject {
         throw URLError(.cannotDecodeContentData)
     }
 
-    private static func cacheCost(for image: UIImage) -> Int {
-        guard let cgImage = image.cgImage else {
-            return Int(image.size.width * image.size.height * image.scale * image.scale)
-        }
-
-        return cgImage.bytesPerRow * cgImage.height
-    }
-
-    private static func decodeImage(from data: Data) -> UIImage? {
-        if let image = UIImage(data: data) {
-            return image
-        }
-
-        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
-              let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil)
-        else {
+    private static func downsampledImage(from data: Data, maxPixelSize: Int) -> UIImage? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, [
+            kCGImageSourceShouldCache: false
+        ] as CFDictionary) else {
             return nil
         }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+            kCGImageSourceShouldCacheImmediately: true
+        ]
+        guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
+            return nil
+        }
+        return UIImage(cgImage: image)
+    }
 
-        return UIImage(cgImage: cgImage)
+    private static func canonicalImageURL(_ url: URL) -> URL {
+        URL(string: url.absoluteString.replacingOccurrences(of: "http://", with: "https://")) ?? url
     }
 
     private static func imageURLCandidates(for url: URL) -> [URL] {
-        let absoluteString = url.absoluteString
-        let cleaned = absoluteString.replacingOccurrences(of: "http://", with: "https://")
+        let cleaned = url.absoluteString.replacingOccurrences(of: "http://", with: "https://")
         let stripped = cleaned.replacingOccurrences(of: #"@[^/?#]+"#, with: "", options: .regularExpression)
-        let preferred = stripped.contains("@") ? stripped : cleaned
-        return [preferred, stripped, cleaned]
+        return [cleaned, stripped]
             .compactMap(URL.init(string:))
-            .reduce(into: [URL]()) { partialResult, candidate in
-                if !partialResult.contains(candidate) {
-                    partialResult.append(candidate)
+            .reduce(into: [URL]()) { values, candidate in
+                if !values.contains(candidate) {
+                    values.append(candidate)
                 }
             }
     }
 
+    private static func cacheCost(for image: UIImage) -> Int {
+        guard let image = image.cgImage else {
+            return Int(image.size.width * image.size.height * image.scale * image.scale)
+        }
+        return image.bytesPerRow * image.height
+    }
+
+    @MainActor
     private static func cookieHeaderValue() async -> String? {
         let store = WKWebsiteDataStore.default().httpCookieStore
         let cookies = await withCheckedContinuation { continuation in
-            store.getAllCookies { cookies in
-                continuation.resume(returning: cookies)
-            }
+            store.getAllCookies { continuation.resume(returning: $0) }
         }
         guard !cookies.isEmpty else {
             return nil
         }
         return HTTPCookie.requestHeaderFields(with: cookies)["Cookie"]
+    }
+}
+
+@MainActor
+final class FocusRemoteImageLoader: ObservableObject {
+    @Published fileprivate var phase: FocusRemoteImagePhase = .empty
+
+    private var requestID: UUID?
+
+    func load(url: URL?, referer: String) async {
+        let requestID = UUID()
+        self.requestID = requestID
+
+        guard let url else {
+            phase = .failure
+            return
+        }
+
+        phase = .empty
+        do {
+            let image = try await FocusImageRepository.shared.image(
+                for: url,
+                preferredReferer: referer
+            )
+            guard
+                !Task.isCancelled,
+                self.requestID == requestID
+            else {
+                return
+            }
+            phase = .success(Image(uiImage: image))
+        } catch is CancellationError {
+            return
+        } catch {
+            guard !Task.isCancelled, self.requestID == requestID else {
+                return
+            }
+            phase = .failure
+        }
+    }
+
+    nonisolated static func prefetch(urls: [URL], referer: String) async {
+        for url in urls {
+            guard !Task.isCancelled else {
+                return
+            }
+            _ = try? await FocusImageRepository.shared.image(
+                for: url,
+                preferredReferer: referer
+            )
+        }
     }
 }
 
