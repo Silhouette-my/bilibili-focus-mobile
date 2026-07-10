@@ -40,3 +40,7 @@ BilibiliFocus.xcodeproj/project.xcworkspace/xcuserdata/
 
 # Logs
 *.log
+
+# Local reverse-engineering and archival work
+.reverse/
+localonly/

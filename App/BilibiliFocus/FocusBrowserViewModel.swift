@@ -3491,7 +3491,7 @@ final class FocusBrowserViewModel: ObservableObject {
         for canonicalURL: URL,
         revision: Int
     ) {
-        let delays: [UInt64] = [0, 150_000_000, 500_000_000, 1_200_000_000, 3_000_000_000]
+        let delays: [UInt64] = [0, 150_000_000, 500_000_000, 1_200_000_000, 3_000_000_000, 6_000_000_000]
         let expectedRenderKey = payload.renderKey
 
         for (index, delay) in delays.enumerated() {
@@ -3566,6 +3566,33 @@ final class FocusBrowserViewModel: ObservableObject {
                         && style.opacity !== '0';
                     });
                   };
+                  const hasVisiblePlayer = () => {
+                    const playerShell = document.querySelector('#playerWrap, .player-wrap, #bilibili-player, .bpx-player-container, .player-container, .bpx-player-video-wrap');
+                    if (!(playerShell instanceof HTMLElement)) {
+                      return false;
+                    }
+
+                    const playerRect = playerShell.getBoundingClientRect?.();
+                    if (!playerRect || playerRect.width < 120 || playerRect.height < 68) {
+                      return false;
+                    }
+
+                    return Array.from(document.querySelectorAll('video')).some((node) => {
+                      if (!(node instanceof HTMLVideoElement)) {
+                        return false;
+                      }
+                      const rect = node.getBoundingClientRect?.();
+                      if (!rect) {
+                        return false;
+                      }
+                      const style = window.getComputedStyle(node);
+                      return rect.width > 120
+                        && rect.height > 68
+                        && style.display !== 'none'
+                        && style.visibility !== 'hidden'
+                        && style.opacity !== '0';
+                    });
+                  };
                   const checkTargets = () => {
                     let score = 0;
                     const hasPlayer = !!document.querySelector('#playerWrap, .player-wrap, #bilibili-player');
@@ -3575,6 +3602,7 @@ final class FocusBrowserViewModel: ObservableObject {
                     const hasEpisodeAnchor = !!document.querySelector('.video-pod, .multi-page, [class*="episode-list"], [class*="part-list"], [class*="page-list"]');
                     const hasViewbox = !!document.querySelector('#viewbox_report');
                     const playerLoadingVisible = hasVisiblePlayerLoadingOverlay();
+                    const visiblePlayer = hasVisiblePlayer();
 
                     if (hasPlayer) score += 25;
                     if (hasContainer) score += 20;
@@ -3585,7 +3613,7 @@ final class FocusBrowserViewModel: ObservableObject {
 
                     return {
                       score: score,
-                      ready: hasPlayer && hasContainer,
+                      ready: hasPlayer && hasContainer && visiblePlayer,
                       details: {
                         hasPlayer: hasPlayer,
                         hasContainer: hasContainer,
@@ -3593,7 +3621,8 @@ final class FocusBrowserViewModel: ObservableObject {
                         hasCommentAnchor: hasCommentAnchor,
                         hasEpisodeAnchor: hasEpisodeAnchor,
                         hasViewbox: hasViewbox,
-                        playerLoadingVisible: playerLoadingVisible
+                        playerLoadingVisible: playerLoadingVisible,
+                        visiblePlayer: visiblePlayer
                       }
                     };
                   };
@@ -3602,21 +3631,22 @@ final class FocusBrowserViewModel: ObservableObject {
                 })();
                 """
 
-                let (isReady, score, playerLoadingVisible) = await withCheckedContinuation { continuation in
+                let (isReady, score, playerLoadingVisible, visiblePlayer) = await withCheckedContinuation { continuation in
                     webView.evaluateJavaScript(preflightScript) { value, error in
                         if let dict = value as? [String: Any],
                            let ready = dict["ready"] as? Bool,
                            let score = dict["score"] as? Int {
                             let details = dict["details"] as? [String: Any]
                             let playerLoadingVisible = details?["playerLoadingVisible"] as? Bool ?? false
-                            continuation.resume(returning: (ready, score, playerLoadingVisible))
+                            let visiblePlayer = details?["visiblePlayer"] as? Bool ?? false
+                            continuation.resume(returning: (ready, score, playerLoadingVisible, visiblePlayer))
                         } else {
-                            continuation.resume(returning: (false, 0, false))
+                            continuation.resume(returning: (false, 0, false, false))
                         }
                     }
                 }
 
-                print("[Focus Native Augment] preflight attempt=\(index) delay=\(delay/1_000_000)ms ready=\(isReady) score=\(score) playerLoadingVisible=\(playerLoadingVisible)")
+                print("[Focus Native Augment] preflight attempt=\(index) delay=\(delay/1_000_000)ms ready=\(isReady) score=\(score) visiblePlayer=\(visiblePlayer) playerLoadingVisible=\(playerLoadingVisible)")
                 self.debugLog(
                     "nativePageAugmentation.preflight",
                     fields: self.debugStateFields([
@@ -3626,9 +3656,27 @@ final class FocusBrowserViewModel: ObservableObject {
                         "delayMS": String(delay / 1_000_000),
                         "ready": isReady ? "true" : "false",
                         "score": String(score),
+                        "visiblePlayer": visiblePlayer ? "true" : "false",
                         "playerLoadingVisible": playerLoadingVisible ? "true" : "false"
                     ])
                 )
+
+                if !isReady {
+                    self.debugLog(
+                        index == delays.count - 1
+                            ? "nativePageAugmentation.preflightFinalFallback"
+                            : "nativePageAugmentation.skipPreflight",
+                        fields: self.debugStateFields([
+                            "pageURL": canonicalURL.absoluteString,
+                            "pageKind": payload.kind.rawValue,
+                            "attempt": String(index),
+                            "delayMS": String(delay / 1_000_000),
+                            "visiblePlayer": visiblePlayer ? "true" : "false",
+                            "playerLoadingVisible": playerLoadingVisible ? "true" : "false",
+                            "reason": visiblePlayer ? "dom-not-ready" : "player-not-visible"
+                        ])
+                    )
+                }
 
                 guard isReady || index == delays.count - 1 else {
                     print("[Focus Native Augment] skip-not-ready attempt=\(index)")
