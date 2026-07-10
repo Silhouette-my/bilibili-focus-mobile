@@ -5,7 +5,7 @@ import UIKit
 import WebKit
 
 struct FocusWebView: UIViewRepresentable {
-    @ObservedObject var viewModel: FocusBrowserViewModel
+    let viewModel: FocusBrowserViewModel
     @ObservedObject var settingsStore: FocusSettingsStore
     @Environment(\.colorScheme) private var colorScheme
 
@@ -97,8 +97,10 @@ struct FocusWebView: UIViewRepresentable {
 
         func tearDown(webView: WKWebView) {
             let controller = webView.configuration.userContentController
+            webView.evaluateJavaScript("window.__FOCUS_NATIVE_PLAYER_BRIDGE__?.teardown?.(); window.__FOCUS_NATIVE_PLAYER_BRIDGE__ = null;")
             controller.removeScriptMessageHandler(forName: "getConfig")
             controller.removeScriptMessageHandler(forName: "logDebug")
+            controller.removeScriptMessageHandler(forName: "playerState")
             controller.removeAllUserScripts()
             webView.navigationDelegate = nil
             webView.uiDelegate = nil
@@ -117,8 +119,10 @@ struct FocusWebView: UIViewRepresentable {
             controller.removeAllUserScripts()
             controller.removeScriptMessageHandler(forName: "getConfig")
             controller.removeScriptMessageHandler(forName: "logDebug")
+            controller.removeScriptMessageHandler(forName: "playerState")
             controller.add(self, name: "getConfig")
             controller.add(self, name: "logDebug")
+            controller.add(self, name: "playerState")
 
             let bootstrapAppearanceScript = FocusWebAppearance.bootstrapCSS(isDarkMode: isDarkMode)
             let appearanceScript = FocusWebAppearance.script(isDarkMode: isDarkMode)
@@ -185,6 +189,141 @@ struct FocusWebView: UIViewRepresentable {
             if let lastDocumentEndScript {
                 webView.evaluateJavaScript(lastDocumentEndScript)
             }
+            installPlayerStateBridge(on: webView)
+        }
+
+        func installPlayerStateBridge(on webView: WKWebView) {
+            guard let context = viewModel.playerBridgeContext(for: webView) else {
+                return
+            }
+
+            let sessionID = context.sessionID
+            let revision = context.revision
+            let script = """
+            (() => {
+              const browserSessionID = '\(sessionID)';
+              const navigationRevision = \(revision);
+              const existing = window.__FOCUS_NATIVE_PLAYER_BRIDGE__;
+              if (existing
+                && existing.browserSessionID === browserSessionID
+                && existing.navigationRevision === navigationRevision) {
+                existing.emit?.();
+                return true;
+              }
+
+              try {
+                existing?.teardown?.();
+              } catch (_) {}
+
+              let emitTimer = null;
+              let tornDown = false;
+              const eventNames = [
+                'play',
+                'pause',
+                'ratechange',
+                'loadedmetadata',
+                'fullscreenchange',
+                'webkitfullscreenchange',
+                'webkitbeginfullscreen',
+                'webkitendfullscreen',
+                'webkitpresentationmodechanged'
+              ];
+
+              const fallbackSnapshot = () => {
+                const videos = Array.from(document.querySelectorAll('video'));
+                const video = window.__FOCUS_ACTIVE_VIDEO__?.isConnected
+                  ? window.__FOCUS_ACTIVE_VIDEO__
+                  : videos[0] || null;
+                const textTracks = video?.textTracks ? Array.from(video.textTracks) : [];
+                return {
+                  hasPlayer: !!video || !!document.querySelector('#bilibili-player, .bpx-player-container, #playerWrap, .player-container'),
+                  pageURL: location.href,
+                  pageTitle: document.title || '',
+                  videoTitle: '',
+                  isPlaying: !!video && !video.paused && !video.ended,
+                  playbackRate: Number(video?.playbackRate || 1),
+                  isDanmakuHidden: document.documentElement.classList.contains('focus-hide-danmaku'),
+                  hasSubtitles: textTracks.length > 0 || !!document.querySelector('[class*="subtitle"]'),
+                  isSubtitleHidden: textTracks.length > 0 && textTracks.every((track) => track.mode === 'disabled'),
+                  isFullscreen: !!document.fullscreenElement
+                    || video?.webkitPresentationMode === 'fullscreen'
+                    || video?.webkitDisplayingFullscreen === true
+                };
+              };
+
+              const emit = () => {
+                if (tornDown) {
+                  return;
+                }
+                let snapshot = null;
+                try {
+                  snapshot = typeof window.__FOCUS_SNAPSHOT_PLAYER_STATE__ === 'function'
+                    ? window.__FOCUS_SNAPSHOT_PLAYER_STATE__()
+                    : window.__FOCUS_PLAYER_STATE__;
+                } catch (_) {}
+                if (!snapshot || typeof snapshot !== 'object') {
+                  snapshot = fallbackSnapshot();
+                }
+                try {
+                  window.webkit.messageHandlers.playerState.postMessage({
+                    ...snapshot,
+                    browserSessionID,
+                    navigationRevision,
+                    pageURL: location.href,
+                    pageTitle: snapshot.pageTitle || document.title || ''
+                  });
+                } catch (_) {}
+              };
+
+              const scheduleEmit = (delay = 40) => {
+                clearTimeout(emitTimer);
+                emitTimer = setTimeout(emit, delay);
+              };
+              const eventHandler = (event) => {
+                if (event.target instanceof HTMLVideoElement) {
+                  window.__FOCUS_ACTIVE_VIDEO__ = event.target;
+                }
+                scheduleEmit(event.type === 'ratechange' ? 10 : 40);
+              };
+              const clickHandler = (event) => {
+                const target = event.target;
+                if (!target?.closest?.('.bpx-player-container, #bilibili-player, #playerWrap, [class*="player"]')) {
+                  return;
+                }
+                scheduleEmit(80);
+              };
+
+              eventNames.forEach((eventName) => {
+                document.addEventListener(eventName, eventHandler, true);
+              });
+              document.addEventListener('click', clickHandler, true);
+              const observer = new MutationObserver(() => scheduleEmit(100));
+              observer.observe(document.documentElement, { childList: true, subtree: true });
+
+              const teardown = () => {
+                if (tornDown) {
+                  return;
+                }
+                tornDown = true;
+                clearTimeout(emitTimer);
+                observer.disconnect();
+                eventNames.forEach((eventName) => {
+                  document.removeEventListener(eventName, eventHandler, true);
+                });
+                document.removeEventListener('click', clickHandler, true);
+              };
+
+              window.__FOCUS_NATIVE_PLAYER_BRIDGE__ = {
+                browserSessionID,
+                navigationRevision,
+                emit,
+                teardown
+              };
+              scheduleEmit(0);
+              return true;
+            })();
+            """
+            webView.evaluateJavaScript(script)
         }
 
         private func shouldSkipFinishScriptReplay(for url: URL?) -> Bool {
@@ -204,6 +343,8 @@ struct FocusWebView: UIViewRepresentable {
                 webView.evaluateJavaScript("window.__FOCUS_CONFIG__ = \(configJSON);")
             case "logDebug":
                 print("[Focus Debug]", message.body)
+            case "playerState":
+                viewModel.handlePlayerStateMessage(message.body, from: message.webView)
             default:
                 break
             }
@@ -214,6 +355,7 @@ struct FocusWebView: UIViewRepresentable {
                 reapplyCurrentPageScripts(on: webView)
             }
             viewModel.updateNavigationState(from: webView)
+            installPlayerStateBridge(on: webView)
         }
 
         func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
@@ -279,6 +421,7 @@ struct FocusWebView: UIViewRepresentable {
                     from: webView.url,
                     navigationType: navigationAction.navigationType
                 )
+                installPlayerStateBridge(on: webView)
                 let desiredDesktopMode = FocusUserAgent.shouldUseDesktopMode(for: url)
                 if desiredDesktopMode != lastPreparedUsesDesktopMode {
                     decisionHandler(.cancel)

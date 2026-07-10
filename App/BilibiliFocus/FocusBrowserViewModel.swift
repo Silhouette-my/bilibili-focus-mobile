@@ -5,6 +5,42 @@ import FocusCore
 import Foundation
 import WebKit
 
+struct PlayerSnapshot: Equatable, Sendable {
+    var hasPlayer: Bool
+    var isPlaying: Bool
+    var playbackRate: Double
+    var isDanmakuHidden: Bool
+    var hasSubtitles: Bool
+    var isSubtitleHidden: Bool
+    var isFullscreen: Bool
+
+    static let empty = PlayerSnapshot(
+        hasPlayer: false,
+        isPlaying: false,
+        playbackRate: 1,
+        isDanmakuHidden: false,
+        hasSubtitles: false,
+        isSubtitleHidden: false,
+        isFullscreen: false
+    )
+}
+
+struct BrowserSessionID: Equatable, Hashable, Sendable {
+    let rawValue: UUID
+
+    init(rawValue: UUID = UUID()) {
+        self.rawValue = rawValue
+    }
+
+    var stringValue: String {
+        rawValue.uuidString.lowercased()
+    }
+}
+
+struct NavigationRevision: Equatable, Hashable, Sendable {
+    let rawValue: UInt64
+}
+
 @MainActor
 final class FocusAppViewModel: ObservableObject {
     enum PrimaryTab {
@@ -115,8 +151,17 @@ final class FocusAppViewModel: ObservableObject {
             }
         }
 
-        browserViewModel.objectWillChange
-            .sink { [weak self] _ in
+        let browserPresentationChanges: [AnyPublisher<Void, Never>] = [
+            browserViewModel.$navigationTitle.removeDuplicates().dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            browserViewModel.$currentURL.removeDuplicates().dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            browserViewModel.$entryContext.removeDuplicates().dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            browserViewModel.$hasActiveVideoRoute.removeDuplicates().dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            browserViewModel.$playerSnapshot.removeDuplicates().dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            browserViewModel.$isLoadingPage.removeDuplicates().dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            browserViewModel.$webContentFailureMessage.removeDuplicates().dropFirst().map { _ in () }.eraseToAnyPublisher()
+        ]
+        Publishers.MergeMany(browserPresentationChanges)
+            .sink { [weak self] in
                 self?.objectWillChange.send()
             }
             .store(in: &cancellables)
@@ -891,7 +936,7 @@ final class FocusAppViewModel: ObservableObject {
 
 @MainActor
 final class FocusBrowserViewModel: ObservableObject {
-    enum EntryContext {
+    enum EntryContext: Equatable {
         case dynamic
         case search
         case my
@@ -909,17 +954,24 @@ final class FocusBrowserViewModel: ObservableObject {
         let videoTitle: String?
     }
 
+    private struct BrowserCallbackContext: Equatable {
+        let sessionID: BrowserSessionID
+        let revision: NavigationRevision
+        let canonicalURL: URL
+        let webViewIdentifier: ObjectIdentifier
+    }
+
+    struct PlayerBridgeContext: Equatable, Sendable {
+        let sessionID: String
+        let revision: UInt64
+        let canonicalURL: URL
+    }
+
     @Published private(set) var currentURL: URL?
     @Published private(set) var canGoBack = false
     @Published private(set) var canGoForward = false
     @Published private(set) var hasActiveVideoRoute = false
-    @Published private(set) var hasDetectedPlayer = false
-    @Published private(set) var isImmersiveVideo = false
-    @Published private(set) var isPlaying = false
-    @Published private(set) var playbackRate: Double = 1.0
-    @Published private(set) var isDanmakuHidden = false
-    @Published private(set) var hasSubtitles = false
-    @Published private(set) var isSubtitleHidden = false
+    @Published private(set) var playerSnapshot = PlayerSnapshot.empty
     @Published private(set) var isLoadingPage = false
     @Published private(set) var entryContext: EntryContext = .dynamic
     @Published private(set) var navigationTitle = "浏览"
@@ -941,7 +993,9 @@ final class FocusBrowserViewModel: ObservableObject {
     private(set) var isSessionActive = false
     private var playerStateObservationTask: Task<Void, Never>?
     private var embeddedPlayerDetectionTask: Task<Void, Never>?
+    private var playerCommandTask: Task<Void, Never>?
     private var pageAugmentationTask: Task<Void, Never>?
+    private var pageAugmentationApplyTask: Task<Void, Never>?
     private var nativeVideoLoadingMaskTask: Task<Void, Never>?
     private var nativeVideoPlaceholderTask: Task<Void, Never>?
     private var pageAugmentationRevision = 0
@@ -963,6 +1017,11 @@ final class FocusBrowserViewModel: ObservableObject {
     private var webContentRecoveryTask: Task<Void, Never>?
     private var webContentRecoveryAttempts = 0
     private var requestedInterfaceOrientationMask: UIInterfaceOrientationMask = .portrait
+    private var browserSessionID = BrowserSessionID()
+    private var navigationRevisionCounter: UInt64 = 0
+    private var navigationRevision = NavigationRevision(rawValue: 0)
+    private var sessionCanonicalURL: URL?
+    private var isAwaitingNavigationStart = false
 
     init(settingsStore: FocusSettingsStore) {
         self.settingsStore = settingsStore
@@ -971,7 +1030,9 @@ final class FocusBrowserViewModel: ObservableObject {
     deinit {
         playerStateObservationTask?.cancel()
         embeddedPlayerDetectionTask?.cancel()
+        playerCommandTask?.cancel()
         pageAugmentationTask?.cancel()
+        pageAugmentationApplyTask?.cancel()
         nativeVideoLoadingMaskTask?.cancel()
         nativeVideoPlaceholderTask?.cancel()
         orientationDebounceTask?.cancel()
@@ -985,6 +1046,34 @@ final class FocusBrowserViewModel: ObservableObject {
 
     var navigationPolicy: FocusNavigationPolicy {
         FocusNavigationPolicy(settings: settingsStore.settings)
+    }
+
+    var hasDetectedPlayer: Bool {
+        playerSnapshot.hasPlayer
+    }
+
+    var isImmersiveVideo: Bool {
+        playerSnapshot.isFullscreen
+    }
+
+    var isPlaying: Bool {
+        playerSnapshot.isPlaying
+    }
+
+    var playbackRate: Double {
+        playerSnapshot.playbackRate
+    }
+
+    var isDanmakuHidden: Bool {
+        playerSnapshot.isDanmakuHidden
+    }
+
+    var hasSubtitles: Bool {
+        playerSnapshot.hasSubtitles
+    }
+
+    var isSubtitleHidden: Bool {
+        playerSnapshot.isSubtitleHidden
     }
 
     var isVideoPage: Bool {
@@ -1116,7 +1205,138 @@ final class FocusBrowserViewModel: ObservableObject {
         }
     }
 
+    func playerBridgeContext(for candidateWebView: WKWebView) -> PlayerBridgeContext? {
+        guard
+            webView === candidateWebView,
+            let context = makeBrowserCallbackContext(for: candidateWebView)
+        else {
+            return nil
+        }
+
+        return PlayerBridgeContext(
+            sessionID: context.sessionID.stringValue,
+            revision: context.revision.rawValue,
+            canonicalURL: context.canonicalURL
+        )
+    }
+
+    func handlePlayerStateMessage(_ body: Any, from sourceWebView: WKWebView?) {
+        guard
+            let sourceWebView,
+            let payload = body as? [String: Any],
+            let context = makeBrowserCallbackContext(for: sourceWebView),
+            payload["browserSessionID"] as? String == context.sessionID.stringValue,
+            Self.uint64Value(payload["navigationRevision"]) == context.revision.rawValue,
+            let payloadURLString = payload["pageURL"] as? String,
+            let payloadURL = URL(string: payloadURLString).map(FocusNavigationPolicy.canonicalWebURL(for:)),
+            payloadURL == context.canonicalURL,
+            isCurrent(context, webView: sourceWebView)
+        else {
+            debugLog(
+                "playerStateMessage.discarded",
+                fields: debugStateFields([
+                    "messageSessionID": (body as? [String: Any])?["browserSessionID"] as? String,
+                    "messageRevision": Self.uint64Value((body as? [String: Any])?["navigationRevision"]).map(String.init),
+                    "messageURL": (body as? [String: Any])?["pageURL"] as? String
+                ])
+            )
+            return
+        }
+
+        applyPlayerStatePayload(payload, context: context, webView: sourceWebView, source: "playerStateMessage")
+    }
+
+    private func prepareNavigationSession(to url: URL, force: Bool = false) {
+        let canonicalURL = FocusNavigationPolicy.canonicalWebURL(for: url)
+        guard force || !isAwaitingNavigationStart || sessionCanonicalURL != canonicalURL else {
+            return
+        }
+
+        advanceNavigationSession(to: canonicalURL, awaitingStart: true)
+    }
+
+    private func markNavigationStarted(at url: URL?) {
+        let canonicalURL = url.map(FocusNavigationPolicy.canonicalWebURL(for:))
+        if isAwaitingNavigationStart, sessionCanonicalURL == canonicalURL {
+            isAwaitingNavigationStart = false
+            return
+        }
+
+        advanceNavigationSession(to: canonicalURL, awaitingStart: false)
+    }
+
+    private func alignNavigationSessionIfNeeded(to url: URL?) {
+        guard let canonicalURL = url.map(FocusNavigationPolicy.canonicalWebURL(for:)) else {
+            return
+        }
+        guard sessionCanonicalURL != canonicalURL else {
+            isAwaitingNavigationStart = false
+            return
+        }
+
+        advanceNavigationSession(to: canonicalURL, awaitingStart: false)
+    }
+
+    private func advanceNavigationSession(to canonicalURL: URL?, awaitingStart: Bool) {
+        navigationRevisionCounter &+= 1
+        navigationRevision = NavigationRevision(rawValue: navigationRevisionCounter)
+        browserSessionID = BrowserSessionID()
+        sessionCanonicalURL = canonicalURL
+        isAwaitingNavigationStart = awaitingStart
+        playerStateObservationTask?.cancel()
+        playerStateObservationTask = nil
+        embeddedPlayerDetectionTask?.cancel()
+        embeddedPlayerDetectionTask = nil
+        playerCommandTask?.cancel()
+        playerCommandTask = nil
+        pageAugmentationApplyTask?.cancel()
+        pageAugmentationApplyTask = nil
+        publishPlayerSnapshot(.empty)
+    }
+
+    private func invalidateBrowserCallbacks() {
+        advanceNavigationSession(to: nil, awaitingStart: false)
+    }
+
+    private func makeBrowserCallbackContext(for candidateWebView: WKWebView) -> BrowserCallbackContext? {
+        guard webView === candidateWebView else {
+            return nil
+        }
+        guard let canonicalURL = (candidateWebView.url ?? sessionCanonicalURL ?? currentURL ?? pendingURL)
+            .map(FocusNavigationPolicy.canonicalWebURL(for:))
+        else {
+            return nil
+        }
+        guard sessionCanonicalURL == canonicalURL else {
+            return nil
+        }
+
+        return BrowserCallbackContext(
+            sessionID: browserSessionID,
+            revision: navigationRevision,
+            canonicalURL: canonicalURL,
+            webViewIdentifier: ObjectIdentifier(candidateWebView)
+        )
+    }
+
+    private func isCurrent(_ context: BrowserCallbackContext, webView candidateWebView: WKWebView) -> Bool {
+        guard
+            webView === candidateWebView,
+            ObjectIdentifier(candidateWebView) == context.webViewIdentifier,
+            browserSessionID == context.sessionID,
+            navigationRevision == context.revision,
+            sessionCanonicalURL == context.canonicalURL
+        else {
+            return false
+        }
+
+        let activeURL = (candidateWebView.url ?? currentURL ?? pendingURL)
+            .map(FocusNavigationPolicy.canonicalWebURL(for:))
+        return activeURL == context.canonicalURL
+    }
+
     func open(_ url: URL, context: EntryContext) {
+        let canonicalURL = FocusNavigationPolicy.canonicalWebURL(for: url)
         isSessionActive = true
         webContentRecoveryTask?.cancel()
         webContentRecoveryTask = nil
@@ -1124,24 +1344,25 @@ final class FocusBrowserViewModel: ObservableObject {
         webContentFailureMessage = nil
         resetAppBackStack()
         invalidatePageAugmentation()
+        prepareNavigationSession(to: canonicalURL, force: true)
         if let webView {
             suspendActivePlayback(in: webView)
             webView.stopLoading()
         }
         resetPlayerState()
         entryContext = context
-        pendingURL = url
+        pendingURL = canonicalURL
         isLoadingPage = true
-        hasActiveVideoRoute = FocusUserAgent.shouldUseDesktopPlayback(for: url)
-        updateNavigationMetadata(for: url, pageTitle: nil, context: context)
+        hasActiveVideoRoute = FocusUserAgent.shouldUseDesktopPlayback(for: canonicalURL)
+        updateNavigationMetadata(for: canonicalURL, pageTitle: nil, context: context)
         if let webView {
-            loadURLIfNeeded(url, on: webView, reason: "open")
+            loadURLIfNeeded(canonicalURL, on: webView, reason: "open")
         }
 
         debugLog(
             "open",
             fields: debugStateFields([
-                "inputURL": url.absoluteString,
+                "inputURL": canonicalURL.absoluteString,
                 "context": entryContextLabel(context)
             ])
         )
@@ -1149,6 +1370,11 @@ final class FocusBrowserViewModel: ObservableObject {
 
     func reload() {
         if let webView {
+            let targetURL = (webView.url ?? currentURL ?? pendingURL)
+                .map(FocusNavigationPolicy.canonicalWebURL(for:))
+            if let targetURL {
+                prepareNavigationSession(to: targetURL, force: true)
+            }
             webView.reload()
             return
         }
@@ -1165,11 +1391,17 @@ final class FocusBrowserViewModel: ObservableObject {
 
     func goBack() {
         guard canGoBack else { return }
+        if let targetURL = webView?.backForwardList.backItem?.url {
+            prepareNavigationSession(to: targetURL, force: true)
+        }
         webView?.goBack()
     }
 
     func goForward() {
         guard canGoForward else { return }
+        if let targetURL = webView?.backForwardList.forwardItem?.url {
+            prepareNavigationSession(to: targetURL, force: true)
+        }
         webView?.goForward()
     }
 
@@ -1181,6 +1413,8 @@ final class FocusBrowserViewModel: ObservableObject {
             to: canonicalTargetURL,
             navigationType: navigationType
         )
+
+        prepareNavigationSession(to: canonicalTargetURL)
 
         pendingURL = canonicalTargetURL
         updateNavigationMetadata(for: canonicalTargetURL)
@@ -1238,7 +1472,9 @@ final class FocusBrowserViewModel: ObservableObject {
         guard self.webView === webView else {
             return
         }
-        currentURL = webView.url.map(FocusNavigationPolicy.canonicalWebURL(for:))
+        let resolvedURL = webView.url.map(FocusNavigationPolicy.canonicalWebURL(for:))
+        alignNavigationSessionIfNeeded(to: resolvedURL)
+        currentURL = resolvedURL
         pendingURL = currentURL
         isLoadingPage = false
         webContentRecoveryTask?.cancel()
@@ -1299,7 +1535,11 @@ final class FocusBrowserViewModel: ObservableObject {
     }
 
     func commitNavigationState(from webView: WKWebView) {
+        guard self.webView === webView else {
+            return
+        }
         let resolvedURL = webView.url.map(FocusNavigationPolicy.canonicalWebURL(for:))
+        alignNavigationSessionIfNeeded(to: resolvedURL)
         currentURL = resolvedURL
         pendingURL = resolvedURL
         canGoBack = webView.canGoBack
@@ -1346,6 +1586,7 @@ final class FocusBrowserViewModel: ObservableObject {
     func beginNavigation(to url: URL?) {
         var isStaleStartURL = false
         let targetURL = (pendingURL ?? url).map(FocusNavigationPolicy.canonicalWebURL(for:))
+        markNavigationStarted(at: targetURL)
         if let targetURL {
             let canonicalCurrentURL = currentURL.map(FocusNavigationPolicy.canonicalWebURL(for:))
             let canonicalPendingURL = pendingURL.map(FocusNavigationPolicy.canonicalWebURL(for:))
@@ -1384,6 +1625,7 @@ final class FocusBrowserViewModel: ObservableObject {
         nativeVideoLoadingMaskTask = nil
         isLoadingPage = false
         lastIssuedLoadURL = nil
+        invalidateBrowserCallbacks()
         debugLog(
             "handleNavigationFailure",
             fields: debugStateFields([
@@ -1397,6 +1639,7 @@ final class FocusBrowserViewModel: ObservableObject {
             return
         }
 
+        invalidateBrowserCallbacks()
         invalidatePageAugmentation()
         resetPlayerState()
         webContentRecoveryTask?.cancel()
@@ -1425,6 +1668,7 @@ final class FocusBrowserViewModel: ObservableObject {
         webContentFailureMessage = nil
         pendingURL = recoveryURL
         isLoadingPage = true
+        prepareNavigationSession(to: recoveryURL, force: true)
 
         webContentRecoveryTask = Task { @MainActor [weak self, weak terminatedWebView] in
             try? await Task.sleep(nanoseconds: 250_000_000)
@@ -1504,6 +1748,7 @@ final class FocusBrowserViewModel: ObservableObject {
 
         if let webView {
             if let historyItem = historyItem(for: canonicalURL, in: webView) {
+                prepareNavigationSession(to: canonicalURL, force: true)
                 debugLog(
                     "navigateAppBack",
                     fields: debugStateFields([
@@ -2016,6 +2261,7 @@ final class FocusBrowserViewModel: ObservableObject {
 
     func prepareForDismiss() {
         isSessionActive = false
+        invalidateBrowserCallbacks()
         webContentRecoveryTask?.cancel()
         webContentRecoveryTask = nil
         webContentFailureMessage = nil
@@ -2026,7 +2272,6 @@ final class FocusBrowserViewModel: ObservableObject {
         invalidatePageAugmentation()
         resetPlayerState()
         isLoadingPage = false
-        isImmersiveVideo = false
         requestedInterfaceOrientationMask = .portrait
         updateSupportedOrientations(to: .portrait)
         navigationTitle = "浏览"
@@ -2047,6 +2292,7 @@ final class FocusBrowserViewModel: ObservableObject {
         }
 
         isSessionActive = false
+        invalidateBrowserCallbacks()
         webContentRecoveryTask?.cancel()
         webContentRecoveryTask = nil
         if let webView {
@@ -2121,49 +2367,53 @@ final class FocusBrowserViewModel: ObservableObject {
     }
 
     private func runPlayerCommand(_ script: String) {
-        guard allowsPlayerControl else {
+        guard
+            allowsPlayerControl,
+            let webView,
+            let context = makeBrowserCallbackContext(for: webView)
+        else {
             return
         }
 
-        webView?.evaluateJavaScript(script) { [weak self] _, _ in
-            guard let self else {
+        playerCommandTask?.cancel()
+        playerCommandTask = Task { @MainActor [weak self, weak webView] in
+            guard let self, let webView else {
                 return
             }
 
-            Task { @MainActor [weak self] in
-                let delays: [UInt64] = [80_000_000, 220_000_000, 520_000_000, 1_000_000_000]
-                for delay in delays {
-                    try? await Task.sleep(nanoseconds: delay)
-                    self?.refreshPlayerState()
-                }
+            do {
+                _ = try await webView.evaluateJavaScript(script)
+            } catch {
+                self.debugLog(
+                    "playerCommand.error",
+                    fields: self.debugStateFields(["error": String(describing: error)])
+                )
             }
+
+            guard !Task.isCancelled, self.isCurrent(context, webView: webView) else {
+                return
+            }
+
+            _ = await self.refreshPlayerState(on: webView, context: context)
         }
     }
 
     private func startEmbeddedPlayerDetection(on webView: WKWebView) {
-        let expectedURL = webView.url
-        let shouldContinuouslyObserve = expectedURL.map(isSearchResultURL) ?? (entryContext == .search)
+        guard let context = makeBrowserCallbackContext(for: webView) else {
+            return
+        }
+        let expectedURL = context.canonicalURL
         debugLog(
             "startEmbeddedPlayerDetection",
             fields: debugStateFields([
-                "expectedURL": expectedURL?.absoluteString,
-                "continuous": debugBool(shouldContinuouslyObserve)
+                "expectedURL": expectedURL.absoluteString,
+                "continuous": debugBool(false)
             ])
         )
+        embeddedPlayerDetectionTask?.cancel()
         embeddedPlayerDetectionTask = Task { @MainActor [weak self, weak webView] in
-            let initialDelays: [UInt64] = [0, 180_000_000, 420_000_000, 900_000_000, 1_600_000_000]
-            var attempt = 0
-
-            while true {
-                let delay: UInt64
-                if attempt < initialDelays.count {
-                    delay = initialDelays[attempt]
-                } else if shouldContinuouslyObserve {
-                    delay = 950_000_000
-                } else {
-                    break
-                }
-
+            let initialDelays: [UInt64] = [0, 300_000_000, 700_000_000, 1_400_000_000, 2_500_000_000]
+            for (attempt, delay) in initialDelays.enumerated() {
                 if delay > 0 {
                     try? await Task.sleep(nanoseconds: delay)
                 }
@@ -2171,50 +2421,59 @@ final class FocusBrowserViewModel: ObservableObject {
                 guard
                     !Task.isCancelled,
                     let self,
-                    let webView
+                    let webView,
+                    self.isCurrent(context, webView: webView)
                 else {
                     return
                 }
 
-                if let state = await self.detectEmbeddedPlayerState(on: webView, fallbackURL: expectedURL) {
+                if let state = await self.detectEmbeddedPlayerState(
+                    on: webView,
+                    context: context,
+                    fallbackURL: expectedURL
+                ) {
+                    guard self.isCurrent(context, webView: webView) else {
+                        return
+                    }
                     let hasPlayer = state.hasPlayer
-                    self.hasDetectedPlayer = hasPlayer || self.hasDetectedPlayer
                     self.applyDetectedPageState(state, fallbackURL: webView.url ?? expectedURL)
+                    self.logDetectedPageState(state, source: "detectEmbeddedPlayerState")
                     self.debugLog(
                         "embeddedPlayerDetectionAttempt",
                         fields: self.debugStateFields([
                             "attempt": String(attempt),
-                            "expectedURL": expectedURL?.absoluteString,
+                            "expectedURL": expectedURL.absoluteString,
                             "detectedHasPlayer": self.debugBool(hasPlayer)
                         ])
                     )
 
                     if self.hasActiveVideoRoute || hasPlayer {
                         self.hasActiveVideoRoute = true
-                        self.hasDetectedPlayer = true
-                        self.refreshPlayerState()
+                        var snapshot = self.playerSnapshot
+                        snapshot.hasPlayer = true
+                        self.publishPlayerSnapshot(snapshot)
                         self.startPlayerStateObservation()
                         return
                     }
                 }
-
-                attempt += 1
             }
 
             guard
                 let self,
                 !Task.isCancelled,
-                self.currentURL == expectedURL,
-                !shouldContinuouslyObserve
+                let webView,
+                self.isCurrent(context, webView: webView)
             else {
                 return
             }
-
-            self.resetPlayerState()
         }
     }
 
-    private func detectEmbeddedPlayerState(on webView: WKWebView, fallbackURL: URL?) async -> DetectedPageState? {
+    private func detectEmbeddedPlayerState(
+        on webView: WKWebView,
+        context: BrowserCallbackContext,
+        fallbackURL: URL?
+    ) async -> DetectedPageState? {
         let script = """
         (() => {
           const cachedState = window.__FOCUS_PLAYER_STATE__;
@@ -2273,51 +2532,34 @@ final class FocusBrowserViewModel: ObservableObject {
         })();
         """
 
-        return await withCheckedContinuation { continuation in
-            webView.evaluateJavaScript(script) { [weak self, weak webView] value, error in
-                guard
-                    let self
-                else {
-                    continuation.resume(returning: nil)
-                    return
-                }
-
-                if let error {
-                    self.debugLog(
-                        "detectEmbeddedPlayerState.error",
-                        fields: self.debugStateFields([
-                            "fallbackURL": fallbackURL?.absoluteString,
-                            "error": String(describing: error)
-                        ])
-                    )
-                }
-
-                guard
-                    let webView,
-                    let payload = value as? [String: Any]
-                else {
-                    self.debugLog(
-                        "detectEmbeddedPlayerState.missingPayload",
-                        fields: self.debugStateFields([
-                            "fallbackURL": fallbackURL?.absoluteString,
-                            "valueType": value.map { String(describing: type(of: $0)) } ?? "nil"
-                        ])
-                    )
-                    continuation.resume(returning: nil)
-                    return
-                }
-
-                let state = self.makeDetectedPageState(from: payload)
-                self.applyDetectedPageState(state, fallbackURL: webView.url ?? fallbackURL)
-                self.logDetectedPageState(state, source: "detectEmbeddedPlayerState")
-
-                let hasPlayer = state.hasPlayer
-                if hasPlayer {
-                    self.hasDetectedPlayer = true
-                }
-
-                continuation.resume(returning: state)
+        do {
+            let value = try await webView.evaluateJavaScript(script)
+            guard !Task.isCancelled, isCurrent(context, webView: webView) else {
+                return nil
             }
+            guard let payload = value as? [String: Any] else {
+                debugLog(
+                    "detectEmbeddedPlayerState.missingPayload",
+                    fields: debugStateFields([
+                        "fallbackURL": fallbackURL?.absoluteString,
+                        "valueType": value.map { String(describing: type(of: $0)) } ?? "nil"
+                    ])
+                )
+                return nil
+            }
+            return makeDetectedPageState(from: payload)
+        } catch {
+            guard isCurrent(context, webView: webView) else {
+                return nil
+            }
+            debugLog(
+                "detectEmbeddedPlayerState.error",
+                fields: debugStateFields([
+                    "fallbackURL": fallbackURL?.absoluteString,
+                    "error": String(describing: error)
+                ])
+            )
+            return nil
         }
     }
 
@@ -2573,17 +2815,13 @@ final class FocusBrowserViewModel: ObservableObject {
         orientationDebounceTask = nil
         fullscreenTransitionTask?.cancel()
         fullscreenTransitionTask = nil
+        playerCommandTask?.cancel()
+        playerCommandTask = nil
         lastHandledDeviceOrientation = .unknown
         requestedInterfaceOrientationMask = .portrait
         updateSupportedOrientations(to: .portrait)
         hasActiveVideoRoute = false
-        hasDetectedPlayer = false
-        isImmersiveVideo = false
-        isPlaying = false
-        playbackRate = 1.0
-        isDanmakuHidden = false
-        hasSubtitles = false
-        isSubtitleHidden = false
+        publishPlayerSnapshot(.empty)
         nativeVideoAuthorName = ""
         nativeVideoAuthorAvatarURL = nil
         nativeVideoAuthorSpaceURL = nil
@@ -2599,6 +2837,8 @@ final class FocusBrowserViewModel: ObservableObject {
         pageAugmentationRevision &+= 1
         pageAugmentationTask?.cancel()
         pageAugmentationTask = nil
+        pageAugmentationApplyTask?.cancel()
+        pageAugmentationApplyTask = nil
         nativeVideoLoadingMaskTask?.cancel()
         nativeVideoLoadingMaskTask = nil
         nativeVideoPlaceholderTask?.cancel()
@@ -2641,6 +2881,7 @@ final class FocusBrowserViewModel: ObservableObject {
             }
         }
 
+        prepareNavigationSession(to: canonicalURL)
         prepareForURL?(webView, canonicalURL)
         lastIssuedLoadURL = canonicalURL
         webView.load(URLRequest(url: canonicalURL))
@@ -2762,7 +3003,6 @@ final class FocusBrowserViewModel: ObservableObject {
                 self.pageAugmentationRetryAfter[scheduleKey] = nil
                 self.pageAugmentCache[cacheKey] = payload
                 self.syncNativeVideoMetadata(from: payload)
-                print("[Focus Native Augment] loaded kind=\(payload.kind.rawValue) summary=\(payload.summary) url=\(canonicalURL.absoluteString)")
                 self.applyPageAugmentation(payload, for: canonicalURL, revision: revision)
             }
         }
@@ -3596,8 +3836,9 @@ final class FocusBrowserViewModel: ObservableObject {
         let delays: [UInt64] = [0, 150_000_000, 500_000_000, 1_200_000_000, 3_000_000_000, 6_000_000_000]
         let expectedRenderKey = payload.renderKey
 
-        for (index, delay) in delays.enumerated() {
-            Task { @MainActor [weak self] in
+        pageAugmentationApplyTask?.cancel()
+        pageAugmentationApplyTask = Task { @MainActor [weak self] in
+            for (index, delay) in delays.enumerated() {
                 guard let self else {
                     return
                 }
@@ -3607,8 +3848,11 @@ final class FocusBrowserViewModel: ObservableObject {
                 }
 
                 guard
+                    !Task.isCancelled,
                     self.pageAugmentationRevision == revision,
-                    let webView = self.webView
+                    let webView = self.webView,
+                    let callbackContext = self.makeBrowserCallbackContext(for: webView),
+                    callbackContext.canonicalURL == canonicalURL
                 else {
                     return
                 }
@@ -3626,6 +3870,14 @@ final class FocusBrowserViewModel: ObservableObject {
                         ) { value, _ in
                             continuation.resume(returning: value as? String)
                         }
+                    }
+
+                    guard
+                        !Task.isCancelled,
+                        self.pageAugmentationRevision == revision,
+                        self.isCurrent(callbackContext, webView: webView)
+                    else {
+                        return
                     }
 
                     if existingRenderKey == expectedRenderKey {
@@ -3748,7 +4000,14 @@ final class FocusBrowserViewModel: ObservableObject {
                     }
                 }
 
-                print("[Focus Native Augment] preflight attempt=\(index) delay=\(delay/1_000_000)ms ready=\(isReady) score=\(score) visiblePlayer=\(visiblePlayer) playerLoadingVisible=\(playerLoadingVisible)")
+                guard
+                    !Task.isCancelled,
+                    self.pageAugmentationRevision == revision,
+                    self.isCurrent(callbackContext, webView: webView)
+                else {
+                    return
+                }
+
                 self.debugLog(
                     "nativePageAugmentation.preflight",
                     fields: self.debugStateFields([
@@ -3781,54 +4040,54 @@ final class FocusBrowserViewModel: ObservableObject {
                 }
 
                 guard isReady || index == delays.count - 1 else {
-                    print("[Focus Native Augment] skip-not-ready attempt=\(index)")
-                    return
+                    continue
                 }
 
                 let script = payload.javaScript
-                webView.evaluateJavaScript(script) { [weak self] _, error in
-                    guard let self else {
-                        return
-                    }
+                do {
+                    _ = try await webView.evaluateJavaScript(script)
+                } catch {
+                    self.debugLog(
+                        "nativePageAugmentation.error",
+                        fields: self.debugStateFields([
+                            "pageURL": canonicalURL.absoluteString,
+                            "pageKind": payload.kind.rawValue,
+                            "attempt": String(index),
+                            "error": String(describing: error)
+                        ])
+                    )
+                    continue
+                }
 
-                    if let error {
-                        print("[Focus Native Augment] script-error attempt=\(index) kind=\(payload.kind.rawValue) error=\(error)")
+                guard
+                    !Task.isCancelled,
+                    self.pageAugmentationRevision == revision,
+                    self.isCurrent(callbackContext, webView: webView)
+                else {
+                    return
+                }
+
+                    if payload.kind == .video {
+                        try? await Task.sleep(nanoseconds: 220_000_000)
+                        guard
+                            !Task.isCancelled,
+                            self.pageAugmentationRevision == revision,
+                            self.isCurrent(callbackContext, webView: webView)
+                        else {
+                            return
+                        }
                         self.debugLog(
-                            "nativePageAugmentation.error",
+                            "nativeOriginalSectionSuppression.clearScheduled",
                             fields: self.debugStateFields([
                                 "pageURL": canonicalURL.absoluteString,
-                                "pageKind": payload.kind.rawValue,
-                                "attempt": String(index),
-                                "error": String(describing: error)
+                                "delayMS": "220",
+                                "attempt": String(index)
                             ])
                         )
-                        return
+                        self.clearNativeVideoOriginalSectionSuppression(for: canonicalURL)
                     }
 
-                    print("[Focus Native Augment] applied attempt=\(index) kind=\(payload.kind.rawValue) delayMS=\(delay / 1_000_000) url=\(canonicalURL.absoluteString)")
-                    if payload.kind == .video {
-                        Task { @MainActor [weak self] in
-                            try? await Task.sleep(nanoseconds: 220_000_000)
-                            guard let self, self.pageAugmentationRevision == revision else {
-                                return
-                            }
-                            let activeURL = (self.webView?.url ?? self.currentURL ?? self.pendingURL)
-                                .map(FocusNavigationPolicy.canonicalWebURL(for:))
-                            guard activeURL == canonicalURL else {
-                                return
-                            }
-                            self.debugLog(
-                                "nativeOriginalSectionSuppression.clearScheduled",
-                                fields: self.debugStateFields([
-                                    "pageURL": canonicalURL.absoluteString,
-                                    "delayMS": "220",
-                                    "attempt": String(index)
-                                ])
-                            )
-                            self.clearNativeVideoOriginalSectionSuppression(for: canonicalURL)
-                        }
-                    }
-
+                    if self.settingsStore.settings.debugMode {
                     let probeScript = """
                     (() => {
                       const root = document.getElementById('focus-native-video-augment') || document.getElementById('focus-native-opus-comments');
@@ -3925,6 +4184,12 @@ final class FocusBrowserViewModel: ObservableObject {
                     Task { @MainActor in
                         do {
                             let value = try await webView.evaluateJavaScript(traceScript)
+                            guard
+                                self.pageAugmentationRevision == revision,
+                                self.isCurrent(callbackContext, webView: webView)
+                            else {
+                                return
+                            }
                             self.debugLog(
                                 "nativePageAugmentation.traceInstalled",
                                 fields: self.debugStateFields([
@@ -3935,6 +4200,9 @@ final class FocusBrowserViewModel: ObservableObject {
                                 ])
                             )
                         } catch {
+                            guard self.isCurrent(callbackContext, webView: webView) else {
+                                return
+                            }
                             self.debugLog(
                                 "nativePageAugmentation.traceInstallError",
                                 fields: self.debugStateFields([
@@ -3949,7 +4217,12 @@ final class FocusBrowserViewModel: ObservableObject {
                     Task { @MainActor in
                         do {
                             let value = try await webView.evaluateJavaScript(probeScript)
-                            print("[Focus Native Augment] probe attempt=\(index) kind=\(payload.kind.rawValue) url=\(canonicalURL.absoluteString) value=\(String(describing: value))")
+                            guard
+                                self.pageAugmentationRevision == revision,
+                                self.isCurrent(callbackContext, webView: webView)
+                            else {
+                                return
+                            }
                             self.debugLog(
                                 "nativePageAugmentation.probeCaptured",
                                 fields: self.debugStateFields([
@@ -3959,9 +4232,7 @@ final class FocusBrowserViewModel: ObservableObject {
                                     "probeType": value.map { String(describing: type(of: $0)) } ?? "nil"
                                 ])
                             )
-                        } catch {
-                            print("[Focus Native Augment] probe-error attempt=\(index) kind=\(payload.kind.rawValue) url=\(canonicalURL.absoluteString) error=\(error)")
-                        }
+                        } catch {}
                     }
                     let traceSampleDelays: [UInt64] = [0, 120_000_000, 260_000_000]
                     for (sampleIndex, sampleDelay) in traceSampleDelays.enumerated() {
@@ -3984,6 +4255,12 @@ final class FocusBrowserViewModel: ObservableObject {
                                 let value = try await activeWebView.evaluateJavaScript(
                                     "window.__FOCUS_TRACE_NATIVE_AUGMENT__ ? window.__FOCUS_TRACE_NATIVE_AUGMENT__('sample-\(sampleIndex)') : { stage: 'trace-missing' }"
                                 )
+                                guard
+                                    self.pageAugmentationRevision == revision,
+                                    self.isCurrent(callbackContext, webView: activeWebView)
+                                else {
+                                    return
+                                }
                                 self.debugLog(
                                     "nativePageAugmentation.traceSample",
                                     fields: self.debugStateFields([
@@ -4010,6 +4287,7 @@ final class FocusBrowserViewModel: ObservableObject {
                             }
                         }
                     }
+                    }
 
                     self.debugLog(
                         "nativePageAugmentation.applied",
@@ -4021,7 +4299,6 @@ final class FocusBrowserViewModel: ObservableObject {
                             "summary": payload.summary
                         ])
                     )
-                }
             }
         }
     }
@@ -4049,42 +4326,46 @@ final class FocusBrowserViewModel: ObservableObject {
         embeddedPlayerDetectionTask?.cancel()
         embeddedPlayerDetectionTask = nil
         playerStateObservationTask?.cancel()
-        playerStateObservationTask = Task { @MainActor [weak self] in
-            var attempt = 0
-            while let self, self.allowsPlayerControl, !Task.isCancelled {
-                self.refreshPlayerState()
-                attempt += 1
+        guard
+            allowsPlayerControl,
+            let webView,
+            let context = makeBrowserCallbackContext(for: webView)
+        else {
+            return
+        }
 
-                let delay: UInt64
-                if self.hasDetectedPlayer {
-                    delay = 450_000_000
-                } else if attempt < 12 {
-                    delay = 220_000_000
-                } else {
-                    delay = 550_000_000
+        playerStateObservationTask = Task { @MainActor [weak self, weak webView] in
+            let delays: [UInt64] = [0, 300_000_000, 700_000_000, 1_400_000_000, 2_500_000_000]
+            for delay in delays {
+                if delay > 0 {
+                    try? await Task.sleep(nanoseconds: delay)
+                }
+                guard
+                    let self,
+                    let webView,
+                    !Task.isCancelled,
+                    self.allowsPlayerControl,
+                    self.isCurrent(context, webView: webView)
+                else {
+                    return
                 }
 
-                try? await Task.sleep(nanoseconds: delay)
+                if await self.refreshPlayerState(on: webView, context: context) {
+                    return
+                }
             }
         }
     }
 
-    private func refreshPlayerState() {
-        guard allowsPlayerControl, let webView else {
+    @discardableResult
+    private func refreshPlayerState(
+        on webView: WKWebView,
+        context: BrowserCallbackContext
+    ) async -> Bool {
+        guard allowsPlayerControl, isCurrent(context, webView: webView) else {
             playerStateObservationTask?.cancel()
             playerStateObservationTask = nil
-            hasActiveVideoRoute = false
-            hasDetectedPlayer = false
-            isImmersiveVideo = false
-            isPlaying = false
-            playbackRate = 1.0
-            isDanmakuHidden = false
-            hasSubtitles = false
-            isSubtitleHidden = false
-            nativeVideoAuthorName = ""
-            nativeVideoAuthorAvatarURL = nil
-            nativeVideoAuthorSpaceURL = nil
-            return
+            return false
         }
 
         let script = """
@@ -4209,64 +4490,101 @@ final class FocusBrowserViewModel: ObservableObject {
         })();
         """
 
-        webView.evaluateJavaScript(script) { [weak self] value, error in
-            guard
-                let self
-            else {
-                return
+        do {
+            let value = try await webView.evaluateJavaScript(script)
+            guard !Task.isCancelled, isCurrent(context, webView: webView) else {
+                return false
             }
-
-            if let error {
-                self.debugLog(
-                    "refreshPlayerState.error",
-                    fields: self.debugStateFields([
-                        "error": String(describing: error)
-                    ])
-                )
-            }
-
-            guard
-                let payload = value as? [String: Any],
-                let hasPlayer = payload["hasPlayer"] as? Bool
-            else {
-                self.debugLog(
+            guard let payload = value as? [String: Any] else {
+                debugLog(
                     "refreshPlayerState.missingPayload",
-                    fields: self.debugStateFields([
+                    fields: debugStateFields([
                         "valueType": value.map { String(describing: type(of: $0)) } ?? "nil"
                     ])
                 )
-                return
+                return false
             }
-
-            self.hasDetectedPlayer = hasPlayer || self.hasDetectedPlayer
-            self.hasActiveVideoRoute = hasPlayer || self.hasActiveVideoRoute
-            self.applyDetectedPageState(self.makeDetectedPageState(from: payload), fallbackURL: self.currentURL ?? self.pendingURL)
-            if hasPlayer {
-                self.isLoadingPage = false
-                if let activeURL = self.currentURL ?? self.pendingURL,
-                   self.nativePageKind(for: activeURL) == .video,
-                   self.nativeVideoPlaceholderTask != nil
-                {
-                    let canonicalURL = FocusNavigationPolicy.canonicalWebURL(for: activeURL)
-                    self.nativeVideoPlaceholderTask?.cancel()
-                    self.nativeVideoPlaceholderTask = nil
-                    self.installNativeVideoPlaceholderIfNeeded(for: canonicalURL)
-                }
-                if self.hasActiveVideoRoute, self.scheduledPageAugmentationKey == nil {
-                    self.schedulePageAugmentationRefresh()
-                }
+            applyPlayerStatePayload(payload, context: context, webView: webView, source: "refreshPlayerState")
+            return payload["hasPlayer"] as? Bool ?? false
+        } catch {
+            guard isCurrent(context, webView: webView) else {
+                return false
             }
-            self.isPlaying = payload["isPlaying"] as? Bool ?? false
-            self.playbackRate = payload["playbackRate"] as? Double ?? 1.0
-            self.isDanmakuHidden = payload["isDanmakuHidden"] as? Bool ?? false
-            self.hasSubtitles = payload["hasSubtitles"] as? Bool ?? false
-            self.isSubtitleHidden = payload["isSubtitleHidden"] as? Bool ?? false
-            self.isImmersiveVideo = payload["isFullscreen"] as? Bool ?? self.isImmersiveVideo
-            if self.pendingOrientationSyncAfterPlayerReady {
-                self.handleDeviceOrientationChange(UIDevice.current.orientation)
-            }
-            self.logPlayerStatePayload(payload)
+            debugLog(
+                "refreshPlayerState.error",
+                fields: debugStateFields(["error": String(describing: error)])
+            )
+            return false
         }
+    }
+
+    private func applyPlayerStatePayload(
+        _ payload: [String: Any],
+        context: BrowserCallbackContext,
+        webView: WKWebView,
+        source: String
+    ) {
+        guard isCurrent(context, webView: webView) else {
+            return
+        }
+
+        let snapshot = PlayerSnapshot(
+            hasPlayer: payload["hasPlayer"] as? Bool ?? false,
+            isPlaying: payload["isPlaying"] as? Bool ?? false,
+            playbackRate: max(Self.doubleValue(payload["playbackRate"]) ?? 1, 0.1),
+            isDanmakuHidden: payload["isDanmakuHidden"] as? Bool ?? false,
+            hasSubtitles: payload["hasSubtitles"] as? Bool ?? false,
+            isSubtitleHidden: payload["isSubtitleHidden"] as? Bool ?? false,
+            isFullscreen: payload["isFullscreen"] as? Bool ?? false
+        )
+
+        let detectedState = makeDetectedPageState(from: payload)
+        applyDetectedPageState(detectedState, fallbackURL: context.canonicalURL)
+        if snapshot.hasPlayer {
+            hasActiveVideoRoute = true
+            isLoadingPage = false
+            if nativePageKind(for: context.canonicalURL) == .video,
+               nativeVideoPlaceholderTask != nil
+            {
+                nativeVideoPlaceholderTask?.cancel()
+                nativeVideoPlaceholderTask = nil
+                installNativeVideoPlaceholderIfNeeded(for: context.canonicalURL)
+            }
+            if scheduledPageAugmentationKey == nil {
+                schedulePageAugmentationRefresh()
+            }
+        }
+
+        publishPlayerSnapshot(snapshot)
+        if pendingOrientationSyncAfterPlayerReady, snapshot.hasPlayer {
+            handleDeviceOrientationChange(UIDevice.current.orientation)
+        }
+        logDetectedPageState(detectedState, source: source)
+        logPlayerStatePayload(payload)
+    }
+
+    private func publishPlayerSnapshot(_ snapshot: PlayerSnapshot) {
+        guard playerSnapshot != snapshot else {
+            return
+        }
+        playerSnapshot = snapshot
+    }
+
+    private static func doubleValue(_ value: Any?) -> Double? {
+        if let value = value as? Double {
+            return value
+        }
+        return (value as? NSNumber)?.doubleValue
+    }
+
+    private static func uint64Value(_ value: Any?) -> UInt64? {
+        if let value = value as? UInt64 {
+            return value
+        }
+        if let value = value as? Int, value >= 0 {
+            return UInt64(value)
+        }
+        return (value as? NSNumber)?.uint64Value
     }
 
     private func debugLog(_ event: String, fields: [String: String?] = [:]) {
