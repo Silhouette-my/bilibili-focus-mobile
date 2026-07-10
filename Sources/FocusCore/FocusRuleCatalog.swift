@@ -4296,6 +4296,9 @@ public enum FocusRuleCatalog {
                       };
 
                       window.__FOCUS_PLAYER_STATE__ = payload;
+                      try {
+                        window.__FOCUS_PLAYER_STATE_LISTENER__?.(payload);
+                      } catch (_) {}
                       return payload;
                     };
 

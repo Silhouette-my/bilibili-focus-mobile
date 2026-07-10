@@ -41,6 +41,46 @@ struct NavigationRevision: Equatable, Hashable, Sendable {
     let rawValue: UInt64
 }
 
+struct BrowserCallbackStamp: Equatable {
+    let sessionID: BrowserSessionID
+    let revision: NavigationRevision
+    let canonicalURL: URL
+    let webViewIdentifier: ObjectIdentifier
+}
+
+enum BrowserCallbackGate {
+    static func accepts(_ callback: BrowserCallbackStamp, current: BrowserCallbackStamp) -> Bool {
+        callback == current
+    }
+}
+
+enum WebContentRecoveryDecision: Equatable {
+    case inactive
+    case recover(URL)
+    case showRetry(String)
+}
+
+enum WebContentRecoveryPolicy {
+    static let automaticAttemptLimit = 1
+
+    static func decision(
+        isSessionActive: Bool,
+        attempts: Int,
+        recoveryURL: URL?
+    ) -> WebContentRecoveryDecision {
+        guard isSessionActive else {
+            return .inactive
+        }
+        guard attempts < automaticAttemptLimit else {
+            return .showRetry("网页进程已停止，点重试重新加载当前页面。")
+        }
+        guard let recoveryURL else {
+            return .showRetry("网页进程已停止，且没有可恢复的页面地址。")
+        }
+        return .recover(recoveryURL)
+    }
+}
+
 @MainActor
 final class FocusAppViewModel: ObservableObject {
     enum PrimaryTab {
@@ -1153,7 +1193,7 @@ final class FocusBrowserViewModel: ObservableObject {
         playerCommandTask = nil
         pageAugmentationApplyTask?.cancel()
         pageAugmentationApplyTask = nil
-        publishPlayerSnapshot(.empty)
+        updatePlayerSnapshot(.empty)
     }
 
     private func invalidateBrowserCallbacks() {
@@ -1182,12 +1222,25 @@ final class FocusBrowserViewModel: ObservableObject {
     }
 
     private func isCurrent(_ context: BrowserCallbackContext, webView candidateWebView: WKWebView) -> Bool {
+        guard webView === candidateWebView else {
+            return false
+        }
+
+        let callbackStamp = BrowserCallbackStamp(
+            sessionID: context.sessionID,
+            revision: context.revision,
+            canonicalURL: context.canonicalURL,
+            webViewIdentifier: context.webViewIdentifier
+        )
+        let currentStamp = BrowserCallbackStamp(
+            sessionID: browserSessionID,
+            revision: navigationRevision,
+            canonicalURL: sessionCanonicalURL ?? context.canonicalURL,
+            webViewIdentifier: ObjectIdentifier(candidateWebView)
+        )
         guard
-            webView === candidateWebView,
-            ObjectIdentifier(candidateWebView) == context.webViewIdentifier,
-            browserSessionID == context.sessionID,
-            navigationRevision == context.revision,
-            sessionCanonicalURL == context.canonicalURL
+            sessionCanonicalURL != nil,
+            BrowserCallbackGate.accepts(callbackStamp, current: currentStamp)
         else {
             return false
         }
@@ -1507,23 +1560,23 @@ final class FocusBrowserViewModel: ObservableObject {
         webContentRecoveryTask?.cancel()
         webContentRecoveryTask = nil
 
-        guard isSessionActive else {
-            isLoadingPage = false
-            return
-        }
-
-        guard webContentRecoveryAttempts < 1 else {
-            isLoadingPage = false
-            webContentFailureMessage = "网页进程已停止，点重试重新加载当前页面。"
-            return
-        }
-
-        guard let recoveryURL = (terminatedWebView.url ?? currentURL ?? pendingURL)
+        let candidateRecoveryURL = (terminatedWebView.url ?? currentURL ?? pendingURL)
             .map(FocusNavigationPolicy.canonicalWebURL(for:))
-        else {
+        let recoveryURL: URL
+        switch WebContentRecoveryPolicy.decision(
+            isSessionActive: isSessionActive,
+            attempts: webContentRecoveryAttempts,
+            recoveryURL: candidateRecoveryURL
+        ) {
+        case .inactive:
             isLoadingPage = false
-            webContentFailureMessage = "网页进程已停止，且没有可恢复的页面地址。"
             return
+        case let .showRetry(message):
+            isLoadingPage = false
+            webContentFailureMessage = message
+            return
+        case let .recover(url):
+            recoveryURL = url
         }
 
         webContentRecoveryAttempts += 1
@@ -2313,7 +2366,7 @@ final class FocusBrowserViewModel: ObservableObject {
                         self.hasActiveVideoRoute = true
                         var snapshot = self.playerSnapshot
                         snapshot.hasPlayer = true
-                        self.publishPlayerSnapshot(snapshot)
+                        self.updatePlayerSnapshot(snapshot)
                         self.startPlayerStateObservation()
                         return
                     }
@@ -2683,7 +2736,7 @@ final class FocusBrowserViewModel: ObservableObject {
         requestedInterfaceOrientationMask = .portrait
         updateSupportedOrientations(to: .portrait)
         hasActiveVideoRoute = false
-        publishPlayerSnapshot(.empty)
+        updatePlayerSnapshot(.empty)
         nativeVideoAuthorName = ""
         nativeVideoAuthorAvatarURL = nil
         nativeVideoAuthorSpaceURL = nil
@@ -4417,7 +4470,7 @@ final class FocusBrowserViewModel: ObservableObject {
             }
         }
 
-        publishPlayerSnapshot(snapshot)
+        updatePlayerSnapshot(snapshot)
         if pendingOrientationSyncAfterPlayerReady, snapshot.hasPlayer {
             handleDeviceOrientationChange(UIDevice.current.orientation)
         }
@@ -4425,7 +4478,7 @@ final class FocusBrowserViewModel: ObservableObject {
         logPlayerStatePayload(payload)
     }
 
-    private func publishPlayerSnapshot(_ snapshot: PlayerSnapshot) {
+    func updatePlayerSnapshot(_ snapshot: PlayerSnapshot) {
         guard playerSnapshot != snapshot else {
             return
         }
@@ -7468,6 +7521,10 @@ final class FocusUserSpaceViewModel: ObservableObject {
             return page.profile.name
         }
         return "UP主空间"
+    }
+
+    var hasActiveLoadTask: Bool {
+        task.map { !$0.isCancelled } ?? false
     }
 
     func open(_ url: URL) {

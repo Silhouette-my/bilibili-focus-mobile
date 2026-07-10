@@ -44,6 +44,7 @@
 		000000000000000000000236 /* AppIcon83.5x83.5@2x.png in Resources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000336 /* AppIcon83.5x83.5@2x.png */; };
 		000000000000000000000337 /* FocusWebAppearance.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000339 /* FocusWebAppearance.swift */; };
 		000000000000000000000348 /* FocusSharedUI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000349 /* FocusSharedUI.swift */; };
+		000000000000000000000701 /* BilibiliFocusStabilityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000703 /* BilibiliFocusStabilityTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -53,6 +54,13 @@
 			proxyType = 1;
 			remoteGlobalIDString = 000000000000000000000005;
 			remoteInfo = FocusCore;
+		};
+		000000000000000000000702 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 000000000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 000000000000000000000004;
+			remoteInfo = BilibiliFocus;
 		};
 /* End PBXContainerItemProxy section */
 
@@ -110,6 +118,8 @@
 		000000000000000000000338 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		000000000000000000000339 /* FocusWebAppearance.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusWebAppearance.swift; sourceTree = "<group>"; };
 		000000000000000000000349 /* FocusSharedUI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusSharedUI.swift; sourceTree = "<group>"; };
+		000000000000000000000703 /* BilibiliFocusStabilityTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BilibiliFocusStabilityTests.swift; sourceTree = "<group>"; };
+		000000000000000000000704 /* BilibiliFocusTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = BilibiliFocusTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -128,6 +138,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		000000000000000000000705 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -136,6 +153,7 @@
 			children = (
 				000000000000000000000401 /* App/BilibiliFocus */,
 				000000000000000000000402 /* Sources/FocusCore */,
+				000000000000000000000713 /* Tests/BilibiliFocusTests */,
 				000000000000000000000003 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -145,6 +163,7 @@
 			children = (
 				000000000000000000000316 /* BilibiliFocus.app */,
 				000000000000000000000317 /* FocusCore.framework */,
+				000000000000000000000704 /* BilibiliFocusTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -216,6 +235,14 @@
 			path = Icons;
 			sourceTree = "<group>";
 		};
+		000000000000000000000713 /* Tests/BilibiliFocusTests */ = {
+			isa = PBXGroup;
+			children = (
+				000000000000000000000703 /* BilibiliFocusStabilityTests.swift */,
+			);
+			path = Tests/BilibiliFocusTests;
+			sourceTree = "<group>";
+		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -255,6 +282,24 @@
 			productReference = 000000000000000000000317 /* FocusCore.framework */;
 			productType = "com.apple.product-type.framework";
 		};
+		000000000000000000000709 /* BilibiliFocusTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 000000000000000000000710 /* Build configuration list for PBXNativeTarget "BilibiliFocusTests" */;
+			buildPhases = (
+				000000000000000000000706 /* Sources */,
+				000000000000000000000705 /* Frameworks */,
+				000000000000000000000707 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				000000000000000000000708 /* PBXTargetDependency */,
+			);
+			name = BilibiliFocusTests;
+			productName = BilibiliFocusTests;
+			productReference = 000000000000000000000704 /* BilibiliFocusTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -270,6 +315,10 @@
 					};
 					000000000000000000000005 = {
 						CreatedOnToolsVersion = 26.0;
+					};
+					000000000000000000000709 = {
+						CreatedOnToolsVersion = 26.0;
+						TestTargetID = 000000000000000000000004;
 					};
 				};
 			};
@@ -288,6 +337,7 @@
 			targets = (
 				000000000000000000000004 /* BilibiliFocus */,
 				000000000000000000000005 /* FocusCore */,
+				000000000000000000000709 /* BilibiliFocusTests */,
 			);
 		};
 /* End PBXProject section */
@@ -316,6 +366,13 @@
 			buildActionMask = 2147483647;
 			files = (
 				000000000000000000000217 /* focus-runtime.js in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		000000000000000000000707 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -359,6 +416,14 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		000000000000000000000706 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				000000000000000000000701 /* BilibiliFocusStabilityTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -366,6 +431,11 @@
 			isa = PBXTargetDependency;
 			target = 000000000000000000000005 /* FocusCore */;
 			targetProxy = 000000000000000000000008 /* PBXContainerItemProxy */;
+		};
+		000000000000000000000708 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 000000000000000000000004 /* BilibiliFocus */;
+			targetProxy = 000000000000000000000702 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -513,6 +583,52 @@
 			};
 			name = Release;
 		};
+		000000000000000000000711 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = K4S7KL8D85;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.michaeltan.BilibiliFocusTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/BilibiliFocus.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/BilibiliFocus";
+			};
+			name = Debug;
+		};
+		000000000000000000000712 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = K4S7KL8D85;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.michaeltan.BilibiliFocusTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/BilibiliFocus.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/BilibiliFocus";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -539,6 +655,15 @@
 			buildConfigurations = (
 				000000000000000000000605 /* Debug */,
 				000000000000000000000606 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		000000000000000000000710 /* Build configuration list for PBXNativeTarget "BilibiliFocusTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				000000000000000000000711 /* Debug */,
+				000000000000000000000712 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

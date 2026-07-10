@@ -4,6 +4,31 @@ import SwiftUI
 import UIKit
 import WebKit
 
+enum FocusWebSettingsUpdate: Equatable {
+    case none
+    case appearance
+    case pageRules
+
+    static func classify(
+        previous: FocusSettings,
+        current: FocusSettings,
+        previousDarkMode: Bool,
+        currentDarkMode: Bool
+    ) -> FocusWebSettingsUpdate {
+        let pageRulesChanged = previous.redirectEnabled != current.redirectEnabled
+            || previous.playerMaskEnabled != current.playerMaskEnabled
+            || previous.searchMaskEnabled != current.searchMaskEnabled
+            || previous.dynamicMaskEnabled != current.dynamicMaskEnabled
+        if pageRulesChanged {
+            return .pageRules
+        }
+        if previousDarkMode != currentDarkMode {
+            return .appearance
+        }
+        return .none
+    }
+}
+
 struct FocusWebView: UIViewRepresentable {
     let viewModel: FocusBrowserViewModel
     @ObservedObject var settingsStore: FocusSettingsStore
@@ -63,17 +88,42 @@ struct FocusWebView: UIViewRepresentable {
         webView.overrideUserInterfaceStyle = isDarkMode ? .dark : .light
         webView.backgroundColor = isDarkMode ? UIColor(red: 0.06, green: 0.07, blue: 0.09, alpha: 1) : UIColor(red: 0.965, green: 0.969, blue: 0.98, alpha: 1)
         webView.scrollView.backgroundColor = webView.backgroundColor
-        if context.coordinator.lastAppliedSettings != settingsStore.settings
-            || context.coordinator.lastAppliedDarkMode != isDarkMode
-        {
+        guard
+            let previousSettings = context.coordinator.lastAppliedSettings,
+            let previousDarkMode = context.coordinator.lastAppliedDarkMode
+        else {
             context.coordinator.installScripts(
                 on: webView,
                 settings: settingsStore.settings,
                 isDarkMode: isDarkMode
             )
-            if viewModel.isSessionActive {
-                context.coordinator.reapplyCurrentPageScripts(on: webView)
+            return
+        }
+
+        switch FocusWebSettingsUpdate.classify(
+            previous: previousSettings,
+            current: settingsStore.settings,
+            previousDarkMode: previousDarkMode,
+            currentDarkMode: isDarkMode
+        ) {
+        case .none:
+            context.coordinator.record(settings: settingsStore.settings, isDarkMode: isDarkMode)
+        case .appearance:
+            context.coordinator.applyAppearance(
+                on: webView,
+                settings: settingsStore.settings,
+                isDarkMode: isDarkMode
+            )
+        case .pageRules:
+            context.coordinator.installScripts(
+                on: webView,
+                settings: settingsStore.settings,
+                isDarkMode: isDarkMode
+            )
+            guard viewModel.isSessionActive else {
+                return
             }
+            context.coordinator.reapplyCurrentPageScripts(on: webView)
         }
     }
 
@@ -179,6 +229,19 @@ struct FocusWebView: UIViewRepresentable {
             lastDocumentEndScript = documentEndScript
         }
 
+        func record(settings: FocusSettings, isDarkMode: Bool) {
+            lastAppliedSettings = settings
+            lastAppliedDarkMode = isDarkMode
+        }
+
+        func applyAppearance(on webView: WKWebView, settings: FocusSettings, isDarkMode: Bool) {
+            let appearanceScript = FocusWebAppearance.script(isDarkMode: isDarkMode)
+            lastAppliedSettings = settings
+            lastAppliedDarkMode = isDarkMode
+            lastAppearanceScript = appearanceScript
+            webView.evaluateJavaScript(appearanceScript)
+        }
+
         func reapplyCurrentPageScripts(on webView: WKWebView) {
             if let lastAppearanceScript {
                 webView.evaluateJavaScript(lastAppearanceScript)
@@ -217,6 +280,7 @@ struct FocusWebView: UIViewRepresentable {
 
               let emitTimer = null;
               let tornDown = false;
+              const previousPlayerStateListener = window.__FOCUS_PLAYER_STATE_LISTENER__;
               const eventNames = [
                 'play',
                 'pause',
@@ -251,16 +315,17 @@ struct FocusWebView: UIViewRepresentable {
                 };
               };
 
-              const emit = () => {
+              const emit = (providedSnapshot = null) => {
                 if (tornDown) {
                   return;
                 }
-                let snapshot = null;
-                try {
-                  snapshot = typeof window.__FOCUS_SNAPSHOT_PLAYER_STATE__ === 'function'
-                    ? window.__FOCUS_SNAPSHOT_PLAYER_STATE__()
-                    : window.__FOCUS_PLAYER_STATE__;
-                } catch (_) {}
+                if (!providedSnapshot && typeof window.__FOCUS_SNAPSHOT_PLAYER_STATE__ === 'function') {
+                  try {
+                    window.__FOCUS_SNAPSHOT_PLAYER_STATE__();
+                    return;
+                  } catch (_) {}
+                }
+                let snapshot = providedSnapshot || window.__FOCUS_PLAYER_STATE__;
                 if (!snapshot || typeof snapshot !== 'object') {
                   snapshot = fallbackSnapshot();
                 }
@@ -299,6 +364,7 @@ struct FocusWebView: UIViewRepresentable {
               document.addEventListener('click', clickHandler, true);
               const observer = new MutationObserver(() => scheduleEmit(100));
               observer.observe(document.documentElement, { childList: true, subtree: true });
+              window.__FOCUS_PLAYER_STATE_LISTENER__ = emit;
 
               const teardown = () => {
                 if (tornDown) {
@@ -311,6 +377,9 @@ struct FocusWebView: UIViewRepresentable {
                   document.removeEventListener(eventName, eventHandler, true);
                 });
                 document.removeEventListener('click', clickHandler, true);
+                if (window.__FOCUS_PLAYER_STATE_LISTENER__ === emit) {
+                  window.__FOCUS_PLAYER_STATE_LISTENER__ = previousPlayerStateListener;
+                }
               };
 
               window.__FOCUS_NATIVE_PLAYER_BRIDGE__ = {

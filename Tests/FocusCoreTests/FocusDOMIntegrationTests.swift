@@ -168,6 +168,88 @@ struct FocusDOMIntegrationTests {
         #expect(overflowFree == "true")
     }
 
+    @Test
+    func playerEventsEmitCompleteSnapshots() async throws {
+        let webView = try await loadFixture(named: "video", url: URL(string: "https://www.bilibili.com/video/BV1xx411c7mD/")!)
+        _ = try await evaluate(
+            """
+            window.__focusPlayerMessages = [];
+            window.__FOCUS_PLAYER_STATE_LISTENER__ = (payload) => {
+              window.__focusPlayerMessages.push(payload);
+            };
+            const video = document.querySelector('video');
+            video.playbackRate = 1.5;
+            ['loadedmetadata', 'play', 'pause', 'ratechange'].forEach((name) => {
+              video.dispatchEvent(new Event(name));
+            });
+            document.dispatchEvent(new Event('fullscreenchange'));
+            'ready';
+            """,
+            in: webView
+        )
+        try await Task.sleep(nanoseconds: 220_000_000)
+
+        let payload = try await evaluate(
+            "JSON.stringify(window.__focusPlayerMessages.at(-1) || {})",
+            in: webView
+        )
+        #expect(payload.contains("\"hasPlayer\""))
+        #expect(payload.contains("\"isPlaying\""))
+        #expect(payload.contains("\"playbackRate\":1.5"))
+        #expect(payload.contains("\"isDanmakuHidden\""))
+        #expect(payload.contains("\"hasSubtitles\""))
+        #expect(payload.contains("\"isSubtitleHidden\""))
+        #expect(payload.contains("\"isFullscreen\""))
+    }
+
+    @Test
+    func repeatedVideoRuleMountKeepsSingleStylePerFeature() async throws {
+        let webView = try await loadFixture(named: "video", url: URL(string: "https://www.bilibili.com/video/BV1xx411c7mD/")!)
+        let documentEndScript = try FocusScriptBuilder.makeUserScript(for: .documentEnd, settings: .defaults)
+        _ = try await evaluate(documentEndScript, in: webView)
+        _ = try await evaluate(documentEndScript, in: webView)
+
+        let counts = try await evaluate(
+            """
+            (() => {
+              const styles = Array.from(document.querySelectorAll('style[id^="bili-focus-style-"]'));
+              return `${styles.length}|${new Set(styles.map((style) => style.id)).size}`;
+            })();
+            """,
+            in: webView
+        )
+        let parts = counts.split(separator: "|")
+        #expect(parts.count == 2)
+        #expect(parts.first == parts.last)
+    }
+
+    @Test
+    func rapidVideoSwitchPublishesLatestPageURL() async throws {
+        let webView = try await loadFixture(named: "video", url: URL(string: "https://www.bilibili.com/video/BV1xx411c7mD/")!)
+        _ = try await evaluate(
+            """
+            window.__focusPlayerMessages = [];
+            window.__FOCUS_PLAYER_STATE_LISTENER__ = (payload) => {
+              window.__focusPlayerMessages.push(payload);
+            };
+            history.replaceState({}, '', '/video/BV1FIRST/');
+            window.__FOCUS_SNAPSHOT_PLAYER_STATE__?.();
+            history.replaceState({}, '', '/video/BV1LATEST/');
+            document.querySelector('video')?.dispatchEvent(new Event('loadedmetadata'));
+            window.__FOCUS_SNAPSHOT_PLAYER_STATE__?.();
+            'switched';
+            """,
+            in: webView
+        )
+        try await Task.sleep(nanoseconds: 180_000_000)
+
+        let latestURL = try await evaluate(
+            "window.__focusPlayerMessages.at(-1)?.pageURL || ''",
+            in: webView
+        )
+        #expect(latestURL.contains("/video/BV1LATEST/"))
+    }
+
     private func loadFixture(named name: String, url: URL) async throws -> WKWebView {
         let htmlURL = try #require(Bundle.module.url(forResource: name, withExtension: "html"))
         let html = try String(contentsOf: htmlURL, encoding: .utf8)
