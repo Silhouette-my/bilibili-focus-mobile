@@ -130,7 +130,15 @@ struct FocusBrowserView: View {
                     FocusWebView(viewModel: viewModel.browserViewModel, settingsStore: settingsStore)
                         .background(colorScheme == .dark ? Color(red: 0.06, green: 0.07, blue: 0.09) : Color(red: 0.965, green: 0.969, blue: 0.98))
 
-                    if viewModel.browserViewModel.isLoadingPage && !viewModel.browserViewModel.showsNativeVideoControls {
+                    if let message = viewModel.browserViewModel.webContentFailureMessage {
+                        FocusStateView(
+                            title: "网页加载失败",
+                            message: message,
+                            buttonTitle: "重新加载",
+                            action: viewModel.browserViewModel.retryAfterWebContentFailure
+                        )
+                        .background(colorScheme == .dark ? Color(red: 0.06, green: 0.07, blue: 0.09) : Color(red: 0.965, green: 0.969, blue: 0.98))
+                    } else if viewModel.browserViewModel.isLoadingPage && !viewModel.browserViewModel.showsNativeVideoControls {
                         (colorScheme == .dark ? Color(red: 0.06, green: 0.07, blue: 0.09) : Color(red: 0.965, green: 0.969, blue: 0.98))
                             .ignoresSafeArea()
                             .overlay {

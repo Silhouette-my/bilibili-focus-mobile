@@ -23,14 +23,9 @@ struct BilibiliFocusApp: App {
     var body: some Scene {
         WindowGroup {
             FocusBrowserView(settingsStore: settingsStore)
-                .id(themeIdentity)
                 .tint(Color(red: 0.984, green: 0.447, blue: 0.600)) // Bilibili pink
                 .preferredColorScheme(preferredColorScheme)
         }
-    }
-
-    private var themeIdentity: String {
-        settingsStore.settings.themeMode.rawValue
     }
 
     private var preferredColorScheme: ColorScheme? {

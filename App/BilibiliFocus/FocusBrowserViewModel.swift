@@ -929,16 +929,16 @@ final class FocusBrowserViewModel: ObservableObject {
     @Published private(set) var nativeVideoAuthorMID: Int64 = 0
     @Published private(set) var nativeVideoAuthorFollowers: Int64 = 0
     @Published private(set) var nativeVideoAuthorIsFollowing = false
+    @Published private(set) var webContentFailureMessage: String?
     let settingsStore: FocusSettingsStore
 
     weak var webView: WKWebView?
     fileprivate var nativePageAugmentService: FocusNativePageAugmentService?
-    var reconfigureScripts: ((WKWebView, FocusSettings) -> Void)?
     var prepareForURL: ((WKWebView, URL) -> Void)?
     var onEntryRequest: ((FocusEntry) -> Void)?
     var onUserSpaceRequest: ((URL) -> Void)?
     private var pendingURL: URL?
-    private var cancellables: Set<AnyCancellable> = []
+    private(set) var isSessionActive = false
     private var playerStateObservationTask: Task<Void, Never>?
     private var embeddedPlayerDetectionTask: Task<Void, Never>?
     private var pageAugmentationTask: Task<Void, Never>?
@@ -960,16 +960,23 @@ final class FocusBrowserViewModel: ObservableObject {
     private var lastHandledDeviceOrientation: UIDeviceOrientation = .unknown
     private var orientationDebounceTask: Task<Void, Never>?
     private var fullscreenTransitionTask: Task<Void, Never>?
+    private var webContentRecoveryTask: Task<Void, Never>?
+    private var webContentRecoveryAttempts = 0
     private var requestedInterfaceOrientationMask: UIInterfaceOrientationMask = .portrait
+
     init(settingsStore: FocusSettingsStore) {
         self.settingsStore = settingsStore
+    }
 
-        settingsStore.$settings
-            .dropFirst()
-            .sink { [weak self] settings in
-                self?.applySettingsChange(settings)
-            }
-            .store(in: &cancellables)
+    deinit {
+        playerStateObservationTask?.cancel()
+        embeddedPlayerDetectionTask?.cancel()
+        pageAugmentationTask?.cancel()
+        nativeVideoLoadingMaskTask?.cancel()
+        nativeVideoPlaceholderTask?.cancel()
+        orientationDebounceTask?.cancel()
+        fullscreenTransitionTask?.cancel()
+        webContentRecoveryTask?.cancel()
     }
 
     var router: FocusRouter {
@@ -1099,11 +1106,9 @@ final class FocusBrowserViewModel: ObservableObject {
 
     func attach(
         webView: WKWebView,
-        reconfigureScripts: @escaping (WKWebView, FocusSettings) -> Void,
         prepareForURL: @escaping (WKWebView, URL) -> Void
     ) {
         self.webView = webView
-        self.reconfigureScripts = reconfigureScripts
         self.prepareForURL = prepareForURL
 
         if let pendingURL {
@@ -1112,6 +1117,11 @@ final class FocusBrowserViewModel: ObservableObject {
     }
 
     func open(_ url: URL, context: EntryContext) {
+        isSessionActive = true
+        webContentRecoveryTask?.cancel()
+        webContentRecoveryTask = nil
+        webContentRecoveryAttempts = 0
+        webContentFailureMessage = nil
         resetAppBackStack()
         invalidatePageAugmentation()
         if let webView {
@@ -1225,9 +1235,16 @@ final class FocusBrowserViewModel: ObservableObject {
     }
 
     func updateNavigationState(from webView: WKWebView) {
+        guard self.webView === webView else {
+            return
+        }
         currentURL = webView.url.map(FocusNavigationPolicy.canonicalWebURL(for:))
         pendingURL = currentURL
         isLoadingPage = false
+        webContentRecoveryTask?.cancel()
+        webContentRecoveryTask = nil
+        webContentRecoveryAttempts = 0
+        webContentFailureMessage = nil
         canGoBack = webView.canGoBack
         canGoForward = webView.canGoForward
         updateNavigationMetadata(for: currentURL, pageTitle: webView.title)
@@ -1373,6 +1390,78 @@ final class FocusBrowserViewModel: ObservableObject {
                 "failingURL": failingURL?.absoluteString
             ])
         )
+    }
+
+    func handleWebContentProcessTermination(_ terminatedWebView: WKWebView) {
+        guard webView === terminatedWebView else {
+            return
+        }
+
+        invalidatePageAugmentation()
+        resetPlayerState()
+        webContentRecoveryTask?.cancel()
+        webContentRecoveryTask = nil
+
+        guard isSessionActive else {
+            isLoadingPage = false
+            return
+        }
+
+        guard webContentRecoveryAttempts < 1 else {
+            isLoadingPage = false
+            webContentFailureMessage = "网页进程已停止，点重试重新加载当前页面。"
+            return
+        }
+
+        guard let recoveryURL = (terminatedWebView.url ?? currentURL ?? pendingURL)
+            .map(FocusNavigationPolicy.canonicalWebURL(for:))
+        else {
+            isLoadingPage = false
+            webContentFailureMessage = "网页进程已停止，且没有可恢复的页面地址。"
+            return
+        }
+
+        webContentRecoveryAttempts += 1
+        webContentFailureMessage = nil
+        pendingURL = recoveryURL
+        isLoadingPage = true
+
+        webContentRecoveryTask = Task { @MainActor [weak self, weak terminatedWebView] in
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard
+                let self,
+                !Task.isCancelled,
+                let terminatedWebView,
+                self.webView === terminatedWebView,
+                self.isSessionActive
+            else {
+                return
+            }
+
+            self.prepareForURL?(terminatedWebView, recoveryURL)
+            self.lastIssuedLoadURL = recoveryURL
+            terminatedWebView.load(
+                URLRequest(
+                    url: recoveryURL,
+                    cachePolicy: .reloadIgnoringLocalCacheData,
+                    timeoutInterval: 30
+                )
+            )
+            self.webContentRecoveryTask = nil
+        }
+    }
+
+    func retryAfterWebContentFailure() {
+        guard let recoveryURL = currentURL ?? pendingURL else {
+            return
+        }
+
+        webContentRecoveryAttempts = 0
+        webContentFailureMessage = nil
+        isLoadingPage = true
+        if let webView {
+            loadURLIfNeeded(recoveryURL, on: webView, reason: "manualWebContentRecovery", force: true)
+        }
     }
 
     func entryRedirect(for url: URL) -> FocusEntry? {
@@ -1926,6 +2015,10 @@ final class FocusBrowserViewModel: ObservableObject {
     }
 
     func prepareForDismiss() {
+        isSessionActive = false
+        webContentRecoveryTask?.cancel()
+        webContentRecoveryTask = nil
+        webContentFailureMessage = nil
         if let webView {
             suspendActivePlayback(in: webView)
             webView.stopLoading()
@@ -1946,6 +2039,26 @@ final class FocusBrowserViewModel: ObservableObject {
         fullscreenTransitionTask?.cancel()
         fullscreenTransitionTask = nil
         resetAppBackStack()
+    }
+
+    func detach(webView detachedWebView: WKWebView) {
+        guard webView === detachedWebView else {
+            return
+        }
+
+        isSessionActive = false
+        webContentRecoveryTask?.cancel()
+        webContentRecoveryTask = nil
+        if let webView {
+            suspendActivePlayback(in: webView)
+            webView.stopLoading()
+        }
+        invalidatePageAugmentation()
+        resetPlayerState()
+        prepareForURL = nil
+        self.webView = nil
+        webContentFailureMessage = nil
+        isLoadingPage = false
     }
 
     private func suspendActivePlayback(in webView: WKWebView) {
@@ -2005,17 +2118,6 @@ final class FocusBrowserViewModel: ObservableObject {
         })();
         """
         webView.evaluateJavaScript(script, completionHandler: nil)
-    }
-
-    private func applySettingsChange(_ settings: FocusSettings) {
-        guard let webView else { return }
-        reconfigureScripts?(webView, settings)
-
-        if let currentURL = webView.url {
-            loadURLIfNeeded(currentURL, on: webView, reason: "applySettingsChange.current", force: true)
-        } else if let pendingURL {
-            loadURLIfNeeded(pendingURL, on: webView, reason: "applySettingsChange.pending", force: true)
-        }
     }
 
     private func runPlayerCommand(_ script: String) {

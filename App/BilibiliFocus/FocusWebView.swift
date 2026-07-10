@@ -51,13 +51,6 @@ struct FocusWebView: UIViewRepresentable {
         )
         viewModel.attach(
             webView: webView,
-            reconfigureScripts: { [weak coordinator = context.coordinator] webView, settings in
-                coordinator?.installScripts(
-                    on: webView,
-                    settings: settings,
-                    isDarkMode: resolvedDarkMode()
-                )
-            },
             prepareForURL: { [weak coordinator = context.coordinator] webView, url in
                 coordinator?.prepare(webView: webView, for: url)
             }
@@ -78,8 +71,14 @@ struct FocusWebView: UIViewRepresentable {
                 settings: settingsStore.settings,
                 isDarkMode: isDarkMode
             )
-            context.coordinator.reapplyCurrentPageScripts(on: webView)
+            if viewModel.isSessionActive {
+                context.coordinator.reapplyCurrentPageScripts(on: webView)
+            }
         }
+    }
+
+    static func dismantleUIView(_ webView: WKWebView, coordinator: Coordinator) {
+        coordinator.tearDown(webView: webView)
     }
 
     @MainActor
@@ -94,6 +93,16 @@ struct FocusWebView: UIViewRepresentable {
 
         init(viewModel: FocusBrowserViewModel) {
             self.viewModel = viewModel
+        }
+
+        func tearDown(webView: WKWebView) {
+            let controller = webView.configuration.userContentController
+            controller.removeScriptMessageHandler(forName: "getConfig")
+            controller.removeScriptMessageHandler(forName: "logDebug")
+            controller.removeAllUserScripts()
+            webView.navigationDelegate = nil
+            webView.uiDelegate = nil
+            viewModel.detach(webView: webView)
         }
 
         func prepare(webView: WKWebView, for url: URL) {
@@ -224,7 +233,7 @@ struct FocusWebView: UIViewRepresentable {
         }
 
         func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-            viewModel.updateNavigationState(from: webView)
+            viewModel.handleWebContentProcessTermination(webView)
         }
 
         func webView(
