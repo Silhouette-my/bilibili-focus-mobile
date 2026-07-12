@@ -25,6 +25,19 @@ struct FocusScriptBuilderTests {
         #expect(dynamicRule?.match(host: "www.bilibili.com", path: "/") == false)
     }
 
+    @Test
+    func iosVideoBootstrapRunsAtDocumentStartAndStaysPlatformScoped() throws {
+        let rule = try #require(FocusRuleCatalog.defaultRules.first { $0.id == "ios-video-bootstrap" })
+        let feature = try #require(rule.features.first { $0.featureId == "player-first-frame-layout" })
+
+        #expect(rule.runPhase == .documentStart)
+        #expect(rule.match(host: "www.bilibili.com", path: "/video/BV1TEST/"))
+        #expect(!rule.match(host: "t.bilibili.com", path: "/video/BV1TEST/"))
+        #expect(feature.css.contains("html[data-focus-platform='ios']"))
+        #expect(feature.css.contains("focus-native-video-fallback"))
+        #expect(feature.css.contains("@media (orientation: landscape)"))
+    }
+
     #if canImport(JavaScriptCore)
     @Test
     func featureScriptsCompileAsJavaScript() throws {

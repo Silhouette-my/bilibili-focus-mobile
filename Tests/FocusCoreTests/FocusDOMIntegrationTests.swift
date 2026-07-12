@@ -169,6 +169,111 @@ struct FocusDOMIntegrationTests {
     }
 
     @Test
+    func iosVideoBootstrapCentersPlayerBeforeDocumentEnd() async throws {
+        let webView = try await loadFixture(
+            named: "video",
+            url: URL(string: "https://www.bilibili.com/video/BV1xx411c7mD/")!,
+            includeDocumentEnd: false,
+            simulatesIOS: true,
+            frame: CGRect(x: 0, y: 0, width: 390, height: 844)
+        )
+
+        let isStableFirstFrame = try await evaluate(
+            """
+            (() => {
+              const player = document.querySelector('#playerWrap');
+              const video = document.querySelector('video');
+              const pod = document.querySelector('.video-pod');
+              const playerRect = player.getBoundingClientRect();
+              const videoRect = video.getBoundingClientRect();
+              const viewportCenter = window.innerWidth / 2;
+              const playerCenter = playerRect.left + (playerRect.width / 2);
+              const videoCenter = videoRect.left + (videoRect.width / 2);
+              const podStyle = getComputedStyle(pod);
+              return playerRect.width <= window.innerWidth + 1
+                && Math.abs(playerCenter - viewportCenter) <= 1
+                && Math.abs(videoCenter - viewportCenter) <= 1
+                && podStyle.visibility === 'hidden'
+                && podStyle.opacity === '0';
+            })() ? 'true' : 'false';
+            """,
+            in: webView
+        )
+
+        #expect(isStableFirstFrame == "true")
+    }
+
+    @Test
+    func iosVideoOriginalSectionsStayHiddenAfterDynamicRemount() async throws {
+        let webView = try await loadFixture(
+            named: "video",
+            url: URL(string: "https://www.bilibili.com/video/BV1xx411c7mD/")!,
+            simulatesIOS: true,
+            frame: CGRect(x: 0, y: 0, width: 390, height: 844)
+        )
+
+        let remountedSectionIsHidden = try await evaluate(
+            """
+            (() => {
+              document.documentElement.classList.add('focus-native-video-ready');
+              const remountedPod = document.createElement('div');
+              remountedPod.className = 'video-pod';
+              remountedPod.textContent = 'Remounted original episode list';
+              document.querySelector('.right-container').appendChild(remountedPod);
+              const style = getComputedStyle(remountedPod);
+              return style.visibility === 'hidden'
+                && style.opacity === '0'
+                && style.pointerEvents === 'none';
+            })() ? 'true' : 'false';
+            """,
+            in: webView
+        )
+
+        #expect(remountedSectionIsHidden == "true")
+    }
+
+    @Test
+    func iosExpandedPlayerLayoutCoversLandscapeViewport() async throws {
+        let webView = try await loadFixture(
+            named: "video",
+            url: URL(string: "https://www.bilibili.com/video/BV1xx411c7mD/")!,
+            simulatesIOS: true,
+            frame: CGRect(x: 0, y: 0, width: 844, height: 390)
+        )
+        _ = try await evaluate(
+            "window.__FOCUS_SET_IOS_PLAYER_LAYOUT_MODE__?.('expanded'); 'applied';",
+            in: webView
+        )
+
+        let fillsViewport = try await evaluate(
+            """
+            (() => {
+              const player = document.querySelector('#playerWrap');
+              const video = document.querySelector('video');
+              const playerRect = player.getBoundingClientRect();
+              const videoRect = video.getBoundingClientRect();
+              const playerStyle = getComputedStyle(player);
+              const videoStyle = getComputedStyle(video);
+              const centered = Math.abs(
+                (videoRect.left + videoRect.width / 2)
+                  - (playerRect.left + playerRect.width / 2)
+              ) <= 1;
+              return document.documentElement.getAttribute('data-focus-player-layout') === 'expanded'
+                && playerStyle.position === 'fixed'
+                && Math.abs(playerRect.left) <= 1
+                && Math.abs(playerRect.top) <= 1
+                && playerRect.width >= window.innerWidth - 1
+                && playerRect.height >= window.innerHeight - 1
+                && videoStyle.objectPosition === '50% 50%'
+                && centered;
+            })() ? 'true' : 'false';
+            """,
+            in: webView
+        )
+        #expect(fillsViewport == "true")
+    }
+
+    @Test
     func playerEventsEmitCompleteSnapshots() async throws {
         let webView = try await loadFixture(named: "video", url: URL(string: "https://www.bilibili.com/video/BV1xx411c7mD/")!)
         _ = try await evaluate(
@@ -250,11 +355,26 @@ struct FocusDOMIntegrationTests {
         #expect(latestURL.contains("/video/BV1LATEST/"))
     }
 
-    private func loadFixture(named name: String, url: URL) async throws -> WKWebView {
+    private func loadFixture(
+        named name: String,
+        url: URL,
+        includeDocumentEnd: Bool = true,
+        simulatesIOS: Bool = false,
+        frame: CGRect = .zero
+    ) async throws -> WKWebView {
         let htmlURL = try #require(Bundle.module.url(forResource: name, withExtension: "html"))
         let html = try String(contentsOf: htmlURL, encoding: .utf8)
 
         let controller = WKUserContentController()
+        if simulatesIOS {
+            controller.addUserScript(
+                WKUserScript(
+                    source: "document.documentElement?.setAttribute('data-focus-platform', 'ios');",
+                    injectionTime: .atDocumentStart,
+                    forMainFrameOnly: true
+                )
+            )
+        }
         controller.addUserScript(
             WKUserScript(
                 source: try FocusScriptBuilder.makeUserScript(for: .documentStart, settings: .defaults),
@@ -262,17 +382,19 @@ struct FocusDOMIntegrationTests {
                 forMainFrameOnly: true
             )
         )
-        controller.addUserScript(
-            WKUserScript(
-                source: try FocusScriptBuilder.makeUserScript(for: .documentEnd, settings: .defaults),
-                injectionTime: .atDocumentEnd,
-                forMainFrameOnly: true
+        if includeDocumentEnd {
+            controller.addUserScript(
+                WKUserScript(
+                    source: try FocusScriptBuilder.makeUserScript(for: .documentEnd, settings: .defaults),
+                    injectionTime: .atDocumentEnd,
+                    forMainFrameOnly: true
+                )
             )
-        )
+        }
 
         let configuration = WKWebViewConfiguration()
         configuration.userContentController = controller
-        let webView = WKWebView(frame: .zero, configuration: configuration)
+        let webView = WKWebView(frame: frame, configuration: configuration)
         let delegate = NavigationDelegate()
         webView.navigationDelegate = delegate
 

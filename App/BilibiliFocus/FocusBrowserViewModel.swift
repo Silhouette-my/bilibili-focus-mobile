@@ -1837,8 +1837,11 @@ final class FocusBrowserViewModel: ObservableObject {
         runPlayerCommand(
             """
             (() => {
+              if (typeof window.__FOCUS_SET_IOS_PLAYER_LAYOUT_MODE__ === 'function') {
+                window.__FOCUS_SET_IOS_PLAYER_LAYOUT_MODE__('expanded');
+              }
               if (typeof window.__FOCUS_SUPPRESS_IOS_PLAYER_SIZING__ === 'function') {
-                window.__FOCUS_SUPPRESS_IOS_PLAYER_SIZING__(1400);
+                window.__FOCUS_SUPPRESS_IOS_PLAYER_SIZING__(1400, 'expanded');
               } else if (typeof window.__FOCUS_CLEAR_IOS_PLAYER_SIZING__ === 'function') {
                 window.__FOCUS_CLEAR_IOS_PLAYER_SIZING__();
               }
@@ -1909,8 +1912,11 @@ final class FocusBrowserViewModel: ObservableObject {
         runPlayerCommand(
             """
             (() => {
+              if (typeof window.__FOCUS_SET_IOS_PLAYER_LAYOUT_MODE__ === 'function') {
+                window.__FOCUS_SET_IOS_PLAYER_LAYOUT_MODE__('automatic');
+              }
               if (typeof window.__FOCUS_SUPPRESS_IOS_PLAYER_SIZING__ === 'function') {
-                window.__FOCUS_SUPPRESS_IOS_PLAYER_SIZING__(900);
+                window.__FOCUS_SUPPRESS_IOS_PLAYER_SIZING__(900, 'automatic');
               } else if (typeof window.__FOCUS_CLEAR_IOS_PLAYER_SIZING__ === 'function') {
                 window.__FOCUS_CLEAR_IOS_PLAYER_SIZING__();
               }
@@ -2014,6 +2020,16 @@ final class FocusBrowserViewModel: ObservableObject {
         let targetMask: UIInterfaceOrientationMask = .landscape
         let requiresNativeRotation = requestedInterfaceOrientationMask != targetMask
 
+        runPlayerCommand(
+            """
+            (() => {
+              window.__FOCUS_SET_IOS_PLAYER_LAYOUT_MODE__?.('expanded');
+              window.__FOCUS_SUPPRESS_IOS_PLAYER_SIZING__?.(1800, 'expanded');
+              return true;
+            })();
+            """
+        )
+
         if requiresNativeRotation {
             requestedInterfaceOrientationMask = targetMask
             updateSupportedOrientations(to: targetMask)
@@ -2042,6 +2058,15 @@ final class FocusBrowserViewModel: ObservableObject {
 
         fullscreenTransitionTask?.cancel()
         if needsPortraitRestore {
+            runPlayerCommand(
+                """
+                (() => {
+                  window.__FOCUS_SET_IOS_PLAYER_LAYOUT_MODE__?.('automatic');
+                  window.__FOCUS_SUPPRESS_IOS_PLAYER_SIZING__?.(900, 'automatic');
+                  return true;
+                })();
+                """
+            )
             requestedInterfaceOrientationMask = .portrait
             updateSupportedOrientations(to: .portrait)
         }
@@ -2246,7 +2271,17 @@ final class FocusBrowserViewModel: ObservableObject {
           window.__FOCUS_NATIVE_VIDEO_AUGMENT_HELPERS__ = null;
 
           document.documentElement.classList.remove('focus-native-video-ready', 'focus-hide-danmaku', 'focus-hide-subtitles');
+          document.documentElement.classList.remove('focus-native-video-fallback');
+          document.documentElement.removeAttribute('data-focus-player-layout');
           document.body?.classList?.remove?.('focus-native-video-ready');
+          document.getElementById('focus-native-video-prehide-style')?.remove?.();
+
+          try {
+            window.__FOCUS_CLEAR_IOS_PLAYER_SIZING__?.();
+          } catch (_) {}
+          window.__FOCUS_CLEAR_IOS_PLAYER_SIZING__ = null;
+          window.__FOCUS_SUPPRESS_IOS_PLAYER_SIZING__ = null;
+          window.__FOCUS_SET_IOS_PLAYER_LAYOUT_MODE__ = null;
 
           [
             'focus-native-video-augment',
@@ -2716,8 +2751,8 @@ final class FocusBrowserViewModel: ObservableObject {
     }
 
     private func resetPlayerState() {
-        if let currentURL = currentURL ?? pendingURL, FocusUserAgent.shouldUseDesktopPlayback(for: currentURL) {
-            clearNativeVideoOriginalSectionSuppression(for: FocusNavigationPolicy.canonicalWebURL(for: currentURL))
+        if let activeURL = webView?.url ?? currentURL ?? pendingURL {
+            clearNativeVideoOriginalSectionSuppression(for: FocusNavigationPolicy.canonicalWebURL(for: activeURL))
         }
         playerStateObservationTask?.cancel()
         playerStateObservationTask = nil
@@ -2967,6 +3002,7 @@ final class FocusBrowserViewModel: ObservableObject {
               }
 
               const id = 'focus-native-video-prehide-style';
+              document.documentElement.classList.remove('focus-native-video-fallback');
               let style = document.getElementById(id);
               if (!style) {
                 style = document.createElement('style');
@@ -3050,6 +3086,7 @@ final class FocusBrowserViewModel: ObservableObject {
               }
 
               document.getElementById('focus-native-video-prehide-style')?.remove?.();
+              document.documentElement.classList.add('focus-native-video-fallback');
               return { cleared: true, reason: 'removed' };
             })();
             """,
@@ -3981,26 +4018,6 @@ final class FocusBrowserViewModel: ObservableObject {
                 else {
                     return
                 }
-
-                    if payload.kind == .video {
-                        try? await Task.sleep(nanoseconds: 220_000_000)
-                        guard
-                            !Task.isCancelled,
-                            self.pageAugmentationRevision == revision,
-                            self.isCurrent(callbackContext, webView: webView)
-                        else {
-                            return
-                        }
-                        self.debugLog(
-                            "nativeOriginalSectionSuppression.clearScheduled",
-                            fields: self.debugStateFields([
-                                "pageURL": canonicalURL.absoluteString,
-                                "delayMS": "220",
-                                "attempt": String(index)
-                            ])
-                        )
-                        self.clearNativeVideoOriginalSectionSuppression(for: canonicalURL)
-                    }
 
                     if self.settingsStore.settings.debugMode {
                     let probeScript = """
@@ -5782,7 +5799,7 @@ fileprivate actor FocusNativePageAugmentService {
     }
 }
 
-private let focusNativeVideoAugmentComponentVersion = "2026-06-24-video-mask-waits-player"
+private let focusNativeVideoAugmentComponentVersion = "2026-07-10-video-layout-stability"
 
 private let focusNativeVideoAugmentMountHelpersJavaScript = #"""
               const ensureNativeVideoAugmentHelpers = () => {
@@ -5838,6 +5855,23 @@ private let focusNativeVideoAugmentMountHelpersJavaScript = #"""
                     } catch (_) {}
                   }
                   window.__FOCUS_NATIVE_VIDEO_AUGMENT_OBSERVER__ = null;
+                  if (window.__FOCUS_NATIVE_VIDEO_SUPPRESSION_FRAME__) {
+                    cancelAnimationFrame(window.__FOCUS_NATIVE_VIDEO_SUPPRESSION_FRAME__);
+                  }
+                  window.__FOCUS_NATIVE_VIDEO_SUPPRESSION_FRAME__ = null;
+                };
+
+                const scheduleOriginalSectionSuppression = () => {
+                  if (window.__FOCUS_NATIVE_VIDEO_SUPPRESSION_FRAME__) {
+                    return;
+                  }
+
+                  window.__FOCUS_NATIVE_VIDEO_SUPPRESSION_FRAME__ = requestAnimationFrame(() => {
+                    window.__FOCUS_NATIVE_VIDEO_SUPPRESSION_FRAME__ = null;
+                    try {
+                      window.__FOCUS_ENFORCE_NATIVE_VIDEO_ORIGINAL_SUPPRESSION__?.();
+                    } catch (_) {}
+                  });
                 };
 
                 const installObserver = (root) => {
@@ -5858,16 +5892,19 @@ private let focusNativeVideoAugmentMountHelpersJavaScript = #"""
                     if (liveRoot.parentNode !== host) {
                       repairRoot();
                     }
+                    scheduleOriginalSectionSuppression();
                   });
 
                   observer.observe(document.documentElement, { childList: true, subtree: true });
                   window.__FOCUS_NATIVE_VIDEO_AUGMENT_OBSERVER__ = observer;
+                  scheduleOriginalSectionSuppression();
                 };
 
                 const teardown = () => {
                   disconnectObserver();
                   window.__FOCUS_NATIVE_VIDEO_AUGMENT_ROOT__ = null;
                   window.__FOCUS_REPAIR_NATIVE_VIDEO_AUGMENT__ = null;
+                  window.__FOCUS_ENFORCE_NATIVE_VIDEO_ORIGINAL_SUPPRESSION__ = null;
                 };
 
                 const helpers = {
@@ -6300,6 +6337,7 @@ private extension FocusNativeVideoAugmentPayload {
               });
             });
           };
+          window.__FOCUS_ENFORCE_NATIVE_VIDEO_ORIGINAL_SUPPRESSION__ = hideOriginalSections;
 
           const buildGroupsHTML = () => (payload.groups || []).map((group) => {
             const items = (group.items || []).map((item) => {
