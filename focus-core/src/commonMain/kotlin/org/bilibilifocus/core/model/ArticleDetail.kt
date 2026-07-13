@@ -10,8 +10,9 @@ data class ArticleDetail(
     val publishTime: Long,
     val stats: ArticleStats,
     val bannerUrl: String,
-    val content: List<ArticleNode>,
+    val blocks: List<ArticleBlock>,
     val tags: List<String>,
+    val originalURL: String,
 )
 
 @Serializable
@@ -31,40 +32,35 @@ data class ArticleStats(
 )
 
 @Serializable
-sealed class ArticleNode {
+sealed class ArticleBlock {
     @Serializable
-    data class Paragraph(val text: String, val style: TextStyle = TextStyle.NORMAL) : ArticleNode()
+    data class Paragraph(val runs: List<RichTextRun>, val alignment: TextAlignment = TextAlignment.START) : ArticleBlock()
 
     @Serializable
-    data class Heading(val text: String, val level: Int) : ArticleNode()
+    data class Heading(val runs: List<RichTextRun>, val level: Int) : ArticleBlock()
 
     @Serializable
-    data class Image(val url: String, val width: Int, val height: Int) : ArticleNode()
+    data class Image(val url: String, val width: Int, val height: Int, val caption: String = "") : ArticleBlock()
 
     @Serializable
-    data class CodeBlock(val code: String, val language: String = "") : ArticleNode()
+    data class CodeBlock(val code: String, val language: String = "") : ArticleBlock()
 
     @Serializable
-    data class Link(val text: String, val url: String) : ArticleNode()
+    data class Quote(val runs: List<RichTextRun>) : ArticleBlock()
 
     @Serializable
-    data class Bold(val text: String) : ArticleNode()
+    data class ListBlock(val ordered: Boolean, val items: List<List<RichTextRun>>) : ArticleBlock()
 
     @Serializable
-    data class BlockQuote(val content: List<ArticleNode>) : ArticleNode()
+    data class Resource(val title: String, val url: String) : ArticleBlock()
 
     @Serializable
-    data class OrderedList(val items: List<String>) : ArticleNode()
-
-    @Serializable
-    data class UnorderedList(val items: List<String>) : ArticleNode()
+    data object Divider : ArticleBlock()
 }
 
 @Serializable
-enum class TextStyle {
-    NORMAL,
-    BOLD,
-    ITALIC,
-    UNDERLINE,
-    STRIKETHROUGH,
+enum class TextAlignment {
+    START,
+    CENTER,
+    END,
 }

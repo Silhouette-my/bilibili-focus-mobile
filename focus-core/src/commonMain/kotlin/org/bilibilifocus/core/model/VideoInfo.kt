@@ -15,6 +15,8 @@ data class VideoInfo(
     val pages: List<VideoPage> = emptyList(),
     val episodeGroups: List<VideoEpisodeGroup> = emptyList(),
     val playerURL: String? = null,
+    val width: Int = 0,
+    val height: Int = 0,
 )
 
 data class VideoPage(

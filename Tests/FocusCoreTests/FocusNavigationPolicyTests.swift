@@ -35,11 +35,11 @@ struct FocusNavigationPolicyTests {
 
     @Test
     func canonicalizesBlackboardVideoPageToFinalDesktopShape() {
-        let url = URL(string: "https://www.bilibili.com/blackboard/html5player.html?bvid=BV1xx411c7mD&start_progress=123&foo=bar")!
+        let url = URL(string: "https://www.bilibili.com/blackboard/html5player.html?bvid=BV1xx411c7mD&cid=3000000088&start_progress=123&foo=bar")!
 
         #expect(
             FocusNavigationPolicy.canonicalWebURL(for: url).absoluteString
-                == "https://www.bilibili.com/video/BV1xx411c7mD/?start_progress=123"
+                == "https://www.bilibili.com/video/BV1xx411c7mD/?cid=3000000088&start_progress=123"
         )
     }
 }

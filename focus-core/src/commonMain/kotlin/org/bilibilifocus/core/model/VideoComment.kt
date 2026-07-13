@@ -6,6 +6,7 @@ data class VideoComment(
     val authorName: String,
     val avatarURL: String,
     val content: String,
+    val contentRuns: List<RichTextRun> = RichTextRun.plain(content),
     val likeCount: Long,
     val replyCount: Long,
     val publishTime: Long,

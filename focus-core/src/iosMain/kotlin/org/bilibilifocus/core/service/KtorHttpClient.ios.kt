@@ -1,6 +1,7 @@
 package org.bilibilifocus.core.service
 
 import io.ktor.client.HttpClient as KtorClient
+import io.ktor.client.call.body
 import io.ktor.client.engine.darwin.Darwin
 import io.ktor.client.request.get
 import io.ktor.client.request.headers
@@ -24,6 +25,20 @@ class KtorHttpClient : HttpClient {
         return HttpResponse(
             statusCode = response.status.value,
             body = response.bodyAsText(),
+        )
+    }
+
+    override suspend fun getBytes(url: String, headers: Map<String, String>): BinaryHttpResponse {
+        val response = client.get(url) {
+            headers {
+                for ((key, value) in headers) {
+                    append(key, value)
+                }
+            }
+        }
+        return BinaryHttpResponse(
+            statusCode = response.status.value,
+            body = response.body(),
         )
     }
 

@@ -127,6 +127,7 @@ public struct DynamicFeedService: Sendable {
         var queryItems = [
             URLQueryItem(name: "type", value: "all"),
             URLQueryItem(name: "timezone_offset", value: String(timezoneOffsetMinutes)),
+            URLQueryItem(name: "features", value: "itemOpusStyle"),
         ]
         if let offset, !offset.isEmpty {
             queryItems.append(URLQueryItem(name: "offset", value: offset))
@@ -160,7 +161,7 @@ public struct DynamicFeedService: Sendable {
             ?? ""
 
         let majorType = major.stringValue(at: ["type"]) ?? ""
-        let jumpCandidates = [
+        let primaryJumpCandidates = [
             basic.stringValue(at: ["jump_url"]),
             major.stringValue(at: ["archive", "jump_url"]),
             major.stringValue(at: ["article", "jump_url"]),
@@ -173,7 +174,7 @@ public struct DynamicFeedService: Sendable {
             major.stringValue(at: ["common", "jump_url"]),
         ]
         .compactMap(normalizedURL(_:))
-        + extractJumpURLs(from: major)
+        let jumpCandidates = primaryJumpCandidates + extractJumpURLs(from: major)
 
         let coverURLs = makeCoverURLs(major: major)
         let text = makeText(dynamic: dynamic, major: major)
@@ -184,9 +185,36 @@ public struct DynamicFeedService: Sendable {
             videoURL: videoURL,
             coverURLs: coverURLs
         )
-        let targetURL = videoURL
-            ?? jumpCandidates.first
-            ?? fallbackTargetURL(for: id, kind: kind)
+        let articleCVID = major.stringValue(at: ["article", "id"]).flatMap(Int64.init)
+            ?? major.stringValue(at: ["article", "id_str"]).flatMap(Int64.init)
+            ?? major.stringValue(at: ["article", "cvid"]).flatMap(Int64.init)
+            ?? major.intValue(at: ["article", "id"]).map(Int64.init)
+            ?? jumpCandidates.compactMap(extractArticleCVID(from:)).first
+        let articleURL: URL? = if kind == .articleLike {
+            jumpCandidates.first(where: { extractArticleCVID(from: $0) != nil })
+                .flatMap { extractArticleCVID(from: $0) }
+                .flatMap { URL(string: "https://www.bilibili.com/read/cv\($0)") }
+                ?? articleCVID.flatMap { URL(string: "https://www.bilibili.com/read/cv\($0)") }
+        } else {
+            nil
+        }
+        let opusDetailURL = primaryJumpCandidates.first(where: isOpusLikeURL(_:))
+        let targetURL: URL
+        switch kind {
+        case .video:
+            targetURL = videoURL
+                ?? primaryJumpCandidates.first
+                ?? jumpCandidates.first
+                ?? fallbackTargetURL(for: id, kind: kind)
+        case .articleLike:
+            targetURL = articleURL
+                ?? opusDetailURL
+                ?? primaryJumpCandidates.first
+                ?? jumpCandidates.first
+                ?? fallbackTargetURL(for: id, kind: kind)
+        case .text, .image:
+            targetURL = opusDetailURL ?? fallbackTargetURL(for: id, kind: kind)
+        }
 
         return DynamicCard(
             id: id,
@@ -201,9 +229,22 @@ public struct DynamicFeedService: Sendable {
     }
 
     private static func makeText(dynamic: [String: Any], major: [String: Any]) -> String {
-        let candidates = [
+        let bodyCandidates = [
+            richTextPlainText(dynamic.arrayValue(at: ["desc", "rich_text_nodes"])),
+            richTextPlainText(dynamic.arrayValue(at: ["desc", "rich_text_nodes_v2"])),
             dynamic.stringValue(at: ["desc", "text"]),
+            richTextPlainText(major.arrayValue(at: ["opus", "summary", "rich_text_nodes"])),
+            richTextPlainText(major.arrayValue(at: ["opus", "summary", "rich_text_nodes_v2"])),
             major.stringValue(at: ["opus", "summary", "text"]),
+        ]
+        .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+
+        if let body = bodyCandidates.max(by: { $0.count < $1.count }) {
+            return body
+        }
+
+        let candidates = [
             major.stringValue(at: ["archive", "title"]),
             major.stringValue(at: ["article", "title"]),
             major.stringValue(at: ["pgc", "title"]),
@@ -217,6 +258,25 @@ public struct DynamicFeedService: Sendable {
         return candidates
             .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
             .first(where: { !$0.isEmpty }) ?? ""
+    }
+
+    private static func richTextPlainText(_ nodes: [Any]?) -> String? {
+        guard let nodes, !nodes.isEmpty else {
+            return nil
+        }
+        let text = nodes.compactMap { rawNode -> String? in
+            guard let node = rawNode as? [String: Any] else {
+                return nil
+            }
+            return node.stringValue(at: ["word", "words"])
+                ?? node.stringValue(at: ["words"])
+                ?? node.stringValue(at: ["text"])
+                ?? node.stringValue(at: ["orig_text"])
+                ?? node.stringValue(at: ["rich", "text"])
+                ?? node.stringValue(at: ["rich", "emoji", "text"])
+                ?? node.stringValue(at: ["emoji", "text"])
+        }.joined()
+        return text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : text
     }
 
     private static func makeCoverURLs(major: [String: Any]) -> [URL] {
@@ -335,6 +395,10 @@ public struct DynamicFeedService: Sendable {
             return nil
         }
 
+        if let canonicalOpusURL = canonicalOpusURLFromScheme(rawValue) {
+            return canonicalOpusURL
+        }
+
         if rawValue.hasPrefix("//") {
             rawValue = "https:\(rawValue)"
         } else if rawValue.hasPrefix("/opus/")
@@ -353,9 +417,73 @@ public struct DynamicFeedService: Sendable {
         return FocusNavigationPolicy.canonicalWebURL(for: url)
     }
 
+    private static func canonicalOpusURLFromScheme(_ rawValue: String) -> URL? {
+        guard
+            let url = URL(string: rawValue),
+            url.scheme?.lowercased() == "bilibili",
+            let host = url.host?.lowercased()
+        else {
+            return nil
+        }
+        let pathComponents = url.path.split(separator: "/").map(String.init)
+        let candidate: String?
+        switch host {
+        case "following", "opus":
+            candidate = pathComponents.count == 2 && pathComponents[0].lowercased() == "detail"
+                ? pathComponents[1]
+                : nil
+        case "dynamic":
+            candidate = pathComponents.count == 1 ? pathComponents[0] : nil
+        default:
+            candidate = nil
+        }
+        guard let candidate, !candidate.isEmpty, candidate.allSatisfy(\.isNumber) else {
+            return nil
+        }
+        return URL(string: "https://www.bilibili.com/opus/\(candidate)")
+    }
+
+    private static func isOpusLikeURL(_ url: URL) -> Bool {
+        let hosts = Set(["bilibili.com", "www.bilibili.com", "m.bilibili.com"])
+        guard hosts.contains(url.host?.lowercased() ?? "") else {
+            return false
+        }
+        let components = url.path.split(separator: "/")
+        guard components.count == 2, components[0].lowercased() == "opus" else {
+            return false
+        }
+        return components[1].allSatisfy(\.isNumber)
+    }
+
     private static func isVideoLikeURL(_ url: URL) -> Bool {
         let path = url.path.lowercased()
         return path.hasPrefix("/video/") || path.hasPrefix("/bangumi/play/")
+    }
+
+    private static func extractArticleCVID(from url: URL) -> Int64? {
+        if url.scheme?.lowercased() == "bilibili", url.host?.lowercased() == "article",
+           let component = url.path.split(separator: "/").first
+        {
+            let candidate = String(component).lowercased().replacingOccurrences(of: "cv", with: "")
+            return candidate.allSatisfy(\.isNumber) ? Int64(candidate) : nil
+        }
+        let hosts = Set(["bilibili.com", "www.bilibili.com", "m.bilibili.com"])
+        guard hosts.contains(url.host?.lowercased() ?? "") else { return nil }
+        let parts = url.path.split(separator: "/")
+        if parts.count == 2,
+           parts[0].caseInsensitiveCompare("read") == .orderedSame,
+           parts[1].lowercased().hasPrefix("cv")
+        {
+            let candidate = String(parts[1].dropFirst(2))
+            return candidate.allSatisfy(\.isNumber) ? Int64(candidate) : nil
+        }
+        guard url.path.lowercased() == "/read/mobile",
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        else { return nil }
+        return components.queryItems?
+            .first(where: { $0.name.caseInsensitiveCompare("id") == .orderedSame })?
+            .value
+            .flatMap { $0.allSatisfy(\.isNumber) ? Int64($0) : nil }
     }
 
     private static func extractJumpURLs(from value: Any) -> [URL] {

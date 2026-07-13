@@ -92,6 +92,15 @@ class VideoActionService(
         )
     }
 
+    /** Mirrors bilibili-api's Video.report_watch_history request. */
+    suspend fun reportWatchHistory(aid: Long, cid: Long, progressSeconds: Long) {
+        val csrf = csrfToken()
+        postForm(
+            url = "https://api.bilibili.com/x/v2/history/report",
+            body = "aid=$aid&cid=$cid&progress=${progressSeconds.coerceAtLeast(0)}&csrf=$csrf",
+        )
+    }
+
     suspend fun toggleFavorite(aid: Long, favorited: Boolean, folderId: Long? = null): Long {
         val targetFolderId = folderId ?: resolveDefaultFavoriteFolderId()
         val csrf = csrfToken()

@@ -22,8 +22,10 @@ struct BilibiliFocusApp: App {
 
     var body: some Scene {
         WindowGroup {
+            let accentColor = FocusAccentColor.color(hex: settingsStore.settings.accentColorHex)
             FocusBrowserView(settingsStore: settingsStore)
-                .tint(Color(red: 0.984, green: 0.447, blue: 0.600)) // Bilibili pink
+                .accentColor(accentColor)
+                .tint(accentColor)
                 .preferredColorScheme(preferredColorScheme)
         }
     }

@@ -17,17 +17,10 @@ data class OpusAuthor(
 )
 
 sealed class OpusBlock {
-    data class Text(val nodes: List<OpusTextNode>) : OpusBlock()
+    data class Text(val nodes: List<RichTextRun>) : OpusBlock()
     data class Image(val pics: List<OpusImage>) : OpusBlock()
     data class Code(val lang: String, val content: String) : OpusBlock()
 }
-
-data class OpusTextNode(
-    val text: String,
-    val bold: Boolean = false,
-    val linkUrl: String? = null,
-    val emojiUrl: String? = null,
-)
 
 data class OpusImage(
     val url: String,

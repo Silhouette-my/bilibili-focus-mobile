@@ -7,7 +7,7 @@ import org.bilibilifocus.core.model.OpusAuthor
 import org.bilibilifocus.core.model.OpusBlock
 import org.bilibilifocus.core.model.OpusDetail
 import org.bilibilifocus.core.model.OpusImage
-import org.bilibilifocus.core.model.OpusTextNode
+import org.bilibilifocus.core.model.RichTextRun
 import org.bilibilifocus.core.model.VideoComment
 
 class OpusService(
@@ -103,7 +103,7 @@ class OpusService(
                 publishTime = publishTime,
                 paragraphs = listOf(
                     OpusDetail.Paragraph(
-                        listOf(OpusBlock.Text(listOf(OpusTextNode(text = "暂无内容", bold = false))))
+                        listOf(OpusBlock.Text(listOf(RichTextRun.Text(text = "暂无内容"))))
                     )
                 ),
             )
@@ -147,10 +147,16 @@ class OpusService(
 
         val blocks = mutableListOf<OpusBlock>()
 
-        val text = dynamic.stringValueAt("desc", "text")
-            ?: major?.stringValueAt("opus", "summary", "text")
-        if (!text.isNullOrEmpty()) {
-            blocks.add(OpusBlock.Text(listOf(OpusTextNode(text = text, bold = false))))
+        val richTextRuns = parseOpusTextNodes(
+            dynamic.arrayValueAt("desc", "rich_text_nodes")
+                ?: dynamic.arrayValueAt("desc", "rich_text_nodes_v2")
+                ?: emptyList()
+        )
+        val text = dynamic.stringValueAt("desc", "text") ?: major?.stringValueAt("opus", "summary", "text")
+        if (richTextRuns.isNotEmpty()) {
+            blocks.add(OpusBlock.Text(richTextRuns))
+        } else if (!text.isNullOrEmpty()) {
+            blocks.add(OpusBlock.Text(listOf(RichTextRun.Text(text = text))))
         }
 
         val pics = mutableListOf<OpusImage>()
@@ -263,6 +269,7 @@ class OpusService(
             authorName = member.stringValueAt("uname") ?: "",
             avatarURL = member.stringValueAt("avatar") ?: "",
             content = content.stringValueAt("message") ?: "",
+            contentRuns = CommentRichTextParser.parse(content),
             likeCount = obj.intValueAt("like")?.toLong() ?: 0L,
             replyCount = obj.intValueAt("rcount")?.toLong() ?: 0L,
             publishTime = obj.intValueAt("ctime")?.toLong() ?: 0L,
@@ -297,23 +304,7 @@ class OpusService(
                     ?: para.arrayValueAt("nodes")
                     ?: return emptyList()
 
-                val nodes = nodesArray.mapNotNull { node ->
-                    val dict = node as? JsonObject ?: return@mapNotNull null
-                    val words = dict.stringValueAt("word", "words")
-                        ?: dict.stringValueAt("words")
-                        ?: dict.stringValueAt("text")
-                        ?: ""
-                    val bold = dict.dictionaryValueAt("word", "style")?.intValueAt("bold") == 1
-                        || dict.dictionaryValueAt("style")?.intValueAt("bold") == 1
-                    val linkUrl = dict.stringValueAt("rich", "jump_url")
-                        ?: dict.stringValueAt("jump_url")
-                    val emojiUrl = dict.stringValueAt("rich", "emoji", "icon_url")
-                        ?: dict.stringValueAt("emoji", "icon_url")
-                        ?: dict.stringValueAt("icon_url")
-
-                    if (words.isEmpty() && emojiUrl == null && linkUrl == null) null
-                    else OpusTextNode(text = words, bold = bold, linkUrl = linkUrl, emojiUrl = emojiUrl)
-                }
+                val nodes = parseOpusTextNodes(nodesArray)
                 if (nodes.isEmpty()) emptyList() else listOf(OpusBlock.Text(nodes))
             }
             2 -> {
@@ -347,6 +338,65 @@ class OpusService(
                 if (content.isEmpty()) emptyList() else listOf(OpusBlock.Code(lang = lang, content = content))
             }
             else -> emptyList()
+        }
+    }
+
+    private fun parseOpusTextNodes(nodes: List<kotlinx.serialization.json.JsonElement>): List<RichTextRun> =
+        nodes.mapNotNull { node ->
+            val dict = node as? JsonObject ?: return@mapNotNull null
+            val words = dict.stringValueAt("word", "words")
+                ?: dict.stringValueAt("words")
+                ?: dict.stringValueAt("text")
+                ?: dict.stringValueAt("orig_text")
+                ?: ""
+            val style = dict.dictionaryValueAt("word", "style") ?: dict.dictionaryValueAt("style")
+            val linkUrl = dict.stringValueAt("rich", "jump_url")
+                ?: dict.stringValueAt("jump_url")
+                ?: dict.stringValueAt("link")
+            val emojiUrl = dict.stringValueAt("rich", "emoji", "icon_url")
+                ?: dict.stringValueAt("rich", "emoji", "url")
+                ?: dict.stringValueAt("emoji", "icon_url")
+                ?: dict.stringValueAt("emoji", "url")
+                ?: dict.stringValueAt("icon_url")
+            val emojiSize = dict.intValueAt("rich", "emoji", "meta", "size")
+                ?: dict.intValueAt("emoji", "meta", "size")
+                ?: 0
+
+            when {
+                emojiUrl != null -> RichTextRun.Emote(
+                    alt = words.ifEmpty { "[表情]" },
+                    url = normalizedURL(emojiUrl) ?: emojiUrl,
+                    width = dict.intValueAt("rich", "emoji", "width")
+                        ?: dict.intValueAt("emoji", "width")
+                        ?: emojiSize,
+                    height = dict.intValueAt("rich", "emoji", "height")
+                        ?: dict.intValueAt("emoji", "height")
+                        ?: emojiSize,
+                )
+                words.isNotEmpty() -> RichTextRun.Text(
+                    text = words,
+                    bold = style?.intValueAt("bold") == 1,
+                    italic = style?.intValueAt("italic") == 1,
+                    underline = style?.intValueAt("underline") == 1,
+                    strikethrough = style?.intValueAt("strikethrough") == 1 || style?.intValueAt("strike") == 1,
+                    color = style?.stringValueAt("color"),
+                    linkUrl = normalizedURL(linkUrl),
+                )
+                linkUrl != null -> RichTextRun.Resource(
+                    label = "查看内容",
+                    url = normalizedURL(linkUrl) ?: linkUrl,
+                )
+                else -> null
+            }
+        }
+
+    private fun normalizedURL(raw: String?): String? {
+        val value = raw?.trim()?.takeIf(String::isNotEmpty) ?: return null
+        return when {
+            value.startsWith("//") -> "https:$value"
+            value.startsWith("http://") -> "https://${value.removePrefix("http://")}"
+            value.startsWith("/") -> "https://www.bilibili.com$value"
+            else -> value
         }
     }
 

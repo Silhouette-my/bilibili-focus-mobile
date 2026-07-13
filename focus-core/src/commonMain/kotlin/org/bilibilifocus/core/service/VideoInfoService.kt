@@ -8,6 +8,8 @@ import org.bilibilifocus.core.cookie.CookieProvider
 import org.bilibilifocus.core.crypto.md5Hex
 import org.bilibilifocus.core.model.VideoAuthor
 import org.bilibilifocus.core.model.VideoComment
+import org.bilibilifocus.core.model.VideoDanmakuSegment
+import org.bilibilifocus.core.model.VideoDanmakuView
 import org.bilibilifocus.core.model.VideoEpisode
 import org.bilibilifocus.core.model.VideoEpisodeGroup
 import org.bilibilifocus.core.model.VideoInfo
@@ -88,6 +90,10 @@ class VideoInfoService(
         }.take(32)
     }
 
+    private fun invalidateWbiKey() {
+        wbiMixedKey = null
+    }
+
     private suspend fun signWbi(vararg params: Pair<String, String>): String {
         ensureWbiKey()
         val key = wbiMixedKey ?: return ""
@@ -114,6 +120,7 @@ class VideoInfoService(
 
         val owner = data["owner"] as? JsonObject
         val stat = data["stat"] as? JsonObject
+        val dimension = data["dimension"] as? JsonObject
 
         val tags = data["tname"]?.jsonPrimitive?.content
             ?.split("/")?.map { it.trim() }?.filter { it.isNotBlank() }
@@ -150,6 +157,8 @@ class VideoInfoService(
             pages = pages,
             episodeGroups = episodeGroups,
             playerURL = null,
+            width = dimension?.get("width")?.jsonPrimitive?.content?.toIntOrNull() ?: 0,
+            height = dimension?.get("height")?.jsonPrimitive?.content?.toIntOrNull() ?: 0,
         )
     }
 
@@ -213,6 +222,82 @@ class VideoInfoService(
         }
     }
 
+    suspend fun fetchDanmakuView(aid: Long, cid: Long): VideoDanmakuView {
+        val response = httpClient.getBytes(
+            "https://api.bilibili.com/x/v2/dm/web/view?type=1&oid=$cid&pid=$aid",
+            buildHeaders() + mapOf("Accept" to "application/octet-stream, */*"),
+        )
+        if (response.statusCode !in 200..299) throw ServiceError.InvalidResponse
+        parseBinaryApiError(response.body)?.let { throw it }
+        return try {
+            VideoDanmakuDecoder.decodeView(response.body)
+        } catch (_: ProtobufDecodingException) {
+            throw ServiceError.InvalidResponse
+        }
+    }
+
+    suspend fun fetchDanmakuSegment(
+        aid: Long,
+        cid: Long,
+        segmentIndex: Int,
+    ): VideoDanmakuSegment {
+        require(segmentIndex > 0) { "segmentIndex 必须从 1 开始" }
+        var lastError: ServiceError = ServiceError.InvalidResponse
+        repeat(3) { attempt ->
+            val signed = signWbi(
+                "oid" to cid.toString(),
+                "type" to "1",
+                "pid" to aid.toString(),
+                "segment_index" to segmentIndex.toString(),
+                "web_location" to "1550101",
+            )
+            val response = httpClient.getBytes(
+                "https://api.bilibili.com/x/v2/dm/wbi/web/seg.so?$signed",
+                buildHeaders() + mapOf("Accept" to "application/octet-stream, */*"),
+            )
+            if (response.statusCode == 403 && attempt < 2) {
+                invalidateWbiKey()
+                return@repeat
+            }
+            if (response.statusCode !in 200..299) throw ServiceError.InvalidResponse
+
+            val apiError = parseBinaryApiError(response.body)
+            if (apiError != null) {
+                lastError = apiError
+                if (apiError.code == -403 && attempt < 2) {
+                    invalidateWbiKey()
+                    return@repeat
+                }
+                throw apiError
+            }
+
+            return try {
+                VideoDanmakuDecoder.decodeSegment(response.body)
+            } catch (_: ProtobufDecodingException) {
+                throw ServiceError.InvalidResponse
+            }
+        }
+        throw lastError
+    }
+
+    private fun parseBinaryApiError(bytes: ByteArray): ServiceError.Api? {
+        val firstContentIndex = bytes.indexOfFirst { byte ->
+            byte != 0x09.toByte() &&
+                byte != 0x0a.toByte() &&
+                byte != 0x0d.toByte() &&
+                byte != 0x20.toByte()
+        }
+        if (firstContentIndex < 0 || bytes[firstContentIndex] != 0x7b.toByte()) return null
+        val body = bytes.copyOfRange(firstContentIndex, bytes.size).decodeToString()
+        val root = runCatching { json.parseToJsonElement(body) as? JsonObject }.getOrNull() ?: return null
+        val code = root["code"]?.jsonPrimitive?.content?.toIntOrNull() ?: return null
+        if (code == 0) return null
+        return ServiceError.Api(
+            code = code,
+            message = root["message"]?.jsonPrimitive?.content ?: "弹幕接口失败",
+        )
+    }
+
     private fun parseComment(obj: JsonObject?): VideoComment? {
         if (obj == null) return null
         val member = obj["member"] as? JsonObject ?: return null
@@ -225,6 +310,7 @@ class VideoInfoService(
             authorName = member["uname"]?.jsonPrimitive?.content ?: "",
             avatarURL = member["avatar"]?.jsonPrimitive?.content ?: "",
             content = content["message"]?.jsonPrimitive?.content ?: "",
+            contentRuns = CommentRichTextParser.parse(content),
             likeCount = obj["like"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0,
             replyCount = obj["rcount"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0,
             publishTime = obj["ctime"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0,
@@ -271,11 +357,11 @@ class VideoInfoService(
         val bvid = episode.stringValueAt("bvid")
             ?: arc?.stringValueAt("bvid")
             ?: return null
-        val aid = episode.intValueAt("aid")?.toLong()
-            ?: arc?.intValueAt("aid")?.toLong()
+        val aid = episode.stringValueAt("aid")?.toLongOrNull()
+            ?: arc?.stringValueAt("aid")?.toLongOrNull()
             ?: 0L
-        val cid = episode.intValueAt("cid")?.toLong()
-            ?: arc?.intValueAt("cid")?.toLong()
+        val cid = episode.stringValueAt("cid")?.toLongOrNull()
+            ?: arc?.stringValueAt("cid")?.toLongOrNull()
             ?: 0L
         val title = episode.stringValueAt("title")
             ?.takeIf { it.isNotBlank() }

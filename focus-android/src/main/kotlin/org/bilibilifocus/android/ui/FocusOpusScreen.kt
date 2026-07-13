@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -36,6 +37,8 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -56,7 +59,7 @@ import org.bilibilifocus.android.OpusUiState
 import org.bilibilifocus.core.model.OpusBlock
 import org.bilibilifocus.core.model.OpusDetail
 import org.bilibilifocus.core.model.OpusImage
-import org.bilibilifocus.core.model.OpusTextNode
+import org.bilibilifocus.core.model.RichTextRun
 import org.bilibilifocus.core.model.VideoComment
 import org.bilibilifocus.core.service.KtorHttpClient
 import org.bilibilifocus.core.service.OpusService
@@ -71,6 +74,7 @@ fun FocusOpusScreen(
     onBack: () -> Unit,
     onOpenUser: (Long) -> Unit = {},
     onOpenVideo: (String) -> Unit = {},
+    onOpenURL: (String) -> Unit = {},
     viewModel: FocusOpusViewModel? = null,
     listState: LazyListState = rememberLazyListState(),
 ) {
@@ -89,7 +93,9 @@ fun FocusOpusScreen(
 
     val state by resolvedViewModel.state.collectAsState()
     val comments by resolvedViewModel.comments.collectAsState()
+    var galleryRequest by remember(opusId) { mutableStateOf<FocusImageGalleryRequest?>(null) }
 
+    Box(modifier = Modifier.fillMaxSize()) {
     Scaffold(
         topBar = {
             CenterAlignedTopAppBar(
@@ -128,6 +134,12 @@ fun FocusOpusScreen(
             }
 
             is OpusUiState.Loaded -> {
+                val allImages = s.detail.paragraphs.flatMap { paragraph ->
+                    paragraph.blocks.flatMap { block ->
+                        (block as? OpusBlock.Image)?.pics.orEmpty()
+                    }
+                }
+                val validImages = allImages.filter { it.url.isNotBlank() }
                 LazyColumn(
                     state = listState,
                     modifier = Modifier.fillMaxSize().padding(innerPadding),
@@ -148,6 +160,15 @@ fun FocusOpusScreen(
                                 OpusParagraphView(
                                     paragraph = para,
                                     modifier = Modifier.padding(16.dp),
+                                    onOpenImage = { selected ->
+                                        val index = validImages.indexOfFirst { it.url == selected.url }.coerceAtLeast(0)
+                                        galleryRequest = FocusImageGalleryRequest(
+                                            images = validImages.map { it.url },
+                                            initialIndex = index,
+                                            referer = "https://www.bilibili.com/opus/$opusId",
+                                        )
+                                    },
+                                    onOpenURL = onOpenURL,
                                 )
                             }
                         }
@@ -167,7 +188,11 @@ fun FocusOpusScreen(
                                 colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surface),
                                 elevation = CardDefaults.elevatedCardElevation(defaultElevation = 1.dp),
                             ) {
-                                OpusCommentItem(comment = comment, modifier = Modifier.padding(16.dp))
+                                OpusCommentItem(
+                                    comment = comment,
+                                    modifier = Modifier.padding(16.dp),
+                                    onOpenURL = onOpenURL,
+                                )
                             }
                         }
                     }
@@ -175,6 +200,10 @@ fun FocusOpusScreen(
                     item { Box(modifier = Modifier.padding(top = 32.dp)) }
                 }
             }
+        }
+    }
+        galleryRequest?.let { request ->
+            FocusImageGallery(request = request, onDismiss = { galleryRequest = null })
         }
     }
 }
@@ -217,12 +246,17 @@ private fun OpusAuthorCard(detail: OpusDetail, onOpenUser: (Long) -> Unit) {
 }
 
 @Composable
-private fun OpusParagraphView(paragraph: OpusDetail.Paragraph, modifier: Modifier = Modifier) {
+private fun OpusParagraphView(
+    paragraph: OpusDetail.Paragraph,
+    modifier: Modifier = Modifier,
+    onOpenImage: (OpusImage) -> Unit = {},
+    onOpenURL: (String) -> Unit = {},
+) {
     Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(8.dp)) {
         paragraph.blocks.forEachIndexed { _, block ->
             when (block) {
-                is OpusBlock.Text -> OpusRichText(nodes = block.nodes)
-                is OpusBlock.Image -> OpusImageGrid(images = block.pics)
+                is OpusBlock.Text -> FocusRichText(runs = block.nodes, onOpenURL = onOpenURL)
+                is OpusBlock.Image -> OpusImageGrid(images = block.pics, onOpenImage = onOpenImage)
                 is OpusBlock.Code -> OpusCodeBlock(lang = block.lang, content = block.content)
             }
         }
@@ -230,31 +264,7 @@ private fun OpusParagraphView(paragraph: OpusDetail.Paragraph, modifier: Modifie
 }
 
 @Composable
-private fun OpusRichText(nodes: List<OpusTextNode>) {
-    val annotatedString = buildAnnotatedString {
-        nodes.forEach { node ->
-            if (node.emojiUrl != null) {
-                append("[表情]")
-            } else {
-                val style = if (node.bold) {
-                    SpanStyle(fontWeight = FontWeight.Bold)
-                } else {
-                    SpanStyle()
-                }
-                withStyle(style) {
-                    append(node.text)
-                }
-            }
-        }
-    }
-    Text(
-        text = annotatedString,
-        style = MaterialTheme.typography.bodyLarge,
-    )
-}
-
-@Composable
-private fun OpusImageGrid(images: List<OpusImage>) {
+private fun OpusImageGrid(images: List<OpusImage>, onOpenImage: (OpusImage) -> Unit) {
     if (images.size == 1) {
         val image = images.first()
         val ratio = normalizedImageRatio(image)
@@ -266,6 +276,7 @@ private fun OpusImageGrid(images: List<OpusImage>) {
             contentDescription = null,
             modifier = Modifier
                 .fillMaxWidth()
+                .clickable { onOpenImage(image) }
                 .clip(RoundedCornerShape(12.dp))
                 .background(MaterialTheme.colorScheme.surfaceVariant)
                 .border(
@@ -297,6 +308,7 @@ private fun OpusImageGrid(images: List<OpusImage>) {
                         contentDescription = null,
                         modifier = Modifier
                             .weight(1f)
+                            .clickable { onOpenImage(image) }
                             .height(imageHeight.dp)
                             .clip(RoundedCornerShape(12.dp))
                             .background(MaterialTheme.colorScheme.surfaceVariant)
@@ -334,7 +346,11 @@ private fun OpusCodeBlock(lang: String, content: String) {
 }
 
 @Composable
-private fun OpusCommentItem(comment: VideoComment, modifier: Modifier = Modifier) {
+private fun OpusCommentItem(
+    comment: VideoComment,
+    modifier: Modifier = Modifier,
+    onOpenURL: (String) -> Unit = {},
+) {
     Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             AsyncImage(
@@ -362,14 +378,16 @@ private fun OpusCommentItem(comment: VideoComment, modifier: Modifier = Modifier
                 }
             }
         }
-        Text(comment.content, style = MaterialTheme.typography.bodyLarge)
+        FocusRichText(comment.contentRuns, style = MaterialTheme.typography.bodyLarge, onOpenURL = onOpenURL)
         comment.replies.take(2).forEach { reply ->
-            Text(
-                "${reply.authorName}: ${reply.content}",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(start = 42.dp),
-            )
+            Row(modifier = Modifier.padding(start = 42.dp)) {
+                Text("${reply.authorName}: ", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
+                FocusRichText(
+                    reply.contentRuns,
+                    style = MaterialTheme.typography.bodyMedium.copy(color = MaterialTheme.colorScheme.onSurfaceVariant),
+                    onOpenURL = onOpenURL,
+                )
+            }
         }
     }
 }

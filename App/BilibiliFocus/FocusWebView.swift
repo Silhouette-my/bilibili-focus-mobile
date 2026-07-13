@@ -465,6 +465,12 @@ struct FocusWebView: UIViewRepresentable {
                 return
             }
 
+            if viewModel.shouldRouteVideoNavigationToNative(url, currentURL: webView.url) {
+                decisionHandler(.cancel)
+                viewModel.openNativeVideo(url)
+                return
+            }
+
             if viewModel.shouldOpenNativeUserSpace(url) {
                 decisionHandler(.cancel)
                 viewModel.openNativeUserSpace(url)

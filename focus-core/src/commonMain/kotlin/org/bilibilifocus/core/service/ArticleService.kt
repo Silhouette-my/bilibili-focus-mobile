@@ -1,9 +1,12 @@
 package org.bilibilifocus.core.service
 
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.int
-import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.long
@@ -19,95 +22,116 @@ class ArticleService(
     sealed class ServiceError(message: String) : Exception(message) {
         data object LoginRequired : ServiceError("需要登录")
         data class Api(val code: Int, override val message: String) : ServiceError(message)
-        data object InvalidResponse : ServiceError("接口返回无效数据")
+        data object InvalidResponse : ServiceError("专栏接口返回无效数据")
+        data object EmptyContent : ServiceError("专栏正文为空或暂时无法解析")
     }
 
     private val json = Json { ignoreUnknownKeys = true }
 
-    suspend fun fetchArticleInfo(cvid: Long): ArticleDetail {
-        val cookies = cookieProvider.loadCookies()
-        val headers = mutableMapOf(
-            "User-Agent" to "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36",
-            "Referer" to "https://www.bilibili.com/",
+    suspend fun fetchArticle(cvid: Long): ArticleDetail {
+        val originalURL = "https://www.bilibili.com/read/cv$cvid"
+        val response = httpClient.get(
+            "https://api.bilibili.com/x/article/view?id=$cvid&mobi_app=pc&from=web",
+            buildHeaders(originalURL),
         )
-        if (cookies.isNotEmpty()) {
-            headers["Cookie"] = cookies.joinToString("; ") { "${it.name}=${it.value}" }
-        }
-
-        val url = "https://api.bilibili.com/x/article/viewinfo?id=$cvid"
-        val response = httpClient.get(url, headers)
-
-        val root = json.parseToJsonElement(response.body) as? JsonObject
+        if (response.statusCode !in 200..299) throw ServiceError.InvalidResponse
+        val root = runCatching { json.parseToJsonElement(response.body) as? JsonObject }.getOrNull()
             ?: throw ServiceError.InvalidResponse
-
         val code = root["code"]?.jsonPrimitive?.int ?: throw ServiceError.InvalidResponse
-        if (code != 0) {
-            val message = root["message"]?.jsonPrimitive?.content ?: "未知错误"
-            throw ServiceError.Api(code, message)
-        }
-
+        if (code == -101) throw ServiceError.LoginRequired
+        if (code != 0) throw ServiceError.Api(code, root["message"]?.jsonPrimitive?.content ?: "专栏加载失败")
         val data = root["data"]?.jsonObject ?: throw ServiceError.InvalidResponse
 
-        return parseArticleDetail(cvid, data)
-    }
+        val rawContent = data["content"]?.jsonPrimitive?.content.orEmpty()
+        val blocks = ArticleContentParser.parse(rawContent)
+        if (blocks.isEmpty()) throw ServiceError.EmptyContent
 
-    suspend fun fetchArticleContent(cvid: Long): String {
-        val cookies = cookieProvider.loadCookies()
-        val headers = mutableMapOf(
-            "User-Agent" to "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36",
-            "Referer" to "https://www.bilibili.com/",
-        )
-        if (cookies.isNotEmpty()) {
-            headers["Cookie"] = cookies.joinToString("; ") { "${it.name}=${it.value}" }
-        }
-
-        val url = "https://api.bilibili.com/x/article/viewinfo?id=$cvid"
-        val response = httpClient.get(url, headers)
-
-        val root = json.parseToJsonElement(response.body) as? JsonObject
-            ?: throw ServiceError.InvalidResponse
-
-        val code = root["code"]?.jsonPrimitive?.int ?: throw ServiceError.InvalidResponse
-        if (code != 0) {
-            val message = root["message"]?.jsonPrimitive?.content ?: "未知错误"
-            throw ServiceError.Api(code, message)
-        }
-
-        val data = root["data"]?.jsonObject ?: throw ServiceError.InvalidResponse
-        return data["content"]?.jsonPrimitive?.content ?: ""
-    }
-
-    private fun parseArticleDetail(cvid: Long, data: JsonObject): ArticleDetail {
-        val authorObj = data["author"]?.jsonObject
-        val statsObj = data["stats"]?.jsonObject
-
-        val author = ArticleAuthor(
-            mid = authorObj?.get("mid")?.jsonPrimitive?.long ?: 0L,
-            name = authorObj?.get("name")?.jsonPrimitive?.content ?: "",
-            avatarURL = authorObj?.get("face")?.jsonPrimitive?.content ?: "",
-        )
-
-        val stats = ArticleStats(
-            views = statsObj?.get("view")?.jsonPrimitive?.long ?: 0L,
-            likes = statsObj?.get("like")?.jsonPrimitive?.long ?: 0L,
-            coins = statsObj?.get("coin")?.jsonPrimitive?.long ?: 0L,
-            favorites = statsObj?.get("favorite")?.jsonPrimitive?.long ?: 0L,
-            comments = statsObj?.get("reply")?.jsonPrimitive?.long ?: 0L,
-        )
-
-        val tags = data["tags"]?.jsonArray?.mapNotNull {
-            it.jsonObject["name"]?.jsonPrimitive?.content
-        } ?: emptyList()
+        val authorObj = data["author"] as? JsonObject
+        val statsObj = data["stats"] as? JsonObject
+        val mid = authorObj?.get("mid")?.jsonPrimitive?.long
+            ?: data["mid"]?.jsonPrimitive?.long
+            ?: 0L
+        val authorName = authorObj?.get("name")?.jsonPrimitive?.content
+            ?: data["author_name"]?.jsonPrimitive?.content
+            ?: "作者"
+        val authorFace = authorObj?.get("face")?.jsonPrimitive?.content
+            ?: data["author_face"]?.jsonPrimitive?.content
+            ?: ""
 
         return ArticleDetail(
             cvid = cvid,
-            title = data["title"]?.jsonPrimitive?.content ?: "",
-            author = author,
-            publishTime = data["publish_time"]?.jsonPrimitive?.long ?: 0L,
-            stats = stats,
-            bannerUrl = data["banner_url"]?.jsonPrimitive?.content ?: "",
-            content = emptyList(),
-            tags = tags,
+            title = data["title"]?.jsonPrimitive?.content ?: "专栏",
+            author = ArticleAuthor(mid, authorName, normalizedURL(authorFace)),
+            publishTime = data["publish_time"]?.jsonPrimitive?.long
+                ?: data["ctime"]?.jsonPrimitive?.long
+                ?: 0L,
+            stats = ArticleStats(
+                views = statsObj?.get("view")?.jsonPrimitive?.long ?: 0L,
+                likes = statsObj?.get("like")?.jsonPrimitive?.long ?: 0L,
+                coins = statsObj?.get("coin")?.jsonPrimitive?.long ?: 0L,
+                favorites = statsObj?.get("favorite")?.jsonPrimitive?.long ?: 0L,
+                comments = statsObj?.get("reply")?.jsonPrimitive?.long ?: 0L,
+            ),
+            bannerUrl = normalizedURL(
+                data["banner_url"]?.jsonPrimitive?.content
+                    ?: firstString(data["origin_image_urls"])
+                    ?: firstString(data["image_urls"])
+                    ?: ""
+            ),
+            blocks = blocks,
+            tags = parseTags(data),
+            originalURL = originalURL,
         )
+    }
+
+    private suspend fun buildHeaders(referer: String): Map<String, String> {
+        val cookies = cookieProvider.loadCookies()
+        return cookieProvider.attachCookies(
+            mapOf(
+                "User-Agent" to "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36",
+                "Referer" to referer,
+                "Accept" to "application/json, text/plain, */*",
+            ),
+            cookies,
+        )
+    }
+
+    private fun parseTags(data: JsonObject): List<String> {
+        val values = mutableListOf<String>()
+        (data["tags"] as? kotlinx.serialization.json.JsonArray)?.forEach { raw ->
+            when (raw) {
+                is JsonObject -> raw["name"]?.jsonPrimitive?.content?.let(values::add)
+                else -> raw.jsonPrimitive.content.let(values::add)
+            }
+        }
+        data["keywords"]?.jsonPrimitive?.content
+            ?.split(',', '，')
+            ?.map(String::trim)
+            ?.filter(String::isNotEmpty)
+            ?.let(values::addAll)
+        data["category"]?.jsonObject?.get("name")?.jsonPrimitive?.content?.let(values::add)
+        return values.distinct()
+    }
+
+    private fun firstString(element: JsonElement?): String? {
+        if (element is JsonPrimitive) return element.contentOrNull?.takeIf(String::isNotBlank)
+        val values = element as? JsonArray ?: return null
+        for (value in values) {
+            when (value) {
+                is JsonPrimitive -> value.contentOrNull?.takeIf(String::isNotBlank)?.let { return it }
+                is JsonObject -> listOf("self", "url", "src").firstNotNullOfOrNull { key ->
+                    (value[key] as? JsonPrimitive)?.contentOrNull?.takeIf(String::isNotBlank)
+                }?.let { return it }
+                else -> Unit
+            }
+        }
+        return null
+    }
+
+    private fun normalizedURL(raw: String): String = when {
+        raw.startsWith("//") -> "https:$raw"
+        raw.startsWith("http://") -> "https://${raw.removePrefix("http://")}"
+        raw.startsWith("/") -> "https://www.bilibili.com$raw"
+        else -> raw
     }
 }

@@ -153,6 +153,7 @@ public struct FocusNavigationPolicy: Sendable {
     private static func filteredVideoQueryItems(from items: [URLQueryItem]?) -> [URLQueryItem]? {
         let preservedNames: Set<String> = [
             "p",
+            "cid",
             "t",
             "start_progress",
             "start_progress_ms",

@@ -23,6 +23,6 @@ class SearchQueryTests {
     @Test
     fun `urlEncode handles Chinese characters`() {
         val encoded = urlEncode("测试")
-        assertTrue(encoded.all { it in '%' || it in '0'..'9' || it in 'A'..'F' })
+        assertTrue(encoded.all { it == '%' || it in '0'..'9' || it in 'A'..'F' })
     }
 }

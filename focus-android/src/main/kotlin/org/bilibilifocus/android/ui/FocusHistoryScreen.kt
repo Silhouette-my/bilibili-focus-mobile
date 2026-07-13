@@ -57,7 +57,9 @@ fun FocusHistoryScreen(
         )
     }
 
-    LaunchedEffect(Unit) { resolvedViewModel.loadIfNeeded() }
+    // A retained history view model may have been loaded before opening a video.
+    // Refresh on each screen appearance so the just-reported server position is visible.
+    LaunchedEffect(Unit) { resolvedViewModel.reload() }
 
     val state by resolvedViewModel.state.collectAsState()
     val isLoadingMore by resolvedViewModel.isLoadingMore.collectAsState()
@@ -106,7 +108,7 @@ fun FocusHistoryScreen(
                 } else {
                     LazyVerticalGrid(
                         state = gridState,
-                        columns = GridCells.Adaptive(minSize = 200.dp),
+                        columns = GridCells.Adaptive(minSize = 156.dp),
                         modifier = Modifier.fillMaxSize().padding(innerPadding),
                         contentPadding = PaddingValues(16.dp),
                         horizontalArrangement = Arrangement.spacedBy(12.dp),

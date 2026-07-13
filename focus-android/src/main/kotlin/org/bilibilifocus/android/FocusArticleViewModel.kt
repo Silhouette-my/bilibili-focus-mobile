@@ -23,12 +23,10 @@ class FocusArticleViewModel(
     private val _state = MutableStateFlow<ArticleUiState>(ArticleUiState.Idle)
     val state: StateFlow<ArticleUiState> = _state.asStateFlow()
 
-    private val _htmlContent = MutableStateFlow("")
-    val htmlContent: StateFlow<String> = _htmlContent.asStateFlow()
     private var loadedCvid: Long? = null
 
     fun loadIfNeeded(cvid: Long) {
-        if (loadedCvid == cvid && _state.value is ArticleUiState.Loaded && _htmlContent.value.isNotBlank()) return
+        if (loadedCvid == cvid && _state.value is ArticleUiState.Loaded) return
         load(cvid)
     }
 
@@ -37,10 +35,8 @@ class FocusArticleViewModel(
         loadJob = scope.launch {
             _state.value = ArticleUiState.Loading
             try {
-                val detail = service.fetchArticleInfo(cvid)
-                val content = service.fetchArticleContent(cvid)
+                val detail = service.fetchArticle(cvid)
                 loadedCvid = cvid
-                _htmlContent.value = content
                 _state.value = ArticleUiState.Loaded(detail)
             } catch (e: ArticleService.ServiceError.LoginRequired) {
                 _state.value = ArticleUiState.LoginRequired

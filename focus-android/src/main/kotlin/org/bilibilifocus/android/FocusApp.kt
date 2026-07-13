@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsTopHeight
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.grid.LazyGridState
@@ -32,6 +33,7 @@ import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.outlined.Home
 import androidx.compose.material.icons.outlined.Person
 import androidx.compose.material.icons.outlined.Search
+import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -49,13 +51,17 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.VerticalDivider
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.movableContentOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -77,13 +83,20 @@ import org.bilibilifocus.android.ui.FocusLoginScreen
 import org.bilibilifocus.android.ui.FocusMyScreen
 import org.bilibilifocus.android.ui.FocusOpusScreen
 import org.bilibilifocus.android.ui.FocusSearchScreen
+import org.bilibilifocus.android.ui.FocusSettingsScreen
 import org.bilibilifocus.android.ui.FocusUserScreen
+import org.bilibilifocus.android.ui.FocusUserCollectionScreen
 import org.bilibilifocus.android.ui.FocusVideoScreen
 import org.bilibilifocus.android.ui.FocusWebView
 import org.bilibilifocus.core.model.FavFolder
+import org.bilibilifocus.core.model.FocusEntry
+import org.bilibilifocus.core.model.FocusDynamicFilterKind
+import org.bilibilifocus.core.model.FocusSettings
 import org.bilibilifocus.core.model.SearchResultItem
+import org.bilibilifocus.core.model.UserContentCollection
 import org.bilibilifocus.core.service.AccountService
 import org.bilibilifocus.core.service.ArticleService
+import org.bilibilifocus.core.routing.ArticleURL
 import org.bilibilifocus.core.service.DynamicFeedService
 import org.bilibilifocus.core.service.FavoriteService
 import org.bilibilifocus.core.service.HistoryService
@@ -96,18 +109,41 @@ import org.bilibilifocus.core.service.VideoInfoService
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalHazeMaterialsApi::class)
 @Composable
-fun FocusApp() {
+fun FocusApp(settingsViewModel: FocusSettingsViewModel) {
     val widthClass = rememberFocusWindowClass()
-    val isWideLayout = widthClass != FocusWindowClass.Compact
+    val isWideLayout = widthClass == FocusWindowClass.Expanded
+    val settings by settingsViewModel.settings.collectAsState()
 
-    var selectedTab by remember { mutableIntStateOf(0) }
+    var selectedTab by rememberSaveable {
+        mutableIntStateOf(if (settings.defaultEntry == FocusEntry.SEARCH) 1 else 0)
+    }
     var showLogin by remember { mutableStateOf(false) }
+    var showSettings by remember { mutableStateOf(false) }
     var pendingSearchQuery by remember { mutableStateOf<String?>(null) }
+    var savedFeedFilterName by rememberSaveable {
+        mutableStateOf(FocusDynamicFilterKind.ALL.name)
+    }
     val overlayStack = remember { mutableStateListOf<OverlayRoute>() }
     val dynamicDetailStack = remember { mutableStateListOf<OverlayRoute>() }
 
     // 顶层持有状态，切 tab / 进出详情页都保留内容与滚动位置。
-    val feedViewModel = remember { FocusFeedViewModel(DynamicFeedService(AndroidCookieProvider(), KtorHttpClient())) }
+    val restoredFeedFilter = FocusDynamicFilterKind.entries.firstOrNull {
+        it.name == savedFeedFilterName
+    } ?: FocusDynamicFilterKind.ALL
+    val feedViewModel = remember {
+        FocusFeedViewModel(
+            service = DynamicFeedService(AndroidCookieProvider(), KtorHttpClient()),
+            initialSelectedFilter = restoredFeedFilter,
+        )
+    }
+    val feedState by feedViewModel.state.collectAsState()
+    val knownDynamicAuthors = remember(feedState) {
+        val cards = (feedState as? FeedUiState.Loaded)?.cards.orEmpty()
+        cards.map { it.author }
+            .filter { it.mid > 0 || it.name.isNotBlank() }
+            .distinctBy(FocusSettingsViewModel::authorFilterKey)
+            .sortedBy { it.name.lowercase() }
+    }
     val searchViewModel = remember { FocusSearchViewModel(SearchResultService(AndroidCookieProvider(), KtorHttpClient())) }
     val myViewModel = remember {
         FocusMyViewModel(
@@ -117,16 +153,17 @@ fun FocusApp() {
             favoriteService = FavoriteService(AndroidCookieProvider(), KtorHttpClient()),
         )
     }
-    val feedListState = rememberLazyListState()
+    val feedListState = rememberSaveable(saver = LazyListState.Saver) { LazyListState() }
     val myListState = rememberLazyListState()
     val videoViewModels = remember { mutableStateMapOf<String, FocusVideoViewModel>() }
     val videoScrollStates = remember { mutableStateMapOf<String, ScrollState>() }
     val opusViewModels = remember { mutableStateMapOf<String, FocusOpusViewModel>() }
     val opusListStates = remember { mutableStateMapOf<String, LazyListState>() }
     val articleViewModels = remember { mutableStateMapOf<Long, FocusArticleViewModel>() }
-    val articleScrollStates = remember { mutableStateMapOf<Long, ScrollState>() }
     val userViewModels = remember { mutableStateMapOf<Long, FocusUserViewModel>() }
     val userGridStates = remember { mutableStateMapOf<Long, LazyGridState>() }
+    val userCollectionViewModels = remember { mutableStateMapOf<String, FocusUserCollectionViewModel>() }
+    val userCollectionGridStates = remember { mutableStateMapOf<String, LazyGridState>() }
     val favFolderViewModels = remember { mutableStateMapOf<Long, FocusFavFolderViewModel>() }
     val favFolderGridStates = remember { mutableStateMapOf<Long, LazyGridState>() }
     val historyViewModels = remember { mutableStateMapOf<String, FocusHistoryViewModel>() }
@@ -160,9 +197,11 @@ fun FocusApp() {
         }
         val opusIdExtracted = extractOpusId(url)
         val cvid = extractArticleCvid(url)
+        val userMid = extractUserMid(url)
         return when {
             opusIdExtracted != null -> OverlayRoute.Opus(opusIdExtracted)
             cvid != null -> OverlayRoute.Article(cvid)
+            userMid != null -> OverlayRoute.User(userMid)
             else -> OverlayRoute.Web(url)
         }
     }
@@ -174,12 +213,19 @@ fun FocusApp() {
     val openSearchItem: (SearchResultItem) -> Unit = { item -> openInBrowser(item.targetURL) }
 
     BackHandler(enabled = overlayStack.isNotEmpty()) { popOverlay() }
-    BackHandler(enabled = overlayStack.isEmpty() && isWideLayout && selectedTab == 0 && dynamicDetailStack.isNotEmpty()) {
+    BackHandler(enabled = overlayStack.isEmpty() && selectedTab == 0 && dynamicDetailStack.isNotEmpty()) {
         popDynamicDetail()
     }
     BackHandler(enabled = showLogin) { showLogin = false }
+    BackHandler(enabled = showSettings) { showSettings = false }
 
-    val renderRoute: @Composable (OverlayRoute, () -> Unit, (Long) -> Unit, (String) -> Unit) -> Unit = { route, onBack, onOpenUserRoute, onOpenVideoRoute ->
+    val renderRoute: @Composable (
+        OverlayRoute,
+        () -> Unit,
+        (Long) -> Unit,
+        (String) -> Unit,
+        (OverlayRoute) -> Unit,
+    ) -> Unit = { route, onBack, onOpenUserRoute, onOpenVideoRoute, onOpenChildRoute ->
         when (route) {
             is OverlayRoute.Video -> {
                 val routeKey = route.key
@@ -201,6 +247,11 @@ fun FocusApp() {
                     onBack = onBack,
                     onOpenUser = onOpenUserRoute,
                     onOpenVideo = onOpenVideoRoute,
+                    onOpenURL = { url -> onOpenChildRoute(routeForUrl(url)) },
+                    nativeDanmakuEnabled = settings.nativeDanmakuEnabled,
+                    onNativeDanmakuEnabledChange = { enabled ->
+                        settingsViewModel.update { it.copy(nativeDanmakuEnabled = enabled) }
+                    },
                     viewModel = viewModel,
                     scrollState = scrollState,
                 )
@@ -221,6 +272,7 @@ fun FocusApp() {
                     onBack = onBack,
                     onOpenUser = onOpenUserRoute,
                     onOpenVideo = onOpenVideoRoute,
+                    onOpenURL = { url -> onOpenChildRoute(routeForUrl(url)) },
                     viewModel = viewModel,
                     listState = listState,
                 )
@@ -235,13 +287,13 @@ fun FocusApp() {
                         )
                     )
                 }
-                val scrollState = articleScrollStates.getOrPut(route.cvid) { ScrollState(0) }
                 FocusArticleScreen(
                     cvid = route.cvid,
                     onBack = onBack,
                     onOpenUser = onOpenUserRoute,
+                    onOpenURL = { url -> onOpenChildRoute(routeForUrl(url)) },
+                    onOpenWeb = { url -> onOpenChildRoute(OverlayRoute.Web(url)) },
                     viewModel = viewModel,
-                    scrollState = scrollState,
                 )
             }
 
@@ -257,6 +309,29 @@ fun FocusApp() {
                 val gridState = userGridStates.getOrPut(route.mid) { LazyGridState() }
                 FocusUserScreen(
                     userId = route.mid,
+                    onBack = onBack,
+                    onOpenVideo = onOpenVideoRoute,
+                    onOpenCollection = { collection ->
+                        onOpenChildRoute(OverlayRoute.UserCollection(collection))
+                    },
+                    onOpenArticle = { url -> onOpenChildRoute(routeForUrl(url)) },
+                    viewModel = viewModel,
+                    gridState = gridState,
+                )
+            }
+
+            is OverlayRoute.UserCollection -> {
+                val viewModel = userCollectionViewModels.getOrPut(route.collection.id) {
+                    FocusUserCollectionViewModel(
+                        service = UserService(
+                            cookieProvider = AndroidCookieProvider(),
+                            httpClient = KtorHttpClient(),
+                        )
+                    )
+                }
+                val gridState = userCollectionGridStates.getOrPut(route.collection.id) { LazyGridState() }
+                FocusUserCollectionScreen(
+                    collection = route.collection,
                     onBack = onBack,
                     onOpenVideo = onOpenVideoRoute,
                     viewModel = viewModel,
@@ -284,6 +359,7 @@ fun FocusApp() {
                     Box(modifier = Modifier.fillMaxSize().padding(innerPadding)) {
                         FocusWebView(
                             url = route.url,
+                            userScript = FocusScriptBuilder.buildUserScript(route.url, settings),
                             onUrlChanged = {},
                             onPageStarted = {},
                             onPageFinished = {},
@@ -327,33 +403,49 @@ fun FocusApp() {
         }
     }
 
+    // 同一个详情会在横屏分栏和竖屏覆盖层之间移动。保留其 Composition，
+    // 避免旋转时销毁并重建 FocusVideoScreen/ExoPlayer。
+    val currentRenderRoute by rememberUpdatedState(renderRoute)
+    val movableDynamicDetail = remember {
+        movableContentOf<OverlayRoute> { route ->
+            currentRenderRoute(
+                route,
+                { popDynamicDetail() },
+                openDynamicUser,
+                { url -> pushDynamicDetail(OverlayRoute.Video(url)) },
+                { childRoute -> pushDynamicDetail(childRoute) },
+            )
+        }
+    }
+
     Box(modifier = Modifier.fillMaxSize()) {
         if (isWideLayout && selectedTab == 0) {
             FocusDynamicTabletScaffold(
                 widthClass = widthClass,
                 selectedTab = selectedTab,
                 onSelectTab = { selectedTab = it },
+                onOpenSettings = { showSettings = true },
                 primaryContent = { contentPadding ->
                     FocusDynamicFeedScreen(
                         viewModel = feedViewModel,
                         listState = feedListState,
                         onOpenLogin = { showLogin = true },
-                        onOpenCard = { card -> openDynamicDetailUrl(card.targetURL) },
+                        onOpenCard = { card -> openDynamicDetailUrl(card.videoURL ?: card.targetURL) },
+                        onOpenUser = openDynamicUser,
                         onOpenSearch = { query ->
                             pendingSearchQuery = query
                             selectedTab = 1
                         },
+                        onSelectedFilterChange = { filter ->
+                            savedFeedFilterName = filter.name
+                        },
                         contentPadding = contentPadding,
+                        settings = settings,
                     )
                 },
                 detailContent = {
                     dynamicDetailStack.lastOrNull()?.let { route ->
-                        renderRoute(
-                            route,
-                            { popDynamicDetail() },
-                            openDynamicUser,
-                            { url -> pushDynamicDetail(OverlayRoute.Video(url)) },
-                        )
+                        movableDynamicDetail(route)
                     } ?: FocusDynamicDetailPlaceholder()
                 },
             )
@@ -362,6 +454,7 @@ fun FocusApp() {
                 widthClass = widthClass,
                 selectedTab = selectedTab,
                 onSelectTab = { selectedTab = it },
+                onOpenSettings = { showSettings = true },
             ) { contentPadding ->
                 FocusPrimaryTabContent(
                     selectedTab = selectedTab,
@@ -372,9 +465,13 @@ fun FocusApp() {
                     myListState = myListState,
                     onOpenLogin = { showLogin = true },
                     onOpenRouteFromUrl = openInBrowser,
+                    onOpenUser = openUser,
                     onSearchQueryFromFeed = { query ->
                         pendingSearchQuery = query
                         selectedTab = 1
+                    },
+                    onFeedFilterChange = { filter ->
+                        savedFeedFilterName = filter.name
                     },
                     onOpenSearchItem = openSearchItem,
                     initialQuery = pendingSearchQuery,
@@ -384,12 +481,14 @@ fun FocusApp() {
                     onOpenFolder = { pushOverlay(OverlayRoute.Folder(it.id, it.title)) },
                     contentPadding = contentPadding,
                     searchGridColumns = searchColumnsFor(widthClass),
+                    settings = settings,
                 )
             }
         } else {
             FocusCompactScaffold(
                 selectedTab = selectedTab,
                 onSelectTab = { selectedTab = it },
+                onOpenSettings = { showSettings = true },
             ) { contentPadding ->
                 FocusPrimaryTabContent(
                     selectedTab = selectedTab,
@@ -400,9 +499,13 @@ fun FocusApp() {
                     myListState = myListState,
                     onOpenLogin = { showLogin = true },
                     onOpenRouteFromUrl = openInBrowser,
+                    onOpenUser = openUser,
                     onSearchQueryFromFeed = { query ->
                         pendingSearchQuery = query
                         selectedTab = 1
+                    },
+                    onFeedFilterChange = { filter ->
+                        savedFeedFilterName = filter.name
                     },
                     onOpenSearchItem = openSearchItem,
                     initialQuery = pendingSearchQuery,
@@ -411,8 +514,15 @@ fun FocusApp() {
                     onOpenHistory = { pushOverlay(OverlayRoute.History) },
                     onOpenFolder = { pushOverlay(OverlayRoute.Folder(it.id, it.title)) },
                     contentPadding = contentPadding,
-                    searchGridColumns = 2,
+                    searchGridColumns = searchColumnsFor(widthClass),
+                    settings = settings,
                 )
+            }
+        }
+
+        if (!isWideLayout && selectedTab == 0) {
+            dynamicDetailStack.lastOrNull()?.let { route ->
+                movableDynamicDetail(route)
             }
         }
 
@@ -422,6 +532,23 @@ fun FocusApp() {
                 { popOverlay() },
                 openUser,
                 { url -> pushOverlay(OverlayRoute.Video(url)) },
+                { childRoute -> pushOverlay(childRoute) },
+            )
+        }
+
+        AnimatedVisibility(
+            visible = showSettings,
+            enter = fadeIn(),
+            exit = fadeOut(),
+        ) {
+            FocusSettingsScreen(
+                settings = settings,
+                knownAuthors = knownDynamicAuthors,
+                onBack = { showSettings = false },
+                onUpdate = settingsViewModel::update,
+                onSetAuthorKind = settingsViewModel::setDynamicKindEnabled,
+                authorKinds = settingsViewModel::dynamicKindsFor,
+                onReset = settingsViewModel::reset,
             )
         }
 
@@ -448,7 +575,9 @@ private fun FocusPrimaryTabContent(
     myListState: LazyListState,
     onOpenLogin: () -> Unit,
     onOpenRouteFromUrl: (String) -> Unit,
+    onOpenUser: (Long) -> Unit,
     onSearchQueryFromFeed: (String) -> Unit,
+    onFeedFilterChange: (FocusDynamicFilterKind) -> Unit,
     onOpenSearchItem: (SearchResultItem) -> Unit,
     initialQuery: String?,
     onInitialQueryConsumed: () -> Unit,
@@ -457,15 +586,19 @@ private fun FocusPrimaryTabContent(
     onOpenFolder: (FavFolder) -> Unit,
     contentPadding: PaddingValues,
     searchGridColumns: Int,
+    settings: FocusSettings,
 ) {
     when (selectedTab) {
         0 -> FocusDynamicFeedScreen(
             viewModel = feedViewModel,
             listState = feedListState,
             onOpenLogin = onOpenLogin,
-            onOpenCard = { card -> onOpenRouteFromUrl(card.targetURL) },
+            onOpenCard = { card -> onOpenRouteFromUrl(card.videoURL ?: card.targetURL) },
+            onOpenUser = onOpenUser,
             onOpenSearch = onSearchQueryFromFeed,
+            onSelectedFilterChange = onFeedFilterChange,
             contentPadding = contentPadding,
+            settings = settings,
         )
 
         1 -> FocusSearchScreen(
@@ -490,11 +623,12 @@ private fun FocusPrimaryTabContent(
     }
 }
 
-@OptIn(ExperimentalHazeMaterialsApi::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalHazeMaterialsApi::class)
 @Composable
 private fun FocusCompactScaffold(
     selectedTab: Int,
     onSelectTab: (Int) -> Unit,
+    onOpenSettings: () -> Unit,
     content: @Composable (PaddingValues) -> Unit,
 ) {
     val hazeState = remember { HazeState() }
@@ -502,12 +636,28 @@ private fun FocusCompactScaffold(
 
     Scaffold(
         topBar = {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .windowInsetsTopHeight(WindowInsets.statusBars)
-                    .hazeEffect(state = hazeState, style = hazeStyle),
-            )
+            Column(modifier = Modifier.hazeEffect(state = hazeState, style = hazeStyle)) {
+                CenterAlignedTopAppBar(
+                    title = {
+                        Text(
+                            primaryDestinations.getOrNull(selectedTab)?.label ?: "Bilibili Focus",
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    },
+                    actions = {
+                        IconButton(onClick = onOpenSettings) {
+                            Icon(Icons.Outlined.Settings, contentDescription = "设置")
+                        }
+                    },
+                    colors = TopAppBarDefaults.centerAlignedTopAppBarColors(
+                        containerColor = Color.Transparent,
+                        titleContentColor = MaterialTheme.colorScheme.onSurface,
+                        actionIconContentColor = MaterialTheme.colorScheme.onSurface,
+                    ),
+                )
+                HorizontalDivider(thickness = 0.5.dp, color = Color.Black.copy(alpha = 0.06f))
+            }
         },
         bottomBar = {
             Column(modifier = Modifier.hazeEffect(state = hazeState, style = hazeStyle)) {
@@ -551,6 +701,7 @@ private fun FocusTabletScaffold(
     widthClass: FocusWindowClass,
     selectedTab: Int,
     onSelectTab: (Int) -> Unit,
+    onOpenSettings: () -> Unit,
     content: @Composable (PaddingValues) -> Unit,
 ) {
     Column(
@@ -567,6 +718,7 @@ private fun FocusTabletScaffold(
             FocusPrimaryNavigationRail(
                 selectedTab = selectedTab,
                 onSelectTab = onSelectTab,
+                onOpenSettings = onOpenSettings,
                 modifier = Modifier.fillMaxHeight(),
             )
 
@@ -580,7 +732,8 @@ private fun FocusTabletScaffold(
             ) {
                 Box(
                     modifier = Modifier
-                        .width(tabletContentWidthFor(widthClass, selectedTab))
+                        .widthIn(max = tabletContentWidthFor(widthClass, selectedTab))
+                        .fillMaxWidth()
                         .fillMaxHeight(),
                 ) {
                     content(PaddingValues(bottom = 18.dp))
@@ -595,6 +748,7 @@ private fun FocusDynamicTabletScaffold(
     widthClass: FocusWindowClass,
     selectedTab: Int,
     onSelectTab: (Int) -> Unit,
+    onOpenSettings: () -> Unit,
     primaryContent: @Composable (PaddingValues) -> Unit,
     detailContent: @Composable () -> Unit,
 ) {
@@ -612,6 +766,7 @@ private fun FocusDynamicTabletScaffold(
             FocusPrimaryNavigationRail(
                 selectedTab = selectedTab,
                 onSelectTab = onSelectTab,
+                onOpenSettings = onOpenSettings,
                 modifier = Modifier.fillMaxHeight(),
             )
 
@@ -643,6 +798,7 @@ private fun FocusDynamicTabletScaffold(
 private fun FocusPrimaryNavigationRail(
     selectedTab: Int,
     onSelectTab: (Int) -> Unit,
+    onOpenSettings: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     NavigationRail(
@@ -680,6 +836,25 @@ private fun FocusPrimaryNavigationRail(
             )
             Spacer(modifier = Modifier.height(12.dp))
         }
+        Spacer(modifier = Modifier.weight(1f))
+        NavigationRailItem(
+            selected = false,
+            onClick = onOpenSettings,
+            icon = {
+                Icon(
+                    imageVector = Icons.Outlined.Settings,
+                    contentDescription = "设置",
+                    modifier = Modifier.size(28.dp),
+                )
+            },
+            label = { Text("设置", style = MaterialTheme.typography.labelLarge) },
+            alwaysShowLabel = true,
+            colors = NavigationRailItemDefaults.colors(
+                unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant,
+            ),
+        )
+        Spacer(modifier = Modifier.height(18.dp))
     }
 }
 
@@ -708,10 +883,10 @@ private fun FocusDynamicDetailPlaceholder() {
 
 @Composable
 private fun rememberFocusWindowClass(): FocusWindowClass {
-    val widthDp = LocalConfiguration.current.smallestScreenWidthDp
+    val widthDp = LocalConfiguration.current.screenWidthDp
     return when {
         widthDp < 600 -> FocusWindowClass.Compact
-        widthDp < 840 -> FocusWindowClass.Medium
+        widthDp < 1000 -> FocusWindowClass.Medium
         else -> FocusWindowClass.Expanded
     }
 }
@@ -784,8 +959,22 @@ private fun extractOpusId(url: String): String? {
 }
 
 private fun extractArticleCvid(url: String): Long? {
-    Regex("""bilibili\.com/read/cv(\d+)""").find(url)?.groupValues?.getOrNull(1)?.toLongOrNull()?.let { return it }
-    Regex("""www\.bilibili\.com/read/cv(\d+)""").find(url)?.groupValues?.getOrNull(1)?.toLongOrNull()?.let { return it }
+    return ArticleURL.extractCvid(url)
+}
+
+private fun extractUserMid(url: String): Long? {
+    Regex("""(?:https?:)?//space\.bilibili\.com/(\d+)""", RegexOption.IGNORE_CASE)
+        .find(url)
+        ?.groupValues
+        ?.getOrNull(1)
+        ?.toLongOrNull()
+        ?.let { return it }
+    Regex("""bilibili://space/(\d+)""", RegexOption.IGNORE_CASE)
+        .find(url)
+        ?.groupValues
+        ?.getOrNull(1)
+        ?.toLongOrNull()
+        ?.let { return it }
     return null
 }
 
@@ -806,6 +995,10 @@ private sealed interface OverlayRoute {
 
     data class User(val mid: Long) : OverlayRoute {
         override val key: String = "user:$mid"
+    }
+
+    data class UserCollection(val collection: UserContentCollection) : OverlayRoute {
+        override val key: String = "user-collection:${collection.id}"
     }
 
     data class Web(val url: String) : OverlayRoute {

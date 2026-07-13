@@ -4,9 +4,9 @@ import SwiftUI
 import UIKit
 
 private enum FocusDesign {
-    static let primary = Color(red: 0.984, green: 0.447, blue: 0.600) // Bilibili pink #FB7299
-    static let primaryLight = primary.opacity(0.12)
-    static let primaryStroke = primary.opacity(0.22)
+    static var primary: Color { .accentColor }
+    static var primaryLight: Color { primary.opacity(0.12) }
+    static var primaryStroke: Color { primary.opacity(0.22) }
     static let tabInactive = Color(red: 0.55, green: 0.58, blue: 0.63) // #8C94A1
     static let videoControlForeground = Color(uiColor: .label)
     static let chromeButtonBackground = Color(uiColor: .secondarySystemBackground)
@@ -26,15 +26,19 @@ struct FocusBrowserView: View {
     var body: some View {
         NavigationStack {
             ZStack {
-                browserLayer
-                nativeContentLayer
+                persistentDynamicFeedLayer
+
+                ZStack {
+                    browserLayer
+                    activeNativeContentLayer
+                }
+                .padding(
+                    .bottom,
+                    (viewModel.isBrowserActive || viewModel.isNativeVideoActive)
+                        ? bottomChromeContentInset(safeAreaBottom: FocusWindowMetrics.safeAreaBottom)
+                        : 0
+                )
             }
-            .padding(
-                .bottom,
-                viewModel.isBrowserActive
-                    ? bottomChromeContentInset(safeAreaBottom: FocusWindowMetrics.safeAreaBottom)
-                    : 0
-            )
             .overlay(alignment: .leading) {
                 if viewModel.showsBackButton {
                     FocusEdgeSwipeBackArea {
@@ -69,7 +73,7 @@ struct FocusBrowserView: View {
 
                 ToolbarItem(placement: .topBarTrailing) {
                     HStack(spacing: 12) {
-                        if viewModel.isBrowserActive {
+                        if viewModel.isBrowserActive || viewModel.isNativeVideoActive {
                             Button {
                                 viewModel.reloadCurrent()
                             } label: {
@@ -115,6 +119,12 @@ struct FocusBrowserView: View {
             .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
                 viewModel.handleAppDidBecomeActive()
             }
+            .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
+                viewModel.handleAppWillResignActive()
+            }
+            .onChange(of: settingsStore.settings.nativeDanmakuEnabled) { enabled in
+                viewModel.applyNativeDanmakuPreference(enabled)
+            }
             .task {
                 viewModel.handleLaunchEntryIfNeeded()
             }
@@ -153,23 +163,42 @@ struct FocusBrowserView: View {
     }
 
     @ViewBuilder
-    private var nativeContentLayer: some View {
-        switch viewModel.route {
-        case .dynamicFeed:
+    private var persistentDynamicFeedLayer: some View {
+        if viewModel.hasDynamicFeedRoot {
             FocusDynamicFeedView(
                 viewModel: viewModel.dynamicFeedViewModel,
                 settingsStore: settingsStore,
+                isActive: viewModel.isDynamicFeedActive,
                 searchPrompt: viewModel.searchKeyword.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                     ? "搜索视频、UP主、直播"
                     : viewModel.searchKeyword,
                 onOpenCard: { card in
                     viewModel.open(card: card)
                 },
+                onOpenUser: { mid in
+                    guard mid > 0,
+                          let url = URL(string: "https://space.bilibili.com/\(mid)")
+                    else {
+                        return
+                    }
+                    viewModel.openNativeUserSpace(url)
+                },
                 onOpenLogin: viewModel.openLogin,
                 onSearch: {
                     viewModel.presentSearchEntry()
                 }
             )
+            .opacity(viewModel.isDynamicFeedActive ? 1 : 0)
+            .allowsHitTesting(viewModel.isDynamicFeedActive)
+            .accessibilityHidden(!viewModel.isDynamicFeedActive)
+        }
+    }
+
+    @ViewBuilder
+    private var activeNativeContentLayer: some View {
+        switch viewModel.route {
+        case .dynamicFeed:
+            EmptyView()
         case .searchResults:
             FocusSearchResultsView(
                 viewModel: viewModel.searchResultsViewModel,
@@ -237,13 +266,34 @@ struct FocusBrowserView: View {
                         return
                     }
                     viewModel.openNativeUserSpace(url)
-                }
+                },
+                onOpenURL: { url in viewModel.openOpusRelatedURL(url) },
+                onOpenWeb: { url in viewModel.openArticleInBrowser(url) }
             )
         case let .opus(routeID, _):
             FocusOpusDetailView(
                 viewModel: viewModel.opusDetailViewModel(for: routeID),
                 onOpenURL: { url in
                     viewModel.openOpusRelatedURL(url)
+                }
+            )
+        case let .video(routeID, _):
+            FocusNativeVideoDetailView(
+                viewModel: viewModel.videoViewModel(for: routeID),
+                onOpenUser: { mid in
+                    guard let url = URL(string: "https://space.bilibili.com/\(mid)") else {
+                        return
+                    }
+                    viewModel.openNativeUserSpace(url)
+                },
+                onOpenVideo: { url in
+                    viewModel.openNativeVideo(url)
+                },
+                onOpenURL: { url in
+                    viewModel.openOpusRelatedURL(url)
+                },
+                onOpenWeb: { url in
+                    viewModel.openVideoInBrowser(url)
                 }
             )
         case .browser:
@@ -253,10 +303,19 @@ struct FocusBrowserView: View {
 
     private func bottomChrome(safeAreaBottom: CGFloat) -> some View {
         let tabBottomPadding = bottomTabBarPadding(safeAreaBottom: safeAreaBottom)
-        let tabTopPadding = viewModel.isBrowserActive && viewModel.browserViewModel.showsNativeVideoControls ? 2.0 : 3.0
+        let hasVideoControls = (viewModel.isBrowserActive && viewModel.browserViewModel.showsNativeVideoControls)
+            || (viewModel.activeNativeVideoViewModel?.showsPlaybackControls == true)
+        let tabTopPadding = hasVideoControls ? 2.0 : 3.0
 
         return VStack(spacing: 0) {
-            if viewModel.isBrowserActive, viewModel.browserViewModel.showsNativeVideoControls {
+            if let nativeVideoViewModel = viewModel.activeNativeVideoViewModel,
+               nativeVideoViewModel.showsPlaybackControls
+            {
+                FocusNativeVideoControlDock(viewModel: nativeVideoViewModel)
+                    .padding(.horizontal, 12)
+                    .padding(.top, 8)
+                    .padding(.bottom, 8)
+            } else if viewModel.isBrowserActive, viewModel.browserViewModel.showsNativeVideoControls {
                 videoControls
                     .padding(.horizontal, 12)
                     .padding(.top, 8)
@@ -281,6 +340,9 @@ struct FocusBrowserView: View {
 
     private func bottomChromeContentInset(safeAreaBottom: CGFloat) -> CGFloat {
         let tabInset = 54 + bottomTabBarPadding(safeAreaBottom: safeAreaBottom)
+        if viewModel.activeNativeVideoViewModel?.showsPlaybackControls == true {
+            return tabInset + 74
+        }
         if viewModel.isBrowserActive, viewModel.browserViewModel.showsNativeVideoControls {
             return tabInset + 74
         }
@@ -525,16 +587,20 @@ private struct FocusScrollBounceDisabler: UIViewRepresentable {
 private struct FocusDynamicFeedView: View {
     @ObservedObject var viewModel: FocusDynamicFeedViewModel
     @ObservedObject var settingsStore: FocusSettingsStore
+    let isActive: Bool
     let searchPrompt: String
     let onOpenCard: (DynamicCard) -> Void
+    let onOpenUser: (Int64) -> Void
     let onOpenLogin: () -> Void
     let onSearch: () -> Void
-    @State private var selectedFilter: FocusDynamicFilterKind = .all
-
+    @State private var galleryRequest: FocusImageGalleryRequest?
     var body: some View {
         content
             .task {
                 viewModel.loadIfNeeded()
+            }
+            .fullScreenCover(item: $galleryRequest) { request in
+                FocusImageGalleryView(request: request)
             }
     }
 
@@ -555,7 +621,15 @@ private struct FocusDynamicFeedView: View {
                         action: onSearch
                     )
 
-                    Picker("动态分类", selection: $selectedFilter) {
+                    Picker(
+                        "动态分类",
+                        selection: Binding(
+                            get: { viewModel.selectedFilter },
+                            set: { filter in
+                                viewModel.selectFilter(filter)
+                            }
+                        )
+                    ) {
                         ForEach(FocusDynamicFilterKind.allCases, id: \.self) { filter in
                             Text(filter.title).tag(filter)
                         }
@@ -584,12 +658,18 @@ private struct FocusDynamicFeedView: View {
                         )
                     } else {
                         ForEach(filteredCards) { card in
-                            Button {
-                                onOpenCard(card)
-                            } label: {
-                                FocusDynamicCardView(card: card)
-                            }
-                            .buttonStyle(.plain)
+                            FocusDynamicCardView(
+                                card: card,
+                                onOpenCard: { onOpenCard(card) },
+                                onOpenUser: onOpenUser,
+                                onOpenImage: { index in
+                                    galleryRequest = FocusImageGalleryRequest(
+                                        urls: card.coverURLs,
+                                        initialIndex: index,
+                                        referer: card.targetURL.absoluteString
+                                    )
+                                }
+                            )
                             .onAppear {
                                 viewModel.loadMoreIfNeeded(currentCardID: card.id)
                             }
@@ -605,6 +685,17 @@ private struct FocusDynamicFeedView: View {
                 .padding(.horizontal, 16)
                 .padding(.top, 14)
                 .padding(.bottom, 126)
+                .background {
+                    FocusDynamicFeedScrollBridge(
+                        offsetY: viewModel.scrollOffsetY,
+                        restorationRevision: viewModel.scrollRestorationRevision,
+                        isActive: isActive,
+                        onOffsetChange: { offsetY in
+                            viewModel.updateScrollOffset(offsetY)
+                        }
+                    )
+                    .frame(width: 1, height: 1)
+                }
             }
             .background(Color(uiColor: .systemGroupedBackground))
             .id("dynamic-feed-scroll")
@@ -651,7 +742,7 @@ private struct FocusDynamicFeedView: View {
             guard authorKinds.contains(normalizedKind) else {
                 return false
             }
-            switch selectedFilter {
+            switch viewModel.selectedFilter {
             case .all:
                 return true
             case .video:
@@ -672,58 +763,347 @@ private struct FocusDynamicFeedView: View {
     }
 }
 
+enum FocusDynamicFeedScrollRestorationPolicy {
+    struct Placement: Equatable {
+        let contentOffsetY: CGFloat
+        let normalizedOffsetY: CGFloat
+        let reachedTarget: Bool
+    }
+
+    static func shouldPersistObservedOffset(
+        isTracking: Bool,
+        isDragging: Bool,
+        isDecelerating: Bool,
+        isPanActive: Bool
+    ) -> Bool {
+        isTracking || isDragging || isDecelerating || isPanActive
+    }
+
+    static func normalizedOffset(contentOffsetY: CGFloat, minimumY: CGFloat) -> CGFloat {
+        max(contentOffsetY - minimumY, 0)
+    }
+
+    static func placement(
+        requestedOffsetY: CGFloat,
+        minimumY: CGFloat,
+        maximumY: CGFloat
+    ) -> Placement {
+        let normalizedRequest = max(requestedOffsetY, 0)
+        let maximumOffsetY = max(maximumY - minimumY, 0)
+        let restoredOffsetY = min(normalizedRequest, maximumOffsetY)
+        return Placement(
+            contentOffsetY: minimumY + restoredOffsetY,
+            normalizedOffsetY: restoredOffsetY,
+            reachedTarget: normalizedRequest <= maximumOffsetY + 1
+        )
+    }
+}
+
+private struct FocusDynamicFeedScrollBridge: UIViewRepresentable {
+    let offsetY: CGFloat
+    let restorationRevision: Int
+    let isActive: Bool
+    let onOffsetChange: @MainActor (CGFloat) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    func makeUIView(context: Context) -> FocusDynamicFeedScrollProbeView {
+        let view = FocusDynamicFeedScrollProbeView()
+        view.isUserInteractionEnabled = false
+        context.coordinator.update(
+            probe: view,
+            offsetY: offsetY,
+            restorationRevision: restorationRevision,
+            isActive: isActive,
+            onOffsetChange: onOffsetChange
+        )
+        return view
+    }
+
+    func updateUIView(_ uiView: FocusDynamicFeedScrollProbeView, context: Context) {
+        context.coordinator.update(
+            probe: uiView,
+            offsetY: offsetY,
+            restorationRevision: restorationRevision,
+            isActive: isActive,
+            onOffsetChange: onOffsetChange
+        )
+    }
+
+    static func dismantleUIView(
+        _ uiView: FocusDynamicFeedScrollProbeView,
+        coordinator: Coordinator
+    ) {
+        uiView.onDidMoveToWindow = nil
+        coordinator.detach()
+    }
+
+    @MainActor
+    final class Coordinator {
+        private weak var scrollView: UIScrollView?
+        private var observation: NSKeyValueObservation?
+        private var restorationWorkItem: DispatchWorkItem?
+        private var appliedRestorationRevision: Int?
+        private var requestedOffsetY: CGFloat = 0
+        private var restorationRevision = 0
+        private var restorationGeneration = 0
+        private var isActive = false
+        private var onOffsetChange: (@MainActor (CGFloat) -> Void)?
+
+        func update(
+            probe: FocusDynamicFeedScrollProbeView,
+            offsetY: CGFloat,
+            restorationRevision: Int,
+            isActive: Bool,
+            onOffsetChange: @escaping @MainActor (CGFloat) -> Void
+        ) {
+            let shouldFreezeCurrentPosition = self.isActive && !isActive
+            requestedOffsetY = max(offsetY, 0)
+            self.restorationRevision = restorationRevision
+            self.isActive = isActive
+            self.onOffsetChange = onOffsetChange
+            if shouldFreezeCurrentPosition {
+                freezeCurrentPosition()
+            }
+            probe.onDidMoveToWindow = { [weak self] probe in
+                guard probe.window != nil else {
+                    self?.detach()
+                    return
+                }
+                self?.attachIfPossible(from: probe)
+            }
+            DispatchQueue.main.async { [weak self, weak probe] in
+                guard let self, let probe, probe.window != nil else {
+                    return
+                }
+                self.attachIfPossible(from: probe)
+            }
+        }
+
+        private func attachIfPossible(from probe: UIView) {
+            guard probe.window != nil,
+                  let resolvedScrollView = probe.enclosingScrollView
+            else {
+                return
+            }
+            if scrollView !== resolvedScrollView {
+                detach()
+                scrollView = resolvedScrollView
+                appliedRestorationRevision = nil
+                observation = resolvedScrollView.observe(\.contentOffset, options: [.new]) { [weak self] scrollView, change in
+                    // UIScrollView can only mutate its geometry on the main thread, so
+                    // its synchronous KVO callback is safe to handle on MainActor.
+                    MainActor.assumeIsolated {
+                        guard let self else {
+                            return
+                        }
+                        guard self.isActive else {
+                            return
+                        }
+                        // SwiftUI may change contentOffset while removing the hierarchy
+                        // or recalculating safe-area insets. Only a gesture-driven change
+                        // is a position the user intentionally chose and is safe to persist.
+                        let panState = scrollView.panGestureRecognizer.state
+                        let isUserDriven = FocusDynamicFeedScrollRestorationPolicy.shouldPersistObservedOffset(
+                            isTracking: scrollView.isTracking,
+                            isDragging: scrollView.isDragging,
+                            isDecelerating: scrollView.isDecelerating,
+                            isPanActive: panState == .began || panState == .changed
+                        )
+                        guard isUserDriven else {
+                            return
+                        }
+                        let contentOffsetY = change.newValue?.y ?? scrollView.contentOffset.y
+                        let minimumY = -scrollView.adjustedContentInset.top
+                        let normalizedOffsetY = FocusDynamicFeedScrollRestorationPolicy.normalizedOffset(
+                            contentOffsetY: contentOffsetY,
+                            minimumY: minimumY
+                        )
+                        // A real gesture wins over a pending delayed restoration.
+                        self.cancelRestoration()
+                        self.requestedOffsetY = normalizedOffsetY
+                        self.onOffsetChange?(normalizedOffsetY)
+                    }
+                }
+            }
+            guard appliedRestorationRevision != restorationRevision else {
+                return
+            }
+            appliedRestorationRevision = restorationRevision
+            startRestoration()
+        }
+
+        func detach() {
+            cancelRestoration()
+            observation?.invalidate()
+            observation = nil
+            scrollView = nil
+            appliedRestorationRevision = nil
+        }
+
+        private func startRestoration() {
+            cancelRestoration()
+            restorationGeneration &+= 1
+            restoreOffset(attempt: 0, generation: restorationGeneration)
+        }
+
+        private func cancelRestoration() {
+            restorationGeneration &+= 1
+            restorationWorkItem?.cancel()
+            restorationWorkItem = nil
+        }
+
+        private func freezeCurrentPosition() {
+            guard let scrollView else {
+                return
+            }
+
+            cancelRestoration()
+            let contentOffset = scrollView.contentOffset
+            scrollView.setContentOffset(contentOffset, animated: false)
+            let minimumY = -scrollView.adjustedContentInset.top
+            let normalizedOffsetY = FocusDynamicFeedScrollRestorationPolicy.normalizedOffset(
+                contentOffsetY: contentOffset.y,
+                minimumY: minimumY
+            )
+            requestedOffsetY = normalizedOffsetY
+            onOffsetChange?(normalizedOffsetY)
+        }
+
+        private func restoreOffset(attempt: Int, generation: Int) {
+            guard generation == restorationGeneration,
+                  let scrollView,
+                  scrollView.window != nil
+            else {
+                return
+            }
+
+            scrollView.layoutIfNeeded()
+            let minimumY = -scrollView.adjustedContentInset.top
+            let maximumY = max(
+                minimumY,
+                scrollView.contentSize.height
+                    - scrollView.bounds.height
+                    + scrollView.adjustedContentInset.bottom
+            )
+            let placement = FocusDynamicFeedScrollRestorationPolicy.placement(
+                requestedOffsetY: requestedOffsetY,
+                minimumY: minimumY,
+                maximumY: maximumY
+            )
+            scrollView.setContentOffset(
+                CGPoint(x: scrollView.contentOffset.x, y: placement.contentOffsetY),
+                animated: false
+            )
+
+            guard !placement.reachedTarget else {
+                restorationWorkItem = nil
+                return
+            }
+
+            // LazyVStack initially reports only a partial content height. Keep the
+            // original target intact while it materializes instead of saving the
+            // temporary clamped offset and jumping to it on the next update.
+            guard attempt < 30 else {
+                restorationWorkItem = nil
+                requestedOffsetY = placement.normalizedOffsetY
+                onOffsetChange?(placement.normalizedOffsetY)
+                return
+            }
+
+            let workItem = DispatchWorkItem { [weak self] in
+                guard let self else {
+                    return
+                }
+                self.restoreOffset(attempt: attempt + 1, generation: generation)
+            }
+            restorationWorkItem = workItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: workItem)
+        }
+    }
+}
+
+private final class FocusDynamicFeedScrollProbeView: UIView {
+    var onDidMoveToWindow: ((FocusDynamicFeedScrollProbeView) -> Void)?
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        onDidMoveToWindow?(self)
+    }
+}
+
+private extension UIView {
+    var enclosingScrollView: UIScrollView? {
+        var candidate = superview
+        while let current = candidate {
+            if let scrollView = current as? UIScrollView {
+                return scrollView
+            }
+            candidate = current.superview
+        }
+        return nil
+    }
+}
+
 private struct FocusDynamicCardView: View {
     let card: DynamicCard
+    let onOpenCard: () -> Void
+    let onOpenUser: (Int64) -> Void
+    let onOpenImage: (Int) -> Void
+    @State private var areImagesExpanded = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 12) {
-                avatar
+                Button {
+                    guard card.author.mid > 0 else {
+                        return
+                    }
+                    onOpenUser(card.author.mid)
+                } label: {
+                    avatar
+                }
+                .buttonStyle(.plain)
+                .disabled(card.author.mid <= 0)
+                .accessibilityLabel("打开\(card.author.name)的个人主页")
 
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(card.author.name)
-                        .font(.headline)
-                        .foregroundStyle(.primary)
+                Button(action: onOpenCard) {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(card.author.name)
+                                .font(.headline)
+                                .foregroundStyle(.primary)
 
-                    HStack(spacing: 8) {
-                        if !card.publishTime.isEmpty {
-                            Text(card.publishTime)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                            HStack(spacing: 8) {
+                                if !card.publishTime.isEmpty {
+                                    Text(card.publishTime)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+
+                                FocusKindBadge(kind: card.kind)
+                            }
                         }
 
-                        FocusKindBadge(kind: card.kind)
+                        Spacer(minLength: 0)
                     }
+                    .contentShape(Rectangle())
                 }
-
-                Spacer(minLength: 0)
+                .buttonStyle(.plain)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
 
             if !card.text.isEmpty {
-                Text(card.text)
-                    .font(.body)
-                    .foregroundStyle(.primary)
-                    .multilineTextAlignment(.leading)
+                FocusExpandableDynamicText(
+                    text: card.text,
+                    onOpenCard: onOpenCard
+                )
             }
 
             if !card.coverURLs.isEmpty {
-                if let firstURL = card.coverURLs.first, card.coverURLs.count == 1 {
-                    FocusDynamicMediaCover(
-                        url: firstURL,
-                        referer: card.targetURL.absoluteString,
-                        height: 176
-                    )
-                } else {
-                    LazyVGrid(columns: coverColumns, spacing: 10) {
-                        ForEach(Array(card.coverURLs.enumerated()), id: \.offset) { item in
-                            FocusDynamicMediaCover(
-                                url: item.element,
-                                referer: card.targetURL.absoluteString,
-                                height: coverHeight(for: card.coverURLs.count, index: item.offset)
-                            )
-                        }
-                    }
-                }
+                covers
             }
         }
         .padding(16)
@@ -735,8 +1115,58 @@ private struct FocusDynamicCardView: View {
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
     }
 
-    private var coverColumns: [GridItem] {
-        let count = card.coverURLs.count
+    @ViewBuilder
+    private var covers: some View {
+        let canFoldImages = card.kind == .image && card.coverURLs.count > 4
+        let visibleCoverURLs = canFoldImages && !areImagesExpanded
+            ? Array(card.coverURLs.prefix(4))
+            : card.coverURLs
+
+        if let firstURL = visibleCoverURLs.first, visibleCoverURLs.count == 1 {
+            FocusDynamicMediaCover(
+                url: firstURL,
+                referer: card.targetURL.absoluteString,
+                height: 176
+            )
+            .contentShape(Rectangle())
+            .onTapGesture {
+                card.kind == .image ? onOpenImage(0) : onOpenCard()
+            }
+        } else {
+            LazyVGrid(columns: coverColumns(for: visibleCoverURLs.count), spacing: 10) {
+                ForEach(Array(visibleCoverURLs.enumerated()), id: \.offset) { item in
+                    FocusDynamicMediaCover(
+                        url: item.element,
+                        referer: card.targetURL.absoluteString,
+                        height: coverHeight(for: visibleCoverURLs.count, index: item.offset)
+                    )
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        card.kind == .image ? onOpenImage(item.offset) : onOpenCard()
+                    }
+                }
+            }
+        }
+
+        if canFoldImages {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    areImagesExpanded.toggle()
+                }
+            } label: {
+                Label(
+                    areImagesExpanded ? "收起图片" : "展开全部 \(card.coverURLs.count) 张图片",
+                    systemImage: areImagesExpanded ? "chevron.up" : "chevron.down"
+                )
+                .font(.subheadline.weight(.semibold))
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(FocusDesign.primary)
+        }
+    }
+
+    private func coverColumns(for count: Int) -> [GridItem] {
         let columnCount = count == 1 ? 1 : 2
         return Array(repeating: GridItem(.flexible(), spacing: 10), count: columnCount)
     }
@@ -778,6 +1208,108 @@ private struct FocusDynamicCardView: View {
                         .foregroundStyle(.secondary)
                 )
         }
+    }
+}
+
+private struct FocusExpandableDynamicText: View {
+    let text: String
+    let onOpenCard: () -> Void
+    @State private var isExpanded = false
+    @State private var collapsedHeight: CGFloat = 0
+    @State private var fullHeight: CGFloat = 0
+
+    private var canFold: Bool {
+        fullHeight > collapsedHeight + 0.5
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(text)
+                .font(.body)
+                .foregroundStyle(.primary)
+                .multilineTextAlignment(.leading)
+                .lineLimit(isExpanded ? nil : 6)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+                .onTapGesture(perform: onOpenCard)
+                .background {
+                    FocusDynamicTextMeasurement(text: text)
+                }
+                .onPreferenceChange(FocusCollapsedDynamicTextHeightKey.self) { height in
+                    collapsedHeight = height
+                }
+                .onPreferenceChange(FocusFullDynamicTextHeightKey.self) { height in
+                    fullHeight = height
+                }
+
+            if canFold || isExpanded {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        isExpanded.toggle()
+                    }
+                } label: {
+                    Text(isExpanded ? "收起文本" : "展开全文")
+                        .font(.subheadline.weight(.semibold))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(FocusDesign.primary)
+            }
+        }
+    }
+}
+
+private struct FocusDynamicTextMeasurement: View {
+    let text: String
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            Text(text)
+                .font(.body)
+                .lineLimit(6)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .hidden()
+                .background {
+                    GeometryReader { proxy in
+                        Color.clear.preference(
+                            key: FocusCollapsedDynamicTextHeightKey.self,
+                            value: proxy.size.height
+                        )
+                    }
+                }
+
+            Text(text)
+                .font(.body)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .hidden()
+                .background {
+                    GeometryReader { proxy in
+                        Color.clear.preference(
+                            key: FocusFullDynamicTextHeightKey.self,
+                            value: proxy.size.height
+                        )
+                    }
+                }
+        }
+        .allowsHitTesting(false)
+    }
+}
+
+private struct FocusCollapsedDynamicTextHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+private struct FocusFullDynamicTextHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
     }
 }
 
@@ -2629,6 +3161,8 @@ private struct FocusUserCollectionHeroCard: View {
 private struct FocusArticleView: View {
     @ObservedObject var viewModel: FocusArticleViewModel
     let onOpenUser: (Int64) -> Void
+    let onOpenURL: (URL) -> Void
+    let onOpenWeb: (URL) -> Void
 
     var body: some View {
         content
@@ -2651,6 +3185,7 @@ private struct FocusArticleView: View {
                 buttonTitle: "重新加载",
                 action: viewModel.reload
             )
+            .overlay(alignment: .bottom) { openArticleOnWebButton }
 
         case let .failed(message):
             FocusStateView(
@@ -2659,10 +3194,11 @@ private struct FocusArticleView: View {
                 buttonTitle: "重试",
                 action: viewModel.reload
             )
+            .overlay(alignment: .bottom) { openArticleOnWebButton }
 
         case let .loaded(page):
             ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
+                LazyVStack(alignment: .leading, spacing: 16) {
                     if page.bannerURL != nil {
                         FocusRemoteImage(url: page.bannerURL, referer: "https://www.bilibili.com/read/cv\(page.cvid)") { phase in
                             switch phase {
@@ -2709,10 +3245,12 @@ private struct FocusArticleView: View {
                         }
                     }
 
-                    if !page.paragraphs.isEmpty {
-                        ForEach(page.paragraphs) { paragraph in
-                            FocusOpusParagraphCard(paragraph: paragraph)
-                        }
+                    ForEach(Array(page.blocks.enumerated()), id: \.offset) { _, block in
+                        FocusArticleBlockView(
+                            block: block,
+                            referer: page.originalURL.absoluteString,
+                            onOpenURL: onOpenURL
+                        )
                     }
                 }
                 .padding(.horizontal, 16)
@@ -2721,6 +3259,110 @@ private struct FocusArticleView: View {
             }
             .background(FocusScrollBounceDisabler())
             .background(Color(uiColor: .systemGroupedBackground))
+        }
+    }
+
+    @ViewBuilder
+    private var openArticleOnWebButton: some View {
+        if let url = viewModel.originalURL {
+            Button {
+                onOpenWeb(url)
+            } label: {
+                Label("在网页中打开", systemImage: "safari")
+            }
+            .buttonStyle(.bordered)
+            .padding(.bottom, 32)
+        }
+    }
+}
+
+private struct FocusArticleBlockView: View {
+    let block: FocusArticleBlock
+    let referer: String
+    let onOpenURL: (URL) -> Void
+
+    var body: some View {
+        switch block {
+        case let .paragraph(runs, alignment):
+            FocusInlineRichText(runs: runs, onOpenURL: onOpenURL)
+                .frame(maxWidth: .infinity, alignment: frameAlignment(alignment))
+        case let .heading(runs, level):
+            FocusInlineRichText(
+                runs: runs,
+                font: level <= 1 ? .title2.weight(.bold) : level == 2 ? .title3.weight(.bold) : .headline,
+                onOpenURL: onOpenURL
+            )
+            .padding(.top, 4)
+        case let .image(url, width, height, caption):
+            VStack(alignment: .leading, spacing: 6) {
+                FocusRemoteImage(url: url, referer: referer) { phase in
+                    switch phase {
+                    case let .success(image): image.resizable().scaledToFit()
+                    case .failure:
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(Color(uiColor: .tertiarySystemFill))
+                            .overlay(Image(systemName: "photo").foregroundStyle(.secondary))
+                    case .empty:
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(Color(uiColor: .tertiarySystemFill))
+                            .overlay(ProgressView())
+                    }
+                }
+                .frame(maxWidth: .infinity)
+                .aspectRatio(width > 0 && height > 0 ? CGFloat(width) / CGFloat(height) : 4 / 3, contentMode: .fit)
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                if !caption.isEmpty {
+                    Text(caption).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        case let .quote(runs):
+            FocusInlineRichText(runs: runs, foreground: .secondary, onOpenURL: onOpenURL)
+                .padding(14)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(uiColor: .tertiarySystemFill), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        case let .list(ordered, items):
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(Array(items.enumerated()), id: \.offset) { index, runs in
+                    HStack(alignment: .top, spacing: 8) {
+                        Text(ordered ? "\(index + 1)." : "•")
+                            .frame(width: 24, alignment: .trailing)
+                        FocusInlineRichText(runs: runs, onOpenURL: onOpenURL)
+                    }
+                }
+            }
+        case let .code(language, content):
+            ScrollView(.horizontal, showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 8) {
+                    if !language.isEmpty {
+                        Text(language.uppercased()).font(.caption2.weight(.semibold)).foregroundStyle(FocusDesign.primary)
+                    }
+                    Text(content).font(.system(.footnote, design: .monospaced)).textSelection(.enabled)
+                }
+                .padding(14)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color(uiColor: .tertiarySystemFill), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        case let .resource(title, url):
+            Button { onOpenURL(url) } label: {
+                HStack {
+                    Text(title).font(.headline).foregroundStyle(.primary)
+                    Spacer()
+                    Image(systemName: "arrow.up.right.square").foregroundStyle(FocusDesign.primary)
+                }
+                .padding(14)
+                .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            }
+            .buttonStyle(.plain)
+        case .divider:
+            Divider()
+        }
+    }
+
+    private func frameAlignment(_ alignment: FocusArticleTextAlignment) -> Alignment {
+        switch alignment {
+        case .leading: .leading
+        case .center: .center
+        case .trailing: .trailing
         }
     }
 }
@@ -3000,9 +3642,13 @@ private struct FocusUserSpaceArticleRow: View {
 private struct FocusOpusDetailView: View {
     @ObservedObject var viewModel: FocusOpusDetailViewModel
     let onOpenURL: (URL) -> Void
+    @State private var galleryRequest: FocusImageGalleryRequest?
 
     var body: some View {
         content
+            .fullScreenCover(item: $galleryRequest) { request in
+                FocusImageGalleryView(request: request)
+            }
     }
 
     @ViewBuilder
@@ -3029,12 +3675,32 @@ private struct FocusOpusDetailView: View {
             )
 
         case let .loaded(page):
+            let allImages = page.paragraphs.flatMap { paragraph in
+                paragraph.blocks.flatMap { block -> [FocusOpusImage] in
+                    guard case let .image(images) = block else { return [] }
+                    return images
+                }
+            }
+            let validImages = allImages.filter { $0.url != nil }
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     FocusOpusAuthorCard(page: page, onOpenURL: onOpenURL)
 
                     ForEach(page.paragraphs) { paragraph in
-                        FocusOpusParagraphCard(paragraph: paragraph)
+                        FocusOpusParagraphCard(
+                            paragraph: paragraph,
+                            onOpenURL: onOpenURL,
+                            onOpenImage: { selected in
+                                let urls = validImages.compactMap(\.url)
+                                guard !urls.isEmpty else { return }
+                                let index = validImages.firstIndex(where: { $0.id == selected.id }) ?? 0
+                                galleryRequest = FocusImageGalleryRequest(
+                                    urls: urls,
+                                    initialIndex: index,
+                                    referer: "https://www.bilibili.com/opus/\(page.id)"
+                                )
+                            }
+                        )
                     }
 
                     if !page.comments.isEmpty {
@@ -3044,7 +3710,7 @@ private struct FocusOpusDetailView: View {
                                 .padding(.horizontal, 2)
 
                             ForEach(Array(page.comments.enumerated()), id: \.offset) { item in
-                                FocusOpusCommentCard(comment: item.element)
+                                FocusOpusCommentCard(comment: item.element, onOpenURL: onOpenURL)
                             }
                         }
                     }
@@ -3118,15 +3784,17 @@ private struct FocusOpusAuthorCard: View {
 
 private struct FocusOpusParagraphCard: View {
     let paragraph: FocusOpusParagraph
+    var onOpenURL: (URL) -> Void = { _ in }
+    var onOpenImage: (FocusOpusImage) -> Void = { _ in }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             ForEach(Array(paragraph.blocks.enumerated()), id: \.offset) { _, block in
                 switch block {
                 case let .text(nodes):
-                    FocusOpusRichText(nodes: nodes)
+                    FocusInlineRichText(runs: nodes, onOpenURL: onOpenURL)
                 case let .image(images):
-                    FocusOpusImageGrid(images: images)
+                    FocusOpusImageGrid(images: images, onOpenImage: onOpenImage)
                 case let .code(lang, content):
                     VStack(alignment: .leading, spacing: 8) {
                         if !lang.isEmpty {
@@ -3156,37 +3824,17 @@ private struct FocusOpusParagraphCard: View {
     }
 }
 
-private struct FocusOpusRichText: View {
-    let nodes: [FocusOpusTextNode]
-
-    var body: some View {
-        combinedText
-            .font(.body)
-            .foregroundStyle(.primary)
-            .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private var combinedText: Text {
-        nodes.reduce(Text("")) { partial, node in
-            let rawText = node.emojiURL != nil && node.text.isEmpty ? "[表情]" : node.text
-            let segment = Text(rawText)
-                .fontWeight(node.bold ? .semibold : .regular)
-                .foregroundColor(node.linkURL == nil ? .primary : FocusDesign.primary)
-            return partial + segment
-        }
-    }
-}
-
 private struct FocusOpusImageGrid: View {
     let images: [FocusOpusImage]
+    let onOpenImage: (FocusOpusImage) -> Void
 
     var body: some View {
         if images.count == 1, let image = images.first {
-            FocusOpusImageTile(image: image)
+            FocusOpusImageTile(image: image, onOpenImage: onOpenImage)
         } else {
             LazyVGrid(columns: columns, spacing: 10) {
                 ForEach(images) { image in
-                    FocusOpusImageTile(image: image)
+                    FocusOpusImageTile(image: image, onOpenImage: onOpenImage)
                 }
             }
         }
@@ -3199,6 +3847,7 @@ private struct FocusOpusImageGrid: View {
 
 private struct FocusOpusImageTile: View {
     let image: FocusOpusImage
+    let onOpenImage: (FocusOpusImage) -> Void
 
     var body: some View {
         FocusRemoteImage(url: image.url, referer: image.url?.absoluteString ?? "https://www.bilibili.com/") { phase in
@@ -3220,11 +3869,14 @@ private struct FocusOpusImageTile: View {
         .aspectRatio(image.aspectRatio ?? 1, contentMode: .fit)
         .background(Color(uiColor: .tertiarySystemFill))
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .contentShape(Rectangle())
+        .onTapGesture { onOpenImage(image) }
     }
 }
 
 private struct FocusOpusCommentCard: View {
     let comment: FocusNativeCommentPayload
+    let onOpenURL: (URL) -> Void
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -3251,10 +3903,22 @@ private struct FocusOpusCommentCard: View {
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(FocusDesign.primary)
 
-                Text(comment.content)
-                    .font(.body)
-                    .foregroundStyle(.primary)
-                    .multilineTextAlignment(.leading)
+                FocusInlineRichText(runs: comment.contentRuns, onOpenURL: onOpenURL)
+
+                ForEach(Array(comment.previewReplies.prefix(2).enumerated()), id: \.offset) { _, reply in
+                    HStack(alignment: .top, spacing: 2) {
+                        Text("\(reply.author)：")
+                            .font(.caption)
+                            .foregroundStyle(FocusDesign.primary)
+                        FocusInlineRichText(
+                            runs: reply.contentRuns,
+                            font: .caption,
+                            foreground: .secondary,
+                            onOpenURL: onOpenURL
+                        )
+                    }
+                    .padding(.leading, 8)
+                }
 
                 let meta = [comment.timeText, comment.likeText, comment.replyText]
                     .filter { !$0.isEmpty }
@@ -3305,6 +3969,25 @@ private struct FocusSettingsView: View {
                             Text(mode.title).tag(mode)
                         }
                     }
+
+                    ColorPicker(
+                        "强调色",
+                        selection: accentColorBinding,
+                        supportsOpacity: false
+                    )
+
+                    LabeledContent("颜色值") {
+                        Text(settingsStore.settings.accentColorHex)
+                            .font(.body.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Button("恢复 B 站粉") {
+                        settingsStore.settings.accentColorHex = FocusSettings.defaultAccentColorHex
+                    }
+                    .disabled(
+                        settingsStore.settings.accentColorHex == FocusSettings.defaultAccentColorHex
+                    )
                 } header: {
                     Text("入口与主题")
                 }
@@ -3316,6 +3999,12 @@ private struct FocusSettingsView: View {
                     Toggle("播放页去干扰", isOn: binding(\.playerMaskEnabled))
                 } header: {
                     Text("规则")
+                }
+
+                Section {
+                    Toggle("原生播放器默认显示弹幕", isOn: binding(\.nativeDanmakuEnabled))
+                } header: {
+                    Text("播放")
                 }
 
                 Section {
@@ -3354,6 +4043,17 @@ private struct FocusSettingsView: View {
         Binding(
             get: { settingsStore.settings[keyPath: keyPath] },
             set: { settingsStore.settings[keyPath: keyPath] = $0 }
+        )
+    }
+
+    private var accentColorBinding: Binding<Color> {
+        Binding(
+            get: {
+                FocusAccentColor.color(hex: settingsStore.settings.accentColorHex)
+            },
+            set: { color in
+                settingsStore.settings.accentColorHex = FocusAccentColor.hexString(from: color)
+            }
         )
     }
 }

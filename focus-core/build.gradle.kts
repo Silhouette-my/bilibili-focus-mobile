@@ -53,6 +53,8 @@ android {
     namespace = "org.bilibilifocus.core"
     compileSdk = 35
 
+    sourceSets["main"].resources.srcDir("src/commonMain/resources")
+
     defaultConfig {
         minSdk = 26
     }

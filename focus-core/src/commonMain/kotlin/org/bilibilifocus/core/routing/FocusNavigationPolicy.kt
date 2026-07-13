@@ -137,7 +137,7 @@ class FocusNavigationPolicy(settings: FocusSettings = FocusSettings.DEFAULTS) {
         }
 
         private val preservedQueryNames = setOf(
-            "p", "t", "start_progress", "start_progress_ms",
+            "p", "cid", "t", "start_progress", "start_progress_ms",
             "spm_id_from", "vd_source", "from_spmid", "from_source",
         )
 
