@@ -2,6 +2,7 @@ package org.bilibilifocus.android
 
 import android.app.PictureInPictureParams
 import android.content.pm.ActivityInfo
+import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.Color
 import android.os.Build
@@ -96,16 +97,13 @@ class MainActivity : ComponentActivity() {
 
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S &&
-            playbackConnection.state.value.shouldEnterPictureInPicture
+        val state = playbackConnection.state.value
+        if (FocusPictureInPicturePolicy.shouldRequestOnUserLeave(
+                shouldEnterPictureInPicture = state.shouldEnterPictureInPicture,
+                isInPictureInPictureMode = isInPictureInPictureMode,
+            )
         ) {
-            try {
-                enterPictureInPictureMode(buildPictureInPictureParams(playbackConnection.state.value, false))
-            } catch (_: IllegalArgumentException) {
-                // Unsupported aspect ratios or device policy fall back to background audio.
-            } catch (_: IllegalStateException) {
-                // Activity lifecycle races also fall back to background audio.
-            }
+            requestPictureInPicture(state)
         }
     }
 
@@ -136,6 +134,23 @@ class MainActivity : ComponentActivity() {
             // Playback remains in the foreground media service when PiP is unavailable.
         } catch (_: IllegalStateException) {
             // Activity lifecycle races must not interrupt service playback.
+        }
+    }
+
+    private fun requestPictureInPicture(state: FocusPlaybackState): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O ||
+            !packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)
+        ) {
+            return false
+        }
+        return try {
+            enterPictureInPictureMode(buildPictureInPictureParams(state, false))
+        } catch (_: IllegalArgumentException) {
+            // Unsupported aspect ratios or device policy fall back to background audio.
+            false
+        } catch (_: IllegalStateException) {
+            // Activity lifecycle races also fall back to background audio.
+            false
         }
     }
 
@@ -199,4 +214,9 @@ internal object FocusPictureInPicturePolicy {
 
     fun shouldRenderEmbeddedPlayerSurface(isInPictureInPictureMode: Boolean): Boolean =
         !isInPictureInPictureMode
+
+    fun shouldRequestOnUserLeave(
+        shouldEnterPictureInPicture: Boolean,
+        isInPictureInPictureMode: Boolean,
+    ): Boolean = shouldEnterPictureInPicture && !isInPictureInPictureMode
 }

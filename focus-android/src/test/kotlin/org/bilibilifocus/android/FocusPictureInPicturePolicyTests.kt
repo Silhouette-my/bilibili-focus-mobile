@@ -31,6 +31,28 @@ class FocusPictureInPicturePolicyTests {
     }
 
     @Test
+    fun activelyRequestsPictureInPictureOnUserLeaveAcrossSupportedAndroidVersions() {
+        assertTrue(
+            FocusPictureInPicturePolicy.shouldRequestOnUserLeave(
+                shouldEnterPictureInPicture = true,
+                isInPictureInPictureMode = false,
+            ),
+        )
+        assertFalse(
+            FocusPictureInPicturePolicy.shouldRequestOnUserLeave(
+                shouldEnterPictureInPicture = false,
+                isInPictureInPictureMode = false,
+            ),
+        )
+        assertFalse(
+            FocusPictureInPicturePolicy.shouldRequestOnUserLeave(
+                shouldEnterPictureInPicture = true,
+                isInPictureInPictureMode = true,
+            ),
+        )
+    }
+
+    @Test
     fun keepsPlaybackForApplicationBackgroundButStopsForVideoRouteDeparture() {
         assertFalse(
             FocusPlaybackRoutePolicy.shouldStop(

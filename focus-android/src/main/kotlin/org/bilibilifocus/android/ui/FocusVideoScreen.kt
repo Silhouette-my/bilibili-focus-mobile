@@ -194,7 +194,16 @@ fun FocusVideoScreen(
     var fullscreenLandscapeOrientation by remember {
         mutableStateOf(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE)
     }
+    var shouldIgnoreInitialOrientationAfterPictureInPicture by remember {
+        mutableStateOf(false)
+    }
     val prefersPortraitFullscreen = FocusVideoFullscreenPolicy.isPortrait(videoAspectRatio)
+
+    LaunchedEffect(isInPictureInPictureMode) {
+        if (isInPictureInPictureMode) {
+            shouldIgnoreInitialOrientationAfterPictureInPicture = true
+        }
+    }
 
     LaunchedEffect(info?.bvid, info?.width, info?.height) {
         videoAspectRatio = FocusVideoFullscreenPolicy.aspectRatio(
@@ -286,7 +295,16 @@ fun FocusVideoScreen(
     }
 
     PhoneFullscreenRotationEffect(
-        enabled = isPhone && state is VideoUiState.Loaded && !prefersPortraitFullscreen,
+        enabled = FocusVideoRotationPolicy.shouldObservePhysicalOrientation(
+            isPhone = isPhone,
+            isVideoLoaded = state is VideoUiState.Loaded,
+            prefersPortraitFullscreen = prefersPortraitFullscreen,
+            isInPictureInPictureMode = isInPictureInPictureMode,
+        ),
+        ignoreInitialOrientation = shouldIgnoreInitialOrientationAfterPictureInPicture,
+        onInitialOrientationConsumed = {
+            shouldIgnoreInitialOrientationAfterPictureInPicture = false
+        },
         onLandscape = { orientation ->
             val requestedOrientation = orientation.requestedLandscapeOrientation()
             fullscreenLandscapeOrientation = requestedOrientation
@@ -296,11 +314,18 @@ fun FocusVideoScreen(
         onPortrait = { resolvedViewModel.beginFullscreenExit() },
     )
 
-    LaunchedEffect(isPhone, isCompletingFullscreenExit, configuration.orientation) {
-        if (
-            isPhone &&
-            isCompletingFullscreenExit &&
-            configuration.orientation == Configuration.ORIENTATION_PORTRAIT
+    LaunchedEffect(
+        isPhone,
+        isCompletingFullscreenExit,
+        configuration.orientation,
+        isInPictureInPictureMode,
+    ) {
+        if (FocusVideoRotationPolicy.shouldCompleteFullscreenExit(
+                isPhone = isPhone,
+                isCompletingFullscreenExit = isCompletingFullscreenExit,
+                configurationOrientation = configuration.orientation,
+                isInPictureInPictureMode = isInPictureInPictureMode,
+            )
         ) {
             // 与 iOS 一致：界面几何稳定为竖屏后再撤下全屏层，避免先闪回详情页。
             withFrameNanos { }
@@ -309,7 +334,7 @@ fun FocusVideoScreen(
         }
     }
 
-    BackHandler(enabled = isFullscreen) { requestFullscreenExit() }
+    BackHandler(enabled = isFullscreen && !isInPictureInPictureMode) { requestFullscreenExit() }
     DisposableEffect(
         deviceType,
         isFullscreen,
@@ -317,16 +342,19 @@ fun FocusVideoScreen(
         prefersPortraitFullscreen,
         fullscreenLandscapeOrientation,
         configuration.orientation,
+        isInPictureInPictureMode,
     ) {
         val activity = context.findActivity()
-        activity?.requestedOrientation = when {
-            deviceType == FocusVideoDeviceType.Tablet -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-            isCompletingFullscreenExit -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-            isFullscreen && prefersPortraitFullscreen -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-            isFullscreen -> fullscreenLandscapeOrientation
-            else -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        if (FocusVideoRotationPolicy.shouldApplyActivityOrientation(isInPictureInPictureMode)) {
+            activity?.requestedOrientation = when {
+                deviceType == FocusVideoDeviceType.Tablet -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                isCompletingFullscreenExit -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                isFullscreen && prefersPortraitFullscreen -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                isFullscreen -> fullscreenLandscapeOrientation
+                else -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            }
+            setSystemBarsHidden(activity, isFullscreen)
         }
-        setSystemBarsHidden(activity, isFullscreen)
         onDispose { }
     }
     DisposableEffect(deviceType) {
@@ -1313,11 +1341,15 @@ private fun PlayerSurface(
 @Composable
 private fun PhoneFullscreenRotationEffect(
     enabled: Boolean,
+    ignoreInitialOrientation: Boolean,
+    onInitialOrientationConsumed: () -> Unit,
     onLandscape: (FocusPhysicalOrientation) -> Unit,
     onPortrait: () -> Unit,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val currentIgnoreInitialOrientation by rememberUpdatedState(ignoreInitialOrientation)
+    val currentOnInitialOrientationConsumed by rememberUpdatedState(onInitialOrientationConsumed)
     val currentOnLandscape by rememberUpdatedState(onLandscape)
     val currentOnPortrait by rememberUpdatedState(onPortrait)
 
@@ -1333,8 +1365,16 @@ private fun PhoneFullscreenRotationEffect(
                 val isInitialOrientation = lastOrientation == null
                 lastOrientation = resolvedOrientation
 
-                // OrientationEventListener 启用后会立即上报当前方向；初始竖屏不是一次旋转动作。
-                if (isInitialOrientation && resolvedOrientation == FocusPhysicalOrientation.Portrait) return
+                if (isInitialOrientation) {
+                    currentOnInitialOrientationConsumed()
+                    // OrientationEventListener 启用后会立即上报当前方向。从 PiP
+                    // 返回时这只是设备当前姿态的快照，不应被当作一次新旋转。
+                    if (currentIgnoreInitialOrientation ||
+                        resolvedOrientation == FocusPhysicalOrientation.Portrait
+                    ) {
+                        return
+                    }
+                }
 
                 debounceJob?.cancel()
                 debounceJob = scope.launch {
@@ -1382,6 +1422,31 @@ internal object FocusVideoFullscreenPolicy {
             containerAspectRatio > 0f &&
             videoAspectRatio > 0f &&
             containerAspectRatio <= videoAspectRatio
+}
+
+internal object FocusVideoRotationPolicy {
+    fun shouldObservePhysicalOrientation(
+        isPhone: Boolean,
+        isVideoLoaded: Boolean,
+        prefersPortraitFullscreen: Boolean,
+        isInPictureInPictureMode: Boolean,
+    ): Boolean = isPhone &&
+        isVideoLoaded &&
+        !prefersPortraitFullscreen &&
+        !isInPictureInPictureMode
+
+    fun shouldCompleteFullscreenExit(
+        isPhone: Boolean,
+        isCompletingFullscreenExit: Boolean,
+        configurationOrientation: Int,
+        isInPictureInPictureMode: Boolean,
+    ): Boolean = isPhone &&
+        isCompletingFullscreenExit &&
+        configurationOrientation == Configuration.ORIENTATION_PORTRAIT &&
+        !isInPictureInPictureMode
+
+    fun shouldApplyActivityOrientation(isInPictureInPictureMode: Boolean): Boolean =
+        !isInPictureInPictureMode
 }
 
 internal enum class FocusPhysicalOrientation {

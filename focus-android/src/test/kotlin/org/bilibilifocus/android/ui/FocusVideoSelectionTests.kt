@@ -4,6 +4,8 @@ import android.content.pm.ActivityInfo
 import org.bilibilifocus.core.model.VideoEpisode
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertTrue
 
 class FocusVideoSelectionTests {
     @Test
@@ -69,6 +71,36 @@ class FocusVideoSelectionTests {
                 videoAspectRatio = 16f / 9f,
             ),
         )
+    }
+
+    @Test
+    fun `picture in picture freezes app fullscreen rotation decisions`() {
+        assertTrue(
+            FocusVideoRotationPolicy.shouldObservePhysicalOrientation(
+                isPhone = true,
+                isVideoLoaded = true,
+                prefersPortraitFullscreen = false,
+                isInPictureInPictureMode = false,
+            ),
+        )
+        assertFalse(
+            FocusVideoRotationPolicy.shouldObservePhysicalOrientation(
+                isPhone = true,
+                isVideoLoaded = true,
+                prefersPortraitFullscreen = false,
+                isInPictureInPictureMode = true,
+            ),
+        )
+        assertFalse(
+            FocusVideoRotationPolicy.shouldCompleteFullscreenExit(
+                isPhone = true,
+                isCompletingFullscreenExit = true,
+                configurationOrientation = android.content.res.Configuration.ORIENTATION_PORTRAIT,
+                isInPictureInPictureMode = true,
+            ),
+        )
+        assertFalse(FocusVideoRotationPolicy.shouldApplyActivityOrientation(true))
+        assertTrue(FocusVideoRotationPolicy.shouldApplyActivityOrientation(false))
     }
 
     @Test
