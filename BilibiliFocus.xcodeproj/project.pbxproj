@@ -43,6 +43,12 @@
 		000000000000000000000235 /* AppIcon76x76@2x.png in Resources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000335 /* AppIcon76x76@2x.png */; };
 		000000000000000000000236 /* AppIcon83.5x83.5@2x.png in Resources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000336 /* AppIcon83.5x83.5@2x.png */; };
 		000000000000000000000337 /* FocusWebAppearance.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000339 /* FocusWebAppearance.swift */; };
+		000000000000000000000348 /* FocusSharedUI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000349 /* FocusSharedUI.swift */; };
+		000000000000000000000354 /* FocusNativeVideo.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000350 /* FocusNativeVideo.swift */; };
+		000000000000000000000355 /* FocusVideoDetailService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000351 /* FocusVideoDetailService.swift */; };
+		000000000000000000000356 /* FocusVideoActionService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000352 /* FocusVideoActionService.swift */; };
+		000000000000000000000357 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000325 /* Assets.xcassets */; };
+		000000000000000000000701 /* BilibiliFocusStabilityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000703 /* BilibiliFocusStabilityTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -52,6 +58,13 @@
 			proxyType = 1;
 			remoteGlobalIDString = 000000000000000000000005;
 			remoteInfo = FocusCore;
+		};
+		000000000000000000000702 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 000000000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 000000000000000000000004;
+			remoteInfo = BilibiliFocus;
 		};
 /* End PBXContainerItemProxy section */
 
@@ -103,11 +116,17 @@
 		000000000000000000000331 /* AppIcon40x40@3x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "AppIcon40x40@3x.png"; sourceTree = "<group>"; };
 		000000000000000000000332 /* AppIcon60x60@2x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "AppIcon60x60@2x.png"; sourceTree = "<group>"; };
 		000000000000000000000333 /* AppIcon60x60@3x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "AppIcon60x60@3x.png"; sourceTree = "<group>"; };
-		000000000000000000000334 /* AppIcon76x76.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "AppIcon76x76.png"; sourceTree = "<group>"; };
+		000000000000000000000334 /* AppIcon76x76.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = AppIcon76x76.png; sourceTree = "<group>"; };
 		000000000000000000000335 /* AppIcon76x76@2x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "AppIcon76x76@2x.png"; sourceTree = "<group>"; };
 		000000000000000000000336 /* AppIcon83.5x83.5@2x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "AppIcon83.5x83.5@2x.png"; sourceTree = "<group>"; };
 		000000000000000000000338 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		000000000000000000000339 /* FocusWebAppearance.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusWebAppearance.swift; sourceTree = "<group>"; };
+		000000000000000000000349 /* FocusSharedUI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusSharedUI.swift; sourceTree = "<group>"; };
+		000000000000000000000350 /* FocusNativeVideo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusNativeVideo.swift; sourceTree = "<group>"; };
+		000000000000000000000351 /* FocusVideoDetailService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusVideoDetailService.swift; sourceTree = "<group>"; };
+		000000000000000000000352 /* FocusVideoActionService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusVideoActionService.swift; sourceTree = "<group>"; };
+		000000000000000000000703 /* BilibiliFocusStabilityTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BilibiliFocusStabilityTests.swift; sourceTree = "<group>"; };
+		000000000000000000000704 /* BilibiliFocusTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = BilibiliFocusTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -126,14 +145,22 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		000000000000000000000705 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
 		000000000000000000000002 = {
 			isa = PBXGroup;
 			children = (
-				000000000000000000000401 /* BilibiliFocus */,
-				000000000000000000000402 /* FocusCore */,
+				000000000000000000000401 /* App/BilibiliFocus */,
+				000000000000000000000402 /* Sources/FocusCore */,
+				000000000000000000000713 /* Tests/BilibiliFocusTests */,
 				000000000000000000000003 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -143,11 +170,12 @@
 			children = (
 				000000000000000000000316 /* BilibiliFocus.app */,
 				000000000000000000000317 /* FocusCore.framework */,
+				000000000000000000000704 /* BilibiliFocusTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
 		};
-		000000000000000000000401 /* BilibiliFocus */ = {
+		000000000000000000000401 /* App/BilibiliFocus */ = {
 			isa = PBXGroup;
 			children = (
 				000000000000000000000325 /* Assets.xcassets */,
@@ -156,6 +184,8 @@
 				000000000000000000000301 /* BilibiliFocusApp.swift */,
 				000000000000000000000302 /* FocusBrowserView.swift */,
 				000000000000000000000303 /* FocusBrowserViewModel.swift */,
+				000000000000000000000350 /* FocusNativeVideo.swift */,
+				000000000000000000000349 /* FocusSharedUI.swift */,
 				000000000000000000000304 /* FocusSettingsStore.swift */,
 				000000000000000000000319 /* FocusUserAgent.swift */,
 				000000000000000000000339 /* FocusWebAppearance.swift */,
@@ -164,7 +194,7 @@
 			path = App/BilibiliFocus;
 			sourceTree = "<group>";
 		};
-		000000000000000000000402 /* FocusCore */ = {
+		000000000000000000000402 /* Sources/FocusCore */ = {
 			isa = PBXGroup;
 			children = (
 				000000000000000000000320 /* AppRoute.swift */,
@@ -172,6 +202,8 @@
 				000000000000000000000322 /* CookieSnapshotProvider.swift */,
 				000000000000000000000323 /* DynamicCard.swift */,
 				000000000000000000000324 /* DynamicFeedService.swift */,
+				000000000000000000000352 /* FocusVideoActionService.swift */,
+				000000000000000000000351 /* FocusVideoDetailService.swift */,
 				000000000000000000000306 /* FocusBundle.swift */,
 				000000000000000000000307 /* FocusEntry.swift */,
 				000000000000000000000308 /* FocusFeature.swift */,
@@ -213,6 +245,14 @@
 			path = Icons;
 			sourceTree = "<group>";
 		};
+		000000000000000000000713 /* Tests/BilibiliFocusTests */ = {
+			isa = PBXGroup;
+			children = (
+				000000000000000000000703 /* BilibiliFocusStabilityTests.swift */,
+			);
+			path = Tests/BilibiliFocusTests;
+			sourceTree = "<group>";
+		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -252,6 +292,24 @@
 			productReference = 000000000000000000000317 /* FocusCore.framework */;
 			productType = "com.apple.product-type.framework";
 		};
+		000000000000000000000709 /* BilibiliFocusTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 000000000000000000000710 /* Build configuration list for PBXNativeTarget "BilibiliFocusTests" */;
+			buildPhases = (
+				000000000000000000000706 /* Sources */,
+				000000000000000000000705 /* Frameworks */,
+				000000000000000000000707 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				000000000000000000000708 /* PBXTargetDependency */,
+			);
+			name = BilibiliFocusTests;
+			productName = BilibiliFocusTests;
+			productReference = 000000000000000000000704 /* BilibiliFocusTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -267,6 +325,10 @@
 					};
 					000000000000000000000005 = {
 						CreatedOnToolsVersion = 26.0;
+					};
+					000000000000000000000709 = {
+						CreatedOnToolsVersion = 26.0;
+						TestTargetID = 000000000000000000000004;
 					};
 				};
 			};
@@ -285,6 +347,7 @@
 			targets = (
 				000000000000000000000004 /* BilibiliFocus */,
 				000000000000000000000005 /* FocusCore */,
+				000000000000000000000709 /* BilibiliFocusTests */,
 			);
 		};
 /* End PBXProject section */
@@ -294,6 +357,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				000000000000000000000357 /* Assets.xcassets in Resources */,
 				000000000000000000000226 /* AppIcon20x20@2x.png in Resources */,
 				000000000000000000000227 /* AppIcon20x20@3x.png in Resources */,
 				000000000000000000000228 /* AppIcon29x29@2x.png in Resources */,
@@ -316,6 +380,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		000000000000000000000707 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
@@ -326,6 +397,8 @@
 				000000000000000000000203 /* BilibiliFocusApp.swift in Sources */,
 				000000000000000000000204 /* FocusBrowserView.swift in Sources */,
 				000000000000000000000205 /* FocusBrowserViewModel.swift in Sources */,
+				000000000000000000000354 /* FocusNativeVideo.swift in Sources */,
+				000000000000000000000348 /* FocusSharedUI.swift in Sources */,
 				000000000000000000000206 /* FocusSettingsStore.swift in Sources */,
 				000000000000000000000219 /* FocusUserAgent.swift in Sources */,
 				000000000000000000000337 /* FocusWebAppearance.swift in Sources */,
@@ -342,6 +415,8 @@
 				000000000000000000000222 /* CookieSnapshotProvider.swift in Sources */,
 				000000000000000000000223 /* DynamicCard.swift in Sources */,
 				000000000000000000000224 /* DynamicFeedService.swift in Sources */,
+				000000000000000000000356 /* FocusVideoActionService.swift in Sources */,
+				000000000000000000000355 /* FocusVideoDetailService.swift in Sources */,
 				000000000000000000000208 /* FocusBundle.swift in Sources */,
 				000000000000000000000209 /* FocusEntry.swift in Sources */,
 				000000000000000000000210 /* FocusFeature.swift in Sources */,
@@ -355,6 +430,14 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		000000000000000000000706 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				000000000000000000000701 /* BilibiliFocusStabilityTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -362,6 +445,11 @@
 			isa = PBXTargetDependency;
 			target = 000000000000000000000005 /* FocusCore */;
 			targetProxy = 000000000000000000000008 /* PBXContainerItemProxy */;
+		};
+		000000000000000000000708 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 000000000000000000000004 /* BilibiliFocus */;
+			targetProxy = 000000000000000000000702 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -413,7 +501,7 @@
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = NO;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = K4S7KL8D85;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = App/BilibiliFocus/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
@@ -437,7 +525,7 @@
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = NO;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = K4S7KL8D85;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = App/BilibiliFocus/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
@@ -462,11 +550,11 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEFINES_MODULE = YES;
 				DEVELOPMENT_TEAM = "";
-				DYLIB_INSTALL_NAME_BASE = "@rpath";
 				DYLIB_CURRENT_VERSION = 1;
+				DYLIB_INSTALL_NAME_BASE = "@rpath";
 				GENERATE_INFOPLIST_FILE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
 				INSTALL_PATH = "@rpath";
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -489,11 +577,11 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEFINES_MODULE = YES;
 				DEVELOPMENT_TEAM = "";
-				DYLIB_INSTALL_NAME_BASE = "@rpath";
 				DYLIB_CURRENT_VERSION = 1;
+				DYLIB_INSTALL_NAME_BASE = "@rpath";
 				GENERATE_INFOPLIST_FILE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
 				INSTALL_PATH = "@rpath";
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -506,6 +594,52 @@
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SWIFT_VERSION = 6.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		000000000000000000000711 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = K4S7KL8D85;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.michaeltan.BilibiliFocusTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/BilibiliFocus.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/BilibiliFocus";
+			};
+			name = Debug;
+		};
+		000000000000000000000712 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = K4S7KL8D85;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.michaeltan.BilibiliFocusTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/BilibiliFocus.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/BilibiliFocus";
 			};
 			name = Release;
 		};
@@ -535,6 +669,15 @@
 			buildConfigurations = (
 				000000000000000000000605 /* Debug */,
 				000000000000000000000606 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		000000000000000000000710 /* Build configuration list for PBXNativeTarget "BilibiliFocusTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				000000000000000000000711 /* Debug */,
+				000000000000000000000712 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

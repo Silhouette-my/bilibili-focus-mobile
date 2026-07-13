@@ -4,9 +4,13 @@ import android.util.Base64
 import org.bilibilifocus.core.injection.FocusRuleCatalog
 import org.bilibilifocus.core.model.FocusFeature
 import org.bilibilifocus.core.model.FocusPageRule
+import org.bilibilifocus.core.model.FocusSettings
 
 object FocusScriptBuilder {
-    fun buildUserScript(url: String): String? {
+    fun buildUserScript(
+        url: String,
+        settings: FocusSettings = FocusSettings.DEFAULTS,
+    ): String? {
         val (host, path) = parseURL(url) ?: return null
 
         val rules = FocusRuleCatalog.defaultRules.filter { it.match(host, path) }
@@ -16,15 +20,15 @@ object FocusScriptBuilder {
         val endRules = rules.filter { it.runPhase == FocusPageRule.RunPhase.DOCUMENT_END }
 
         val startCSS = startRules.flatMap { rule ->
-            rule.features.map { it.css }.filter { it.isNotBlank() }
+            rule.features.filter { it.isEnabled(settings) }.map { it.css }.filter { it.isNotBlank() }
         }.joinToString("\n")
 
         val endCSS = endRules.flatMap { rule ->
-            rule.features.map { it.css }.filter { it.isNotBlank() }
+            rule.features.filter { it.isEnabled(settings) }.map { it.css }.filter { it.isNotBlank() }
         }.joinToString("\n")
 
         val scripts = endRules.flatMap { rule ->
-            rule.features.mapNotNull { it.script }.filter { it.isNotBlank() }
+            rule.features.filter { it.isEnabled(settings) }.mapNotNull { it.script }.filter { it.isNotBlank() }
         }
 
         val metaViewport = startRules.mapNotNull { it.metaViewport }.lastOrNull()
@@ -59,6 +63,15 @@ object FocusScriptBuilder {
 
             append("})();")
         }.takeIf { it.isNotBlank() }
+    }
+
+    private fun FocusFeature.isEnabled(settings: FocusSettings): Boolean = when (settingKey) {
+        null -> true
+        FocusFeature.SettingKey.REDIRECT_ENABLED -> settings.redirectEnabled
+        FocusFeature.SettingKey.PLAYER_MASK_ENABLED -> settings.playerMaskEnabled
+        FocusFeature.SettingKey.SEARCH_MASK_ENABLED -> settings.searchMaskEnabled
+        FocusFeature.SettingKey.DYNAMIC_MASK_ENABLED -> settings.dynamicMaskEnabled
+        FocusFeature.SettingKey.DEBUG_MODE -> settings.debugMode
     }
 
     private fun parseURL(url: String): Pair<String, String>? {

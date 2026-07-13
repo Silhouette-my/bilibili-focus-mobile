@@ -1,18 +1,20 @@
 package org.bilibilifocus.android.ui
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.grid.LazyGridState
 import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.LazyGridState
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
@@ -20,38 +22,54 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material3.Button
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import org.bilibilifocus.android.AndroidCookieProvider
 import org.bilibilifocus.android.FocusUserViewModel
+import org.bilibilifocus.android.UserContentSection
 import org.bilibilifocus.android.UserUiState
+import org.bilibilifocus.core.model.UserArticle
+import org.bilibilifocus.core.model.UserContentCollection
+import org.bilibilifocus.core.model.UserProfile
 import org.bilibilifocus.core.model.UserVideo
 import org.bilibilifocus.core.service.KtorHttpClient
 import org.bilibilifocus.core.service.UserService
-import org.bilibilifocus.core.service.VideoInfoService
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -59,6 +77,8 @@ fun FocusUserScreen(
     userId: Long,
     onBack: () -> Unit,
     onOpenVideo: (String) -> Unit = {},
+    onOpenCollection: (UserContentCollection) -> Unit = {},
+    onOpenArticle: (String) -> Unit = {},
     viewModel: FocusUserViewModel? = null,
     gridState: LazyGridState = rememberLazyGridState(),
 ) {
@@ -70,19 +90,19 @@ fun FocusUserScreen(
             )
         )
     }
-
-    LaunchedEffect(userId) {
-        resolvedViewModel.loadIfNeeded(userId)
-    }
+    LaunchedEffect(userId) { resolvedViewModel.loadIfNeeded(userId) }
 
     val state by resolvedViewModel.state.collectAsState()
+    val isLoadingMore by resolvedViewModel.isLoadingMore.collectAsState()
+    var selectedSection by remember(userId) { mutableStateOf(resolvedViewModel.selectedSection) }
+    var isRefreshing by remember { mutableStateOf(false) }
 
     Scaffold(
         topBar = {
             CenterAlignedTopAppBar(
                 title = {
-                    val name = (state as? UserUiState.Loaded)?.profile?.name ?: "UP主"
-                    Text(name, maxLines = 1)
+                    val name = (state as? UserUiState.Loaded)?.profile?.name ?: "UP主空间"
+                    Text(name, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
@@ -96,53 +116,153 @@ fun FocusUserScreen(
             )
         },
     ) { innerPadding ->
-        when (val s = state) {
+        when (val current = state) {
             UserUiState.Idle, UserUiState.Loading -> {
-                Box(modifier = Modifier.fillMaxSize().padding(innerPadding), contentAlignment = Alignment.Center) {
+                Box(
+                    modifier = Modifier.fillMaxSize().padding(innerPadding),
+                    contentAlignment = Alignment.Center,
+                ) {
                     CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
                 }
             }
 
             is UserUiState.Failed -> {
-                Box(modifier = Modifier.fillMaxSize().padding(innerPadding), contentAlignment = Alignment.Center) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        Text("加载失败", style = MaterialTheme.typography.headlineSmall)
-                        Text(s.message, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Box(
+                    modifier = Modifier.fillMaxSize().padding(innerPadding).padding(32.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(14.dp),
+                    ) {
+                        Text("UP 主空间加载失败", style = MaterialTheme.typography.headlineSmall)
+                        Text(
+                            current.message,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = TextAlign.Center,
+                        )
+                        Button(onClick = { resolvedViewModel.load(userId) }) { Text("重试") }
                     }
                 }
             }
 
             is UserUiState.Loaded -> {
-                LazyVerticalGrid(
-                    state = gridState,
-                    columns = GridCells.Fixed(2),
+                val sections = buildList {
+                    if (current.videos.isNotEmpty()) add(UserContentSection.VIDEOS)
+                    if (current.collections.isNotEmpty()) add(UserContentSection.COLLECTIONS)
+                    if (current.articles.isNotEmpty()) add(UserContentSection.ARTICLES)
+                }
+                val activeSection = selectedSection.takeIf { it in sections } ?: sections.firstOrNull()
+                LaunchedEffect(sections) {
+                    if (activeSection != null && selectedSection != activeSection) {
+                        selectedSection = activeSection
+                        resolvedViewModel.selectSection(activeSection)
+                    }
+                }
+
+                PullToRefreshBox(
+                    isRefreshing = isRefreshing,
+                    onRefresh = {
+                        isRefreshing = true
+                        resolvedViewModel.load(userId) { isRefreshing = false }
+                    },
                     modifier = Modifier.fillMaxSize().padding(innerPadding),
-                    contentPadding = PaddingValues(16.dp),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    verticalArrangement = Arrangement.spacedBy(16.dp),
                 ) {
-                    item(span = { androidx.compose.foundation.lazy.grid.GridItemSpan(2) }) {
-                        UserProfileHeader(profile = s.profile)
-                    }
-
-                    items(s.videos, key = { "v-${it.aid}" }) { video ->
-                        ElevatedCard(
-                            onClick = {
-                                val url = "https://www.bilibili.com/video/${video.bvid}"
-                                onOpenVideo(url)
-                            },
-                            shape = RoundedCornerShape(16.dp),
-                            colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surface),
-                            elevation = CardDefaults.elevatedCardElevation(defaultElevation = 1.dp),
-                        ) {
-                            UserVideoCard(video = video)
+                    LazyVerticalGrid(
+                        state = gridState,
+                        columns = GridCells.Adaptive(minSize = 156.dp),
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        item(span = { GridItemSpan(maxLineSpan) }) {
+                            UserProfileHeader(profile = current.profile)
                         }
-                    }
 
-                    if (s.videos.isEmpty()) {
-                        item(span = { androidx.compose.foundation.lazy.grid.GridItemSpan(2) }) {
-                            Box(modifier = Modifier.fillMaxWidth().padding(32.dp), contentAlignment = Alignment.Center) {
-                                Text("暂无视频", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        if (sections.isNotEmpty()) {
+                            item(span = { GridItemSpan(maxLineSpan) }) {
+                                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                                    Text(
+                                        "内容",
+                                        style = MaterialTheme.typography.titleMedium,
+                                        fontWeight = FontWeight.SemiBold,
+                                        modifier = Modifier.padding(horizontal = 2.dp),
+                                    )
+                                    UserSectionPicker(
+                                        sections = sections,
+                                        selected = activeSection ?: sections.first(),
+                                        onSelect = { section ->
+                                            selectedSection = section
+                                            resolvedViewModel.selectSection(section)
+                                        },
+                                    )
+                                }
+                            }
+                        }
+
+                        when (activeSection) {
+                            UserContentSection.VIDEOS -> {
+                                items(current.videos, key = { "video-${it.bvid}" }) { video ->
+                                    LaunchedEffect(video.bvid) {
+                                        resolvedViewModel.loadMoreIfNeeded(video.bvid)
+                                    }
+                                    ElevatedCard(
+                                        onClick = { onOpenVideo("https://www.bilibili.com/video/${video.bvid}") },
+                                        shape = RoundedCornerShape(16.dp),
+                                        colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surface),
+                                        elevation = CardDefaults.elevatedCardElevation(defaultElevation = 1.dp),
+                                    ) {
+                                        UserVideoCard(video = video)
+                                    }
+                                }
+                                if (isLoadingMore) {
+                                    item(span = { GridItemSpan(maxLineSpan) }) {
+                                        Box(
+                                            modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp),
+                                            contentAlignment = Alignment.Center,
+                                        ) {
+                                            CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
+                                        }
+                                    }
+                                }
+                            }
+
+                            UserContentSection.COLLECTIONS -> {
+                                items(
+                                    current.collections,
+                                    key = { "collection-${it.id}" },
+                                    span = { GridItemSpan(maxLineSpan) },
+                                ) { collection ->
+                                    UserCollectionCard(collection = collection, onClick = { onOpenCollection(collection) })
+                                }
+                            }
+
+                            UserContentSection.ARTICLES -> {
+                                items(
+                                    current.articles,
+                                    key = { "article-${it.id}" },
+                                    span = { GridItemSpan(maxLineSpan) },
+                                ) { article ->
+                                    UserArticleCard(article = article, onClick = { onOpenArticle(article.targetURL) })
+                                }
+                            }
+
+                            null -> {
+                                item(span = { GridItemSpan(maxLineSpan) }) {
+                                    Box(
+                                        modifier = Modifier.fillMaxWidth().padding(32.dp),
+                                        contentAlignment = Alignment.Center,
+                                    ) {
+                                        Text(
+                                            "这个 UP 主暂时没有可展示的公开内容",
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            textAlign = TextAlign.Center,
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
@@ -153,77 +273,140 @@ fun FocusUserScreen(
 }
 
 @Composable
-private fun UserProfileHeader(profile: org.bilibilifocus.core.model.UserProfile) {
-    Column(
-        modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(12.dp),
+private fun UserSectionPicker(
+    sections: List<UserContentSection>,
+    selected: UserContentSection,
+    onSelect: (UserContentSection) -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        AsyncImage(
-            model = ImageRequest.Builder(LocalContext.current)
-                .data(profile.avatarURL)
-                .crossfade(true)
-                .build(),
-            contentDescription = null,
-            modifier = Modifier.size(80.dp).clip(CircleShape),
-            contentScale = ContentScale.Crop,
-        )
-
-        Text(profile.name, style = MaterialTheme.typography.headlineSmall)
-
-        if (profile.sign.isNotEmpty()) {
-            Text(
-                profile.sign,
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 2,
+        sections.forEach { section ->
+            FilterChip(
+                selected = section == selected,
+                onClick = { onSelect(section) },
+                label = {
+                    Text(
+                        section.title,
+                        modifier = Modifier.fillMaxWidth(),
+                        textAlign = TextAlign.Center,
+                    )
+                },
+                modifier = Modifier.weight(1f).heightIn(min = 44.dp),
+                colors = FilterChipDefaults.filterChipColors(
+                    selectedContainerColor = MaterialTheme.colorScheme.primary,
+                    selectedLabelColor = MaterialTheme.colorScheme.onPrimary,
+                ),
+                shape = RoundedCornerShape(14.dp),
             )
-        }
-
-        Row(horizontalArrangement = Arrangement.spacedBy(24.dp)) {
-            StatLabel(value = formatProfileCount(profile.following), label = "关注")
-            StatLabel(value = formatProfileCount(profile.followers), label = "粉丝")
-            StatLabel(value = "LV${profile.level}", label = "等级")
         }
     }
 }
 
 @Composable
-private fun StatLabel(value: String, label: String) {
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        Text(value, style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
-        Text(label, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+private fun UserProfileHeader(profile: UserProfile) {
+    ElevatedCard(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(22.dp),
+        colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surface),
+        elevation = CardDefaults.elevatedCardElevation(defaultElevation = 1.dp),
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 22.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            AsyncImage(
+                model = ImageRequest.Builder(LocalContext.current)
+                    .data(profile.avatarURL)
+                    .crossfade(true)
+                    .build(),
+                contentDescription = null,
+                modifier = Modifier.size(82.dp).clip(CircleShape),
+                contentScale = ContentScale.Crop,
+            )
+            Text(
+                profile.name,
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.Bold,
+                textAlign = TextAlign.Center,
+            )
+            Text(
+                "LV${profile.level}",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.primary,
+                fontWeight = FontWeight.SemiBold,
+            )
+            if (profile.sign.isNotEmpty()) {
+                Text(
+                    profile.sign,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis,
+                    textAlign = TextAlign.Center,
+                )
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                ProfileStat(formatProfileCount(profile.following), "关注", Modifier.weight(1f))
+                ProfileStat(formatProfileCount(profile.followers), "粉丝", Modifier.weight(1f))
+                ProfileStat(profile.videoCount.toString(), "视频", Modifier.weight(1f))
+                ProfileStat(profile.articleCount.toString(), "专栏", Modifier.weight(1f))
+            }
+        }
+    }
+}
+
+@Composable
+private fun ProfileStat(value: String, label: String, modifier: Modifier = Modifier) {
+    Column(modifier = modifier, horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(
+            value,
+            style = MaterialTheme.typography.titleSmall,
+            fontWeight = FontWeight.Bold,
+            maxLines = 1,
+        )
+        Text(
+            label,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 
 @Composable
 private fun UserVideoCard(video: UserVideo) {
     Column {
-        Box(modifier = Modifier.fillMaxWidth().height(104.dp)) {
+        Box(modifier = Modifier.fillMaxWidth().aspectRatio(16f / 9f)) {
             AsyncImage(
                 model = ImageRequest.Builder(LocalContext.current)
                     .data(video.coverURL)
                     .crossfade(true)
                     .build(),
                 contentDescription = null,
-                modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(topStart = 12.dp, topEnd = 12.dp)),
+                modifier = Modifier.fillMaxSize(),
                 contentScale = ContentScale.Crop,
             )
             if (video.duration.isNotEmpty()) {
                 Text(
                     text = video.duration,
                     style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onPrimary,
+                    color = Color.White,
                     modifier = Modifier
                         .align(Alignment.BottomEnd)
-                        .padding(8.dp),
+                        .padding(7.dp)
+                        .background(Color.Black.copy(alpha = 0.65f), RoundedCornerShape(5.dp))
+                        .padding(horizontal = 5.dp, vertical = 2.dp),
                 )
             }
         }
-
         Column(
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(4.dp),
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 9.dp),
+            verticalArrangement = Arrangement.spacedBy(5.dp),
         ) {
             Text(
                 video.title,
@@ -232,7 +415,7 @@ private fun UserVideoCard(video: UserVideo) {
                 overflow = TextOverflow.Ellipsis,
             )
             Text(
-                "${formatCount(video.playCount)}播放 · ${formatCount(video.danmakuCount)}弹幕",
+                "${formatCount(video.playCount)}播放${formatDate(video.created)?.let { " · $it" }.orEmpty()}",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
@@ -242,18 +425,131 @@ private fun UserVideoCard(video: UserVideo) {
     }
 }
 
-private fun formatProfileCount(count: Long): String = when {
-    count >= 10000L -> {
-        val v = count / 1000 / 10.0
-        if (v >= 10) "${v.toLong()}万" else "%.1f万".format(v)
+@Composable
+private fun UserCollectionCard(collection: UserContentCollection, onClick: () -> Unit) {
+    ElevatedCard(
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surface),
+        elevation = CardDefaults.elevatedCardElevation(defaultElevation = 1.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            AsyncImage(
+                model = ImageRequest.Builder(LocalContext.current)
+                    .data(collection.coverURL)
+                    .crossfade(true)
+                    .build(),
+                contentDescription = null,
+                modifier = Modifier.size(82.dp).clip(RoundedCornerShape(14.dp)),
+                contentScale = ContentScale.Crop,
+            )
+            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                Text(
+                    collection.title,
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    "${collection.kind.title} · ${collection.itemCount} 个视频",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+                if (collection.description.isNotEmpty()) {
+                    Text(
+                        collection.description,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+            Icon(
+                Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
     }
+}
+
+@Composable
+private fun UserArticleCard(article: UserArticle, onClick: () -> Unit) {
+    ElevatedCard(
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surface),
+        elevation = CardDefaults.elevatedCardElevation(defaultElevation = 1.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            if (article.coverURL.isNotEmpty()) {
+                AsyncImage(
+                    model = ImageRequest.Builder(LocalContext.current)
+                        .data(article.coverURL)
+                        .crossfade(true)
+                        .build(),
+                    contentDescription = null,
+                    modifier = Modifier.size(96.dp, 70.dp).clip(RoundedCornerShape(12.dp)),
+                    contentScale = ContentScale.Crop,
+                )
+            }
+            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                Text(
+                    article.title,
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (article.summary.isNotEmpty()) {
+                    Text(
+                        article.summary,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                Text(
+                    listOfNotNull(
+                        formatDate(article.publishedAt),
+                        formatCount(article.viewCount).takeIf { article.viewCount > 0 }?.let { "$it 阅读" },
+                    ).joinToString(" · "),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+private fun formatProfileCount(count: Long): String = when {
+    count >= 100_000_000L -> compactDecimal(count, 100_000_000L, "亿")
+    count >= 10_000L -> compactDecimal(count, 10_000L, "万")
     else -> count.toString()
 }
 
-private fun formatCount(count: Long): String = when {
-    count >= 10000L -> {
-        val v = count / 1000 / 10.0
-        if (v >= 10) "${v.toLong()}万" else "%.1f万".format(v)
-    }
-    else -> count.toString()
+private fun formatCount(count: Long): String = formatProfileCount(count)
+
+private fun compactDecimal(value: Long, unit: Long, suffix: String): String {
+    val whole = value / unit
+    val decimal = (value % unit) * 10 / unit
+    return if (decimal == 0L) "$whole$suffix" else "$whole.$decimal$suffix"
+}
+
+private fun formatDate(seconds: Long): String? {
+    if (seconds <= 0) return null
+    return SimpleDateFormat("yyyy-MM-dd", Locale.CHINA).format(Date(seconds * 1000))
 }

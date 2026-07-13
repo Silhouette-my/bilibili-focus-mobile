@@ -10,10 +10,12 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import org.bilibilifocus.core.model.DynamicCard
+import org.bilibilifocus.core.model.FocusDynamicFilterKind
 import org.bilibilifocus.core.service.DynamicFeedService
 
 class FocusFeedViewModel(
     private val service: DynamicFeedService,
+    initialSelectedFilter: FocusDynamicFilterKind = FocusDynamicFilterKind.ALL,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main + kotlinx.coroutines.CoroutineExceptionHandler { _, e ->
         _state.value = FeedUiState.Failed(e.message ?: "加载失败")
@@ -27,6 +29,13 @@ class FocusFeedViewModel(
 
     private val _isLoadingMore = MutableStateFlow(false)
     val isLoadingMore: StateFlow<Boolean> = _isLoadingMore.asStateFlow()
+
+    private val _selectedFilter = MutableStateFlow(initialSelectedFilter)
+    val selectedFilter: StateFlow<FocusDynamicFilterKind> = _selectedFilter.asStateFlow()
+
+    fun selectFilter(filter: FocusDynamicFilterKind) {
+        _selectedFilter.value = filter
+    }
 
     fun loadIfNeeded() {
         if (_state.value !is FeedUiState.Idle) return

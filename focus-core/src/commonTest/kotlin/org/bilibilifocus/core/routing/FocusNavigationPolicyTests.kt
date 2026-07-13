@@ -34,6 +34,17 @@ class FocusNavigationPolicyTests {
     }
 
     @Test
+    fun `preserve episode cid when canonicalizing player URL`() {
+        val url = "https://www.bilibili.com/blackboard/html5player.html" +
+            "?bvid=BV1xx411c7mD&cid=3000000088&start_progress=123&foo=bar"
+        val result = FocusNavigationPolicy.canonicalWebURL(url)
+        assertEquals(
+            "https://www.bilibili.com/video/BV1xx411c7mD?cid=3000000088&start_progress=123",
+            result,
+        )
+    }
+
+    @Test
     fun `block openapp URL`() {
         val policy = FocusNavigationPolicy()
         val decision = policy.decision("https://www.bilibili.com/video/BV1xx/?openapp=1")

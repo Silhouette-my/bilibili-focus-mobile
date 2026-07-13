@@ -43,9 +43,11 @@ dependencies {
     implementation(libs.compose.ui.tooling.preview)
     implementation(libs.androidx.activity.compose)
     implementation(libs.coil.compose)
+    implementation("io.coil-kt:coil-gif:2.7.0")
     implementation("dev.chrisbanes.haze:haze:1.5.4")
     implementation("dev.chrisbanes.haze:haze-materials:1.5.4")
     implementation(libs.media3.exoplayer)
     implementation(libs.media3.ui)
+    testImplementation(kotlin("test"))
     debugImplementation(libs.compose.ui.tooling)
 }

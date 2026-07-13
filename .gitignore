@@ -1,5 +1,6 @@
 # Gradle
 .gradle/
+.gradle-home/
 build/
 */build/
 !gradle-wrapper.jar
@@ -19,6 +20,28 @@ captures/
 # KMP
 .kotlin/
 
+# iOS / Swift / Xcode
+.build/
+.build-tests/
+Build/
+.DerivedData/
+.DerivedData*/
+.tmp-*/
+.tmp-home/
+.swift-cache/
+.swift-home/
+.codex-clang-cache/
+*.xcuserstate
+*.xcarchive
+*.ipa
+*.bak
+*.dSYM
+BilibiliFocus.xcodeproj/xcuserdata/
+BilibiliFocus.xcodeproj/project.xcworkspace/xcuserdata/
+
 # Logs
 *.log
 
+# Local reverse-engineering and archival work
+.reverse/
+localonly/

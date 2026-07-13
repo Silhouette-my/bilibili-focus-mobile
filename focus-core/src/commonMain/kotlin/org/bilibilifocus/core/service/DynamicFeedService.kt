@@ -8,6 +8,7 @@ import kotlinx.serialization.json.jsonPrimitive
 import org.bilibilifocus.core.cookie.Cookie
 import org.bilibilifocus.core.cookie.CookieProvider
 import org.bilibilifocus.core.model.DynamicCard
+import org.bilibilifocus.core.routing.ArticleURL
 
 class DynamicFeedService(
     private val cookieProvider: CookieProvider,
@@ -47,10 +48,11 @@ class DynamicFeedService(
         return decodeFeedPage(response.body)
     }
 
-    private fun buildEndpoint(offset: String?): String {
+    internal fun buildEndpoint(offset: String?): String {
         val sb = StringBuilder("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all")
         sb.append("?type=all")
         sb.append("&timezone_offset=$timezoneOffsetMinutes")
+        sb.append("&features=itemOpusStyle")
         if (!offset.isNullOrEmpty()) {
             sb.append("&offset=$offset")
         }
@@ -114,7 +116,7 @@ class DynamicFeedService(
 
         val majorType = major.stringValueAt("type") ?: ""
 
-        val jumpCandidates = listOfNotNull(
+        val primaryJumpCandidates = listOfNotNull(
             normalizedURL(basic.stringValueAt("jump_url")),
             normalizedURL(major.stringValueAt("archive", "jump_url")),
             normalizedURL(major.stringValueAt("article", "jump_url")),
@@ -125,15 +127,40 @@ class DynamicFeedService(
             normalizedURL(major.stringValueAt("live", "jump_url")),
             normalizedURL(major.stringValueAt("opus", "jump_url")),
             normalizedURL(major.stringValueAt("common", "jump_url")),
-        ) + extractJumpURLs(major)
+        )
+        val jumpCandidates = primaryJumpCandidates + extractJumpURLs(major)
 
         val coverURLs = makeCoverURLs(major)
         val text = makeText(dynamic, major)
         val videoURL = jumpCandidates.firstOrNull { isVideoLikeURL(it) }
         val kind = makeKind(majorType, item.stringValueAt("type") ?: "", videoURL, coverURLs)
-        val targetURL = videoURL
-            ?: jumpCandidates.firstOrNull()
-            ?: fallbackTargetURL(id, kind)
+        val articleCvid = major.stringValueAt("article", "id")?.toLongOrNull()
+            ?: major.stringValueAt("article", "id_str")?.toLongOrNull()
+            ?: major.stringValueAt("article", "cvid")?.toLongOrNull()
+            ?: major.intValueAt("article", "id")?.toLong()
+            ?: jumpCandidates.firstNotNullOfOrNull(ArticleURL::extractCvid)
+        val articleURL = if (kind == DynamicCard.Kind.ARTICLE_LIKE) {
+            jumpCandidates.firstOrNull { ArticleURL.extractCvid(it) != null }
+                ?.let(ArticleURL::canonicalURL)
+                ?: articleCvid?.let(ArticleURL::canonicalURL)
+        } else {
+            null
+        }
+        val opusDetailURL = primaryJumpCandidates.firstOrNull(::isOpusLikeURL)
+        val targetURL = when (kind) {
+            DynamicCard.Kind.VIDEO -> videoURL
+                ?: primaryJumpCandidates.firstOrNull()
+                ?: jumpCandidates.firstOrNull()
+                ?: fallbackTargetURL(id, kind)
+            DynamicCard.Kind.ARTICLE_LIKE -> articleURL
+                ?: opusDetailURL
+                ?: primaryJumpCandidates.firstOrNull()
+                ?: jumpCandidates.firstOrNull()
+                ?: fallbackTargetURL(id, kind)
+            DynamicCard.Kind.TEXT,
+            DynamicCard.Kind.IMAGE,
+            -> opusDetailURL ?: fallbackTargetURL(id, kind)
+        }
 
         return DynamicCard(
             id = id,
@@ -148,9 +175,18 @@ class DynamicFeedService(
     }
 
     private fun makeText(dynamic: JsonObject, major: JsonObject): String {
-        val candidates = listOfNotNull(
+        val bodyCandidates = listOfNotNull(
+            richTextPlainText(dynamic.arrayValueAt("desc", "rich_text_nodes")),
+            richTextPlainText(dynamic.arrayValueAt("desc", "rich_text_nodes_v2")),
             dynamic.stringValueAt("desc", "text"),
+            richTextPlainText(major.arrayValueAt("opus", "summary", "rich_text_nodes")),
+            richTextPlainText(major.arrayValueAt("opus", "summary", "rich_text_nodes_v2")),
             major.stringValueAt("opus", "summary", "text"),
+        ).mapNotNull { it.trim().takeIf(String::isNotEmpty) }
+
+        bodyCandidates.maxByOrNull(String::length)?.let { return it }
+
+        val candidates = listOfNotNull(
             major.stringValueAt("archive", "title"),
             major.stringValueAt("article", "title"),
             major.stringValueAt("pgc", "title"),
@@ -164,6 +200,26 @@ class DynamicFeedService(
         return candidates
             .mapNotNull { it?.trim()?.takeIf { t -> t.isNotEmpty() } }
             .firstOrNull() ?: ""
+    }
+
+    private fun richTextPlainText(nodes: List<JsonElement>?): String? {
+        if (nodes.isNullOrEmpty()) return null
+        val text = buildString {
+            nodes.forEach { node ->
+                val dict = node as? JsonObject ?: return@forEach
+                append(
+                    dict.stringValueAt("word", "words")
+                        ?: dict.stringValueAt("words")
+                        ?: dict.stringValueAt("text")
+                        ?: dict.stringValueAt("orig_text")
+                        ?: dict.stringValueAt("rich", "text")
+                        ?: dict.stringValueAt("rich", "emoji", "text")
+                        ?: dict.stringValueAt("emoji", "text")
+                        ?: ""
+                )
+            }
+        }
+        return text.takeIf(String::isNotBlank)
     }
 
     private fun makeCoverURLs(major: JsonObject): List<String> {
@@ -227,6 +283,8 @@ class DynamicFeedService(
         var value = rawValue.trim()
         if (value.isEmpty()) return null
 
+        canonicalOpusURLFromScheme(value)?.let { return it }
+
         value = when {
             value.startsWith("//") -> "https:$value"
             value.startsWith("/opus/") || value.startsWith("/video/") ||
@@ -236,6 +294,23 @@ class DynamicFeedService(
         }
 
         return org.bilibilifocus.core.routing.FocusNavigationPolicy.canonicalWebURL(value)
+    }
+
+    private fun canonicalOpusURLFromScheme(value: String): String? {
+        val match = opusSchemePattern.find(value) ?: return null
+        return "https://www.bilibili.com/opus/${match.groupValues[1]}"
+    }
+
+    private fun isOpusLikeURL(url: String): Boolean {
+        val lower = url.lowercase()
+        val marker = "/opus/"
+        val markerIndex = lower.indexOf(marker)
+        if (markerIndex < 0 || "bilibili.com" !in lower.substring(0, markerIndex)) return false
+        val candidate = lower.substring(markerIndex + marker.length)
+            .substringBefore('?')
+            .substringBefore('#')
+            .trimEnd('/')
+        return candidate.isNotEmpty() && candidate.all { it.isDigit() }
     }
 
     private fun isVideoLikeURL(url: String): Boolean {
@@ -351,6 +426,10 @@ class DynamicFeedService(
     }
 
     companion object {
+        private val opusSchemePattern = Regex(
+            """^bilibili://(?:following/detail|opus/detail|dynamic)/(\d+)(?:[/?#].*)?$""",
+            RegexOption.IGNORE_CASE,
+        )
         private val urlKeyPatterns = setOf(
             "jump_url", "url", "link", "target_url", "target", "schema",
         )

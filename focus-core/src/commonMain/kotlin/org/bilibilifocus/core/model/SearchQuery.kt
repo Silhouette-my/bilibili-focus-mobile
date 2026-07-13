@@ -3,14 +3,23 @@ package org.bilibilifocus.core.model
 import kotlinx.serialization.Serializable
 
 @Serializable
-data class SearchQuery(
+@ConsistentCopyVisibility
+data class SearchQuery private constructor(
     val keyword: String,
 ) {
+    init {
+        require(keyword == keyword.trim()) { "keyword 必须去除首尾空白" }
+    }
+
     val resultURL: String
         get() {
-            val encoded = org.bilibilifocus.core.routing.urlEncode(keyword.trim())
+            val encoded = org.bilibilifocus.core.routing.urlEncode(keyword)
             return "https://search.bilibili.com/all?keyword=$encoded"
         }
+
+    companion object {
+        operator fun invoke(keyword: String): SearchQuery = SearchQuery(keyword.trim())
+    }
 }
 
 @Serializable

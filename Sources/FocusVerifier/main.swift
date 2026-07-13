@@ -28,12 +28,12 @@ struct FocusVerifier {
                 checks: [
                     ("search recommendation hidden", "getComputedStyle(document.querySelector('.search-recommend')).display", "none"),
                     ("search result preserved", "document.querySelector('.search-list').textContent.includes('Core Search Results') ? 'true' : 'false'", "true"),
-                    ("search video href canonicalized", "document.querySelector('.video-link').href", "https://www.bilibili.com/video/BV1xx411c7mD"),
+                    ("search video href canonicalized", "document.querySelector('.video-link').href", "https://www.bilibili.com/video/BV1xx411c7mD/"),
                 ]
             )
             try await verifyFixture(
                 name: "video",
-                url: URL(string: "https://www.bilibili.com/video/BV1xx411c7mD")!,
+                url: URL(string: "https://www.bilibili.com/video/BV1xx411c7mD/")!,
                 html: videoHTML,
                 checks: [
                     ("video title hidden", "getComputedStyle(document.querySelector('#viewbox_report')).display", "none"),
@@ -46,9 +46,9 @@ struct FocusVerifier {
                           .map((node) => node.textContent.trim())
                           .join('|')
                         """,
-                        "Like|Favorite|Share"
+                        "Like|Coin|Favorite|Share"
                     ),
-                    ("video coin hidden", "getComputedStyle(document.querySelector('.toolbar-left-item-wrap')).display", "none"),
+                    ("video coin visible", "getComputedStyle(document.querySelector('.toolbar-left-item-wrap')).display", "block"),
                     ("video parts preserved", "Array.from(document.querySelectorAll('.video-pod__item')).map((node) => node.textContent.trim()).join('|')", "P1|P2"),
                     ("video recommendation hidden", "getComputedStyle(document.querySelector('.rec-list')).display", "none"),
                     ("video no horizontal overflow", "(document.documentElement.scrollWidth <= document.documentElement.clientWidth) ? 'true' : 'false'", "true"),

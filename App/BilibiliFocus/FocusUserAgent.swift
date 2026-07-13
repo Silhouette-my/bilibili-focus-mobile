@@ -2,6 +2,7 @@
 import UIKit
 
 enum FocusUserAgent {
+    @MainActor
     static func mobileSafari() -> String {
         let idiom = UIDevice.current.userInterfaceIdiom
         let deviceName = idiom == .pad ? "iPad" : "iPhone"

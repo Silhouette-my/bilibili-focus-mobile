@@ -4,10 +4,46 @@ import SwiftUI
 import UIKit
 import WebKit
 
+enum FocusWebSettingsUpdate: Equatable {
+    case none
+    case appearance
+    case pageRules
+
+    static func classify(
+        previous: FocusSettings,
+        current: FocusSettings,
+        previousDarkMode: Bool,
+        currentDarkMode: Bool
+    ) -> FocusWebSettingsUpdate {
+        let pageRulesChanged = previous.redirectEnabled != current.redirectEnabled
+            || previous.playerMaskEnabled != current.playerMaskEnabled
+            || previous.searchMaskEnabled != current.searchMaskEnabled
+            || previous.dynamicMaskEnabled != current.dynamicMaskEnabled
+        if pageRulesChanged {
+            return .pageRules
+        }
+        if previousDarkMode != currentDarkMode {
+            return .appearance
+        }
+        return .none
+    }
+}
+
 struct FocusWebView: UIViewRepresentable {
-    @ObservedObject var viewModel: FocusBrowserViewModel
+    let viewModel: FocusBrowserViewModel
     @ObservedObject var settingsStore: FocusSettingsStore
     @Environment(\.colorScheme) private var colorScheme
+
+    private func resolvedDarkMode() -> Bool {
+        switch settingsStore.settings.themeMode {
+        case .system:
+            return colorScheme == .dark
+        case .light:
+            return false
+        case .dark:
+            return true
+        }
+    }
 
     func makeCoordinator() -> Coordinator {
         Coordinator(viewModel: viewModel)
@@ -23,7 +59,11 @@ struct FocusWebView: UIViewRepresentable {
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.customUserAgent = FocusUserAgent.mobileSafari()
         webView.allowsBackForwardNavigationGestures = false
-        webView.overrideUserInterfaceStyle = colorScheme == .dark ? .dark : .light
+        let isDarkMode = resolvedDarkMode()
+        webView.overrideUserInterfaceStyle = isDarkMode ? .dark : .light
+        webView.isOpaque = false
+        webView.backgroundColor = isDarkMode ? UIColor(red: 0.06, green: 0.07, blue: 0.09, alpha: 1) : UIColor(red: 0.965, green: 0.969, blue: 0.98, alpha: 1)
+        webView.scrollView.backgroundColor = webView.backgroundColor
         if #available(iOS 16.4, *) {
             webView.isInspectable = true
         }
@@ -32,17 +72,10 @@ struct FocusWebView: UIViewRepresentable {
         context.coordinator.installScripts(
             on: webView,
             settings: settingsStore.settings,
-            isDarkMode: colorScheme == .dark
+            isDarkMode: isDarkMode
         )
         viewModel.attach(
             webView: webView,
-            reconfigureScripts: { [weak coordinator = context.coordinator] webView, settings in
-                coordinator?.installScripts(
-                    on: webView,
-                    settings: settings,
-                    isDarkMode: colorScheme == .dark
-                )
-            },
             prepareForURL: { [weak coordinator = context.coordinator] webView, url in
                 coordinator?.prepare(webView: webView, for: url)
             }
@@ -51,18 +84,51 @@ struct FocusWebView: UIViewRepresentable {
     }
 
     func updateUIView(_ webView: WKWebView, context: Context) {
-        let isDarkMode = colorScheme == .dark
+        let isDarkMode = resolvedDarkMode()
         webView.overrideUserInterfaceStyle = isDarkMode ? .dark : .light
-        if context.coordinator.lastAppliedSettings != settingsStore.settings
-            || context.coordinator.lastAppliedDarkMode != isDarkMode
-        {
+        webView.backgroundColor = isDarkMode ? UIColor(red: 0.06, green: 0.07, blue: 0.09, alpha: 1) : UIColor(red: 0.965, green: 0.969, blue: 0.98, alpha: 1)
+        webView.scrollView.backgroundColor = webView.backgroundColor
+        guard
+            let previousSettings = context.coordinator.lastAppliedSettings,
+            let previousDarkMode = context.coordinator.lastAppliedDarkMode
+        else {
             context.coordinator.installScripts(
                 on: webView,
                 settings: settingsStore.settings,
                 isDarkMode: isDarkMode
             )
+            return
+        }
+
+        switch FocusWebSettingsUpdate.classify(
+            previous: previousSettings,
+            current: settingsStore.settings,
+            previousDarkMode: previousDarkMode,
+            currentDarkMode: isDarkMode
+        ) {
+        case .none:
+            context.coordinator.record(settings: settingsStore.settings, isDarkMode: isDarkMode)
+        case .appearance:
+            context.coordinator.applyAppearance(
+                on: webView,
+                settings: settingsStore.settings,
+                isDarkMode: isDarkMode
+            )
+        case .pageRules:
+            context.coordinator.installScripts(
+                on: webView,
+                settings: settingsStore.settings,
+                isDarkMode: isDarkMode
+            )
+            guard viewModel.isSessionActive else {
+                return
+            }
             context.coordinator.reapplyCurrentPageScripts(on: webView)
         }
+    }
+
+    static func dismantleUIView(_ webView: WKWebView, coordinator: Coordinator) {
+        coordinator.tearDown(webView: webView)
     }
 
     @MainActor
@@ -79,6 +145,18 @@ struct FocusWebView: UIViewRepresentable {
             self.viewModel = viewModel
         }
 
+        func tearDown(webView: WKWebView) {
+            let controller = webView.configuration.userContentController
+            webView.evaluateJavaScript("window.__FOCUS_NATIVE_PLAYER_BRIDGE__?.teardown?.(); window.__FOCUS_NATIVE_PLAYER_BRIDGE__ = null;")
+            controller.removeScriptMessageHandler(forName: "getConfig")
+            controller.removeScriptMessageHandler(forName: "logDebug")
+            controller.removeScriptMessageHandler(forName: "playerState")
+            controller.removeAllUserScripts()
+            webView.navigationDelegate = nil
+            webView.uiDelegate = nil
+            viewModel.detach(webView: webView)
+        }
+
         func prepare(webView: WKWebView, for url: URL) {
             let useDesktopMode = FocusUserAgent.shouldUseDesktopMode(for: url)
             lastPreparedUsesDesktopMode = useDesktopMode
@@ -91,12 +169,23 @@ struct FocusWebView: UIViewRepresentable {
             controller.removeAllUserScripts()
             controller.removeScriptMessageHandler(forName: "getConfig")
             controller.removeScriptMessageHandler(forName: "logDebug")
+            controller.removeScriptMessageHandler(forName: "playerState")
             controller.add(self, name: "getConfig")
             controller.add(self, name: "logDebug")
+            controller.add(self, name: "playerState")
 
+            let bootstrapAppearanceScript = FocusWebAppearance.bootstrapCSS(isDarkMode: isDarkMode)
             let appearanceScript = FocusWebAppearance.script(isDarkMode: isDarkMode)
             let documentStartScript = try? FocusScriptBuilder.makeUserScript(for: .documentStart, settings: settings)
             let documentEndScript = try? FocusScriptBuilder.makeUserScript(for: .documentEnd, settings: settings)
+            controller.addUserScript(
+                WKUserScript(
+                    source: bootstrapAppearanceScript,
+                    injectionTime: .atDocumentStart,
+                    forMainFrameOnly: true
+                )
+            )
+
             controller.addUserScript(
                 WKUserScript(
                     source: appearanceScript,
@@ -140,6 +229,19 @@ struct FocusWebView: UIViewRepresentable {
             lastDocumentEndScript = documentEndScript
         }
 
+        func record(settings: FocusSettings, isDarkMode: Bool) {
+            lastAppliedSettings = settings
+            lastAppliedDarkMode = isDarkMode
+        }
+
+        func applyAppearance(on webView: WKWebView, settings: FocusSettings, isDarkMode: Bool) {
+            let appearanceScript = FocusWebAppearance.script(isDarkMode: isDarkMode)
+            lastAppliedSettings = settings
+            lastAppliedDarkMode = isDarkMode
+            lastAppearanceScript = appearanceScript
+            webView.evaluateJavaScript(appearanceScript)
+        }
+
         func reapplyCurrentPageScripts(on webView: WKWebView) {
             if let lastAppearanceScript {
                 webView.evaluateJavaScript(lastAppearanceScript)
@@ -150,6 +252,155 @@ struct FocusWebView: UIViewRepresentable {
             if let lastDocumentEndScript {
                 webView.evaluateJavaScript(lastDocumentEndScript)
             }
+            installPlayerStateBridge(on: webView)
+        }
+
+        func installPlayerStateBridge(on webView: WKWebView) {
+            guard let context = viewModel.playerBridgeContext(for: webView) else {
+                return
+            }
+
+            let sessionID = context.sessionID
+            let revision = context.revision
+            let script = """
+            (() => {
+              const browserSessionID = '\(sessionID)';
+              const navigationRevision = \(revision);
+              const existing = window.__FOCUS_NATIVE_PLAYER_BRIDGE__;
+              if (existing
+                && existing.browserSessionID === browserSessionID
+                && existing.navigationRevision === navigationRevision) {
+                existing.emit?.();
+                return true;
+              }
+
+              try {
+                existing?.teardown?.();
+              } catch (_) {}
+
+              let emitTimer = null;
+              let tornDown = false;
+              const previousPlayerStateListener = window.__FOCUS_PLAYER_STATE_LISTENER__;
+              const eventNames = [
+                'play',
+                'pause',
+                'ratechange',
+                'loadedmetadata',
+                'fullscreenchange',
+                'webkitfullscreenchange',
+                'webkitbeginfullscreen',
+                'webkitendfullscreen',
+                'webkitpresentationmodechanged'
+              ];
+
+              const fallbackSnapshot = () => {
+                const videos = Array.from(document.querySelectorAll('video'));
+                const video = window.__FOCUS_ACTIVE_VIDEO__?.isConnected
+                  ? window.__FOCUS_ACTIVE_VIDEO__
+                  : videos[0] || null;
+                const textTracks = video?.textTracks ? Array.from(video.textTracks) : [];
+                return {
+                  hasPlayer: !!video || !!document.querySelector('#bilibili-player, .bpx-player-container, #playerWrap, .player-container'),
+                  pageURL: location.href,
+                  pageTitle: document.title || '',
+                  videoTitle: '',
+                  isPlaying: !!video && !video.paused && !video.ended,
+                  playbackRate: Number(video?.playbackRate || 1),
+                  isDanmakuHidden: document.documentElement.classList.contains('focus-hide-danmaku'),
+                  hasSubtitles: textTracks.length > 0 || !!document.querySelector('[class*="subtitle"]'),
+                  isSubtitleHidden: textTracks.length > 0 && textTracks.every((track) => track.mode === 'disabled'),
+                  isFullscreen: !!document.fullscreenElement
+                    || video?.webkitPresentationMode === 'fullscreen'
+                    || video?.webkitDisplayingFullscreen === true
+                };
+              };
+
+              const emit = (providedSnapshot = null) => {
+                if (tornDown) {
+                  return;
+                }
+                if (!providedSnapshot && typeof window.__FOCUS_SNAPSHOT_PLAYER_STATE__ === 'function') {
+                  try {
+                    window.__FOCUS_SNAPSHOT_PLAYER_STATE__();
+                    return;
+                  } catch (_) {}
+                }
+                let snapshot = providedSnapshot || window.__FOCUS_PLAYER_STATE__;
+                if (!snapshot || typeof snapshot !== 'object') {
+                  snapshot = fallbackSnapshot();
+                }
+                try {
+                  window.webkit.messageHandlers.playerState.postMessage({
+                    ...snapshot,
+                    browserSessionID,
+                    navigationRevision,
+                    pageURL: location.href,
+                    pageTitle: snapshot.pageTitle || document.title || ''
+                  });
+                } catch (_) {}
+              };
+
+              const scheduleEmit = (delay = 40) => {
+                clearTimeout(emitTimer);
+                emitTimer = setTimeout(emit, delay);
+              };
+              const eventHandler = (event) => {
+                if (event.target instanceof HTMLVideoElement) {
+                  window.__FOCUS_ACTIVE_VIDEO__ = event.target;
+                }
+                scheduleEmit(event.type === 'ratechange' ? 10 : 40);
+              };
+              const clickHandler = (event) => {
+                const target = event.target;
+                if (!target?.closest?.('.bpx-player-container, #bilibili-player, #playerWrap, [class*="player"]')) {
+                  return;
+                }
+                scheduleEmit(80);
+              };
+
+              eventNames.forEach((eventName) => {
+                document.addEventListener(eventName, eventHandler, true);
+              });
+              document.addEventListener('click', clickHandler, true);
+              const observer = new MutationObserver(() => scheduleEmit(100));
+              observer.observe(document.documentElement, { childList: true, subtree: true });
+              window.__FOCUS_PLAYER_STATE_LISTENER__ = emit;
+
+              const teardown = () => {
+                if (tornDown) {
+                  return;
+                }
+                tornDown = true;
+                clearTimeout(emitTimer);
+                observer.disconnect();
+                eventNames.forEach((eventName) => {
+                  document.removeEventListener(eventName, eventHandler, true);
+                });
+                document.removeEventListener('click', clickHandler, true);
+                if (window.__FOCUS_PLAYER_STATE_LISTENER__ === emit) {
+                  window.__FOCUS_PLAYER_STATE_LISTENER__ = previousPlayerStateListener;
+                }
+              };
+
+              window.__FOCUS_NATIVE_PLAYER_BRIDGE__ = {
+                browserSessionID,
+                navigationRevision,
+                emit,
+                teardown
+              };
+              scheduleEmit(0);
+              return true;
+            })();
+            """
+            webView.evaluateJavaScript(script)
+        }
+
+        private func shouldSkipFinishScriptReplay(for url: URL?) -> Bool {
+            guard let url else {
+                return false
+            }
+
+            return FocusUserAgent.shouldUseDesktopPlayback(for: url)
         }
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
@@ -161,14 +412,19 @@ struct FocusWebView: UIViewRepresentable {
                 webView.evaluateJavaScript("window.__FOCUS_CONFIG__ = \(configJSON);")
             case "logDebug":
                 print("[Focus Debug]", message.body)
+            case "playerState":
+                viewModel.handlePlayerStateMessage(message.body, from: message.webView)
             default:
                 break
             }
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-            reapplyCurrentPageScripts(on: webView)
+            if !shouldSkipFinishScriptReplay(for: webView.url) {
+                reapplyCurrentPageScripts(on: webView)
+            }
             viewModel.updateNavigationState(from: webView)
+            installPlayerStateBridge(on: webView)
         }
 
         func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
@@ -176,7 +432,7 @@ struct FocusWebView: UIViewRepresentable {
         }
 
         func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
-            viewModel.updateNavigationState(from: webView)
+            viewModel.commitNavigationState(from: webView)
         }
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
@@ -188,7 +444,7 @@ struct FocusWebView: UIViewRepresentable {
         }
 
         func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-            viewModel.updateNavigationState(from: webView)
+            viewModel.handleWebContentProcessTermination(webView)
         }
 
         func webView(
@@ -201,6 +457,17 @@ struct FocusWebView: UIViewRepresentable {
                 let url = navigationAction.request.url
             else {
                 decisionHandler(.allow)
+                return
+            }
+
+            if viewModel.handleFocusActionURL(url) {
+                decisionHandler(.cancel)
+                return
+            }
+
+            if viewModel.shouldRouteVideoNavigationToNative(url, currentURL: webView.url) {
+                decisionHandler(.cancel)
+                viewModel.openNativeVideo(url)
                 return
             }
 
@@ -229,6 +496,7 @@ struct FocusWebView: UIViewRepresentable {
                     from: webView.url,
                     navigationType: navigationAction.navigationType
                 )
+                installPlayerStateBridge(on: webView)
                 let desiredDesktopMode = FocusUserAgent.shouldUseDesktopMode(for: url)
                 if desiredDesktopMode != lastPreparedUsesDesktopMode {
                     decisionHandler(.cancel)

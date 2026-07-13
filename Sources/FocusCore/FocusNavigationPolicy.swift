@@ -44,7 +44,15 @@ public struct FocusNavigationPolicy: Sendable {
         let isStandardBilibiliHost = host == "www.bilibili.com" || host == "bilibili.com" || host == "m.bilibili.com"
 
         if isStandardBilibiliHost && (path.hasPrefix("/video/") || path.hasPrefix("/bangumi/play/")) {
+            components?.scheme = "https"
             components?.host = "www.bilibili.com"
+            if path.hasPrefix("/video/"), components?.path.hasSuffix("/") == false {
+                components?.path += "/"
+            }
+            if path.hasPrefix("/video/") {
+                let filteredItems = filteredVideoQueryItems(from: components?.queryItems)
+                components?.queryItems = filteredItems
+            }
             return components?.url ?? url
         }
 
@@ -56,6 +64,9 @@ public struct FocusNavigationPolicy: Sendable {
                 components?.path = videoPath
                 components?.queryItems = filteredItems
                 components?.fragment = nil
+                if components?.path.hasPrefix("/video/") == true, components?.path.hasSuffix("/") == false {
+                    components?.path += "/"
+                }
                 return components?.url ?? url
             }
         }
@@ -142,11 +153,11 @@ public struct FocusNavigationPolicy: Sendable {
     private static func filteredVideoQueryItems(from items: [URLQueryItem]?) -> [URLQueryItem]? {
         let preservedNames: Set<String> = [
             "p",
+            "cid",
             "t",
             "start_progress",
             "start_progress_ms",
             "spm_id_from",
-            "vd_source",
             "from_spmid",
             "from_source",
         ]

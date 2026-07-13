@@ -7,7 +7,10 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.compose.runtime.Composable
-import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.viewinterop.AndroidView
 
 @SuppressLint("SetJavaScriptEnabled")
@@ -20,7 +23,13 @@ fun FocusWebView(
     onPageFinished: (String) -> Unit = {},
     onError: (String) -> Unit = {},
 ) {
-    val isDarkMode = isSystemInDarkTheme()
+    val isDarkMode = MaterialTheme.colorScheme.background.luminance() < 0.5f
+    val currentDarkMode by rememberUpdatedState(isDarkMode)
+    val currentUserScript by rememberUpdatedState(userScript)
+    val currentOnUrlChanged by rememberUpdatedState(onUrlChanged)
+    val currentOnPageStarted by rememberUpdatedState(onPageStarted)
+    val currentOnPageFinished by rememberUpdatedState(onPageFinished)
+    val currentOnError by rememberUpdatedState(onError)
     AndroidView(
         factory = { context ->
             WebView(context).apply {
@@ -39,15 +48,15 @@ fun FocusWebView(
                 webViewClient = object : WebViewClient() {
                     override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                         super.onPageStarted(view, url, favicon)
-                        onPageStarted()
+                        currentOnPageStarted()
                     }
 
                     override fun onPageFinished(view: WebView?, url: String?) {
                         super.onPageFinished(view, url)
                         if (url != null) {
-                            view?.evaluateJavascript(buildBilibiliThemeScript(isDarkMode), null)
-                            onPageFinished(url)
-                            userScript?.let { script ->
+                            view?.evaluateJavascript(buildBilibiliThemeScript(currentDarkMode), null)
+                            currentOnPageFinished(url)
+                            currentUserScript?.let { script ->
                                 view?.evaluateJavascript(script, null)
                             }
                         }
@@ -56,7 +65,7 @@ fun FocusWebView(
                     override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
                         super.doUpdateVisitedHistory(view, url, isReload)
                         if (url != null) {
-                            onUrlChanged(url)
+                            currentOnUrlChanged(url)
                         }
                     }
 
@@ -66,7 +75,7 @@ fun FocusWebView(
                         error: WebResourceError?,
                     ) {
                         if (request?.isForMainFrame == true && error != null) {
-                            onError("${error.errorCode}: ${error.description}")
+                            currentOnError("${error.errorCode}: ${error.description}")
                         }
                     }
 
@@ -92,7 +101,7 @@ fun FocusWebView(
             if (webView.url != url) {
                 webView.loadUrl(url)
             } else {
-                webView.evaluateJavascript(buildBilibiliThemeScript(isDarkMode), null)
+                webView.evaluateJavascript(buildBilibiliThemeScript(currentDarkMode), null)
             }
         },
     )

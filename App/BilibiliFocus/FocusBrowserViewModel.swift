@@ -5,6 +5,82 @@ import FocusCore
 import Foundation
 import WebKit
 
+struct PlayerSnapshot: Equatable, Sendable {
+    var hasPlayer: Bool
+    var isPlaying: Bool
+    var playbackRate: Double
+    var isDanmakuHidden: Bool
+    var hasSubtitles: Bool
+    var isSubtitleHidden: Bool
+    var isFullscreen: Bool
+
+    static let empty = PlayerSnapshot(
+        hasPlayer: false,
+        isPlaying: false,
+        playbackRate: 1,
+        isDanmakuHidden: false,
+        hasSubtitles: false,
+        isSubtitleHidden: false,
+        isFullscreen: false
+    )
+}
+
+struct BrowserSessionID: Equatable, Hashable, Sendable {
+    let rawValue: UUID
+
+    init(rawValue: UUID = UUID()) {
+        self.rawValue = rawValue
+    }
+
+    var stringValue: String {
+        rawValue.uuidString.lowercased()
+    }
+}
+
+struct NavigationRevision: Equatable, Hashable, Sendable {
+    let rawValue: UInt64
+}
+
+struct BrowserCallbackStamp: Equatable {
+    let sessionID: BrowserSessionID
+    let revision: NavigationRevision
+    let canonicalURL: URL
+    let webViewIdentifier: ObjectIdentifier
+}
+
+enum BrowserCallbackGate {
+    static func accepts(_ callback: BrowserCallbackStamp, current: BrowserCallbackStamp) -> Bool {
+        callback == current
+    }
+}
+
+enum WebContentRecoveryDecision: Equatable {
+    case inactive
+    case recover(URL)
+    case showRetry(String)
+}
+
+enum WebContentRecoveryPolicy {
+    static let automaticAttemptLimit = 1
+
+    static func decision(
+        isSessionActive: Bool,
+        attempts: Int,
+        recoveryURL: URL?
+    ) -> WebContentRecoveryDecision {
+        guard isSessionActive else {
+            return .inactive
+        }
+        guard attempts < automaticAttemptLimit else {
+            return .showRetry("网页进程已停止，点重试重新加载当前页面。")
+        }
+        guard let recoveryURL else {
+            return .showRetry("网页进程已停止，且没有可恢复的页面地址。")
+        }
+        return .recover(recoveryURL)
+    }
+}
+
 @MainActor
 final class FocusAppViewModel: ObservableObject {
     enum PrimaryTab {
@@ -13,21 +89,31 @@ final class FocusAppViewModel: ObservableObject {
         case my
     }
 
-    enum Route {
+    struct RouteID: Hashable, Sendable {
+        let rawValue: UUID
+
+        init(rawValue: UUID = UUID()) {
+            self.rawValue = rawValue
+        }
+    }
+
+    enum AppRoute {
         case dynamicFeed
         case searchResults(SearchQuery)
         case my
         case history
-        case userSpace(URL)
-        case userCollection(FocusUserSpaceCollection)
-        case article(URL)
-        case opus(URL)
-        case browser(URL)
+        case favoriteFolder(FocusMyFolder)
+        case userSpace(RouteID, URL)
+        case userCollection(RouteID, FocusUserSpaceCollection)
+        case article(RouteID, URL)
+        case opus(RouteID, URL)
+        case video(RouteID, URL)
+        case browser(URL, FocusBrowserViewModel.EntryContext)
     }
 
     private static let loginURL = URL(string: "https://passport.bilibili.com/login")!
 
-    @Published private(set) var route: Route = .dynamicFeed
+    @Published private(set) var routeStack: [AppRoute] = [.dynamicFeed]
     @Published private(set) var hasInstantiatedBrowser = false
     @Published var showSettings = false
     @Published var showSearch = false
@@ -39,27 +125,35 @@ final class FocusAppViewModel: ObservableObject {
     let searchResultsViewModel: FocusSearchResultsViewModel
     let myViewModel: FocusMyViewModel
     let historyViewModel: FocusHistoryViewModel
-    let userSpaceViewModel: FocusUserSpaceViewModel
-    let userCollectionViewModel: FocusUserCollectionViewModel
-    let articleViewModel: FocusArticleViewModel
-    let opusDetailViewModel: FocusOpusDetailViewModel
+    let favoriteFolderViewModel: FocusFavoriteFolderViewModel
     private let cookieProvider: WebViewCookieSnapshotProvider
     private let nativePageAugmentService: FocusNativePageAugmentService
+    private let userSpaceService: FocusUserSpaceService
+    private let userCollectionService: FocusUserSpaceService
+    private let articleService: FocusArticleService
+    private let opusDetailService: FocusOpusDetailService
+    private let videoDetailService: FocusVideoDetailService
+    private let videoActionService: FocusVideoActionService
+    private var userSpaceViewModels: [RouteID: FocusUserSpaceViewModel] = [:]
+    private var userCollectionViewModels: [RouteID: FocusUserCollectionViewModel] = [:]
+    private var articleViewModels: [RouteID: FocusArticleViewModel] = [:]
+    private var opusDetailViewModels: [RouteID: FocusOpusDetailViewModel] = [:]
+    private var videoViewModels: [RouteID: FocusNativeVideoViewModel] = [:]
 
     private var didHandleLaunchEntry = false
-    private var browserReturnRoute: Route = .dynamicFeed
-    private var historyReturnRoute: Route = .my
-    private var userSpaceReturnRoute: Route = .dynamicFeed
-    private var userCollectionReturnRoute: Route = .dynamicFeed
-    private var articleReturnRoute: Route = .dynamicFeed
-    private var opusReturnRoute: Route = .dynamicFeed
-    private var cancellables: Set<AnyCancellable> = []
+    private var didRefreshOnBecomeActive = false
+    private var activeRouteCancellables: Set<AnyCancellable> = []
+
+    var route: AppRoute {
+        routeStack.last ?? .dynamicFeed
+    }
 
     init(settingsStore: FocusSettingsStore) {
         self.settingsStore = settingsStore
 
         let browserViewModel = FocusBrowserViewModel(settingsStore: settingsStore)
         let cookieProvider = WebViewCookieSnapshotProvider()
+        let videoCookieProvider = WebViewCookieSnapshotProvider(performsLoginWarmup: false)
         let nativePageAugmentService = FocusNativePageAugmentService(cookieProvider: cookieProvider)
         let myDataService = FocusMyDataService(cookieProvider: cookieProvider)
         let dynamicFeedViewModel = FocusDynamicFeedViewModel(
@@ -70,19 +164,13 @@ final class FocusAppViewModel: ObservableObject {
         )
         let myViewModel = FocusMyViewModel(service: myDataService)
         let historyViewModel = FocusHistoryViewModel(service: myDataService)
-        let userSpaceViewModel = FocusUserSpaceViewModel(
-            service: FocusUserSpaceService(cookieProvider: cookieProvider)
-        )
-        let userCollectionViewModel = FocusUserCollectionViewModel(
-            service: FocusUserSpaceService(cookieProvider: cookieProvider)
-        )
-        let articleViewModel = FocusArticleViewModel(
-            service: FocusArticleService(cookieProvider: cookieProvider)
-        )
-        let opusDetailViewModel = FocusOpusDetailViewModel(
-            detailService: FocusOpusDetailService(cookieProvider: cookieProvider),
-            augmentService: nativePageAugmentService
-        )
+        let favoriteFolderViewModel = FocusFavoriteFolderViewModel(service: myDataService)
+        let userSpaceService = FocusUserSpaceService(cookieProvider: cookieProvider)
+        let userCollectionService = FocusUserSpaceService(cookieProvider: cookieProvider)
+        let articleService = FocusArticleService(cookieProvider: cookieProvider)
+        let opusDetailService = FocusOpusDetailService(cookieProvider: cookieProvider)
+        let videoDetailService = FocusVideoDetailService(cookieProvider: videoCookieProvider)
+        let videoActionService = FocusVideoActionService(cookieProvider: videoCookieProvider)
 
         self.browserViewModel = browserViewModel
         self.cookieProvider = cookieProvider
@@ -91,10 +179,13 @@ final class FocusAppViewModel: ObservableObject {
         self.searchResultsViewModel = searchResultsViewModel
         self.myViewModel = myViewModel
         self.historyViewModel = historyViewModel
-        self.userSpaceViewModel = userSpaceViewModel
-        self.userCollectionViewModel = userCollectionViewModel
-        self.articleViewModel = articleViewModel
-        self.opusDetailViewModel = opusDetailViewModel
+        self.favoriteFolderViewModel = favoriteFolderViewModel
+        self.userSpaceService = userSpaceService
+        self.userCollectionService = userCollectionService
+        self.articleService = articleService
+        self.opusDetailService = opusDetailService
+        self.videoDetailService = videoDetailService
+        self.videoActionService = videoActionService
         browserViewModel.nativePageAugmentService = nativePageAugmentService
 
         browserViewModel.onEntryRequest = { [weak self] entry in
@@ -109,11 +200,116 @@ final class FocusAppViewModel: ObservableObject {
             }
         }
 
-        browserViewModel.objectWillChange
-            .sink { [weak self] _ in
-                self?.objectWillChange.send()
+        browserViewModel.onVideoRequest = { [weak self] url in
+            Task { @MainActor [weak self] in
+                self?.openNativeVideo(url)
             }
-            .store(in: &cancellables)
+        }
+
+        observeActiveRoute()
+    }
+
+    func userSpaceViewModel(for routeID: RouteID) -> FocusUserSpaceViewModel {
+        if let viewModel = userSpaceViewModels[routeID] {
+            return viewModel
+        }
+        let viewModel = FocusUserSpaceViewModel(service: userSpaceService)
+        userSpaceViewModels[routeID] = viewModel
+        return viewModel
+    }
+
+    func userCollectionViewModel(for routeID: RouteID) -> FocusUserCollectionViewModel {
+        if let viewModel = userCollectionViewModels[routeID] {
+            return viewModel
+        }
+        let viewModel = FocusUserCollectionViewModel(service: userCollectionService)
+        userCollectionViewModels[routeID] = viewModel
+        return viewModel
+    }
+
+    func articleViewModel(for routeID: RouteID) -> FocusArticleViewModel {
+        if let viewModel = articleViewModels[routeID] {
+            return viewModel
+        }
+        let viewModel = FocusArticleViewModel(service: articleService)
+        articleViewModels[routeID] = viewModel
+        return viewModel
+    }
+
+    func opusDetailViewModel(for routeID: RouteID) -> FocusOpusDetailViewModel {
+        if let viewModel = opusDetailViewModels[routeID] {
+            return viewModel
+        }
+        let viewModel = FocusOpusDetailViewModel(
+            detailService: opusDetailService,
+            augmentService: nativePageAugmentService
+        )
+        opusDetailViewModels[routeID] = viewModel
+        return viewModel
+    }
+
+    func videoViewModel(for routeID: RouteID) -> FocusNativeVideoViewModel {
+        if let viewModel = videoViewModels[routeID] {
+            return viewModel
+        }
+        let viewModel = FocusNativeVideoViewModel(
+            detailService: videoDetailService,
+            actionService: videoActionService,
+            nativeDanmakuEnabled: settingsStore.settings.nativeDanmakuEnabled,
+            danmakuPreferenceChange: { [weak settingsStore] enabled in
+                settingsStore?.settings.nativeDanmakuEnabled = enabled
+            }
+        )
+        videoViewModels[routeID] = viewModel
+        return viewModel
+    }
+
+    private func observeActiveRoute() {
+        activeRouteCancellables.removeAll()
+
+        switch route {
+        case .dynamicFeed:
+            forwardActiveChanges(from: dynamicFeedViewModel)
+        case .searchResults:
+            forwardActiveChanges(from: searchResultsViewModel)
+        case .my:
+            forwardActiveChanges(from: myViewModel)
+        case .history:
+            forwardActiveChanges(from: historyViewModel)
+        case .favoriteFolder:
+            forwardActiveChanges(from: favoriteFolderViewModel)
+        case let .userSpace(routeID, _):
+            forwardActiveChanges(from: userSpaceViewModel(for: routeID))
+        case let .userCollection(routeID, _):
+            forwardActiveChanges(from: userCollectionViewModel(for: routeID))
+        case let .article(routeID, _):
+            forwardActiveChanges(from: articleViewModel(for: routeID))
+        case let .opus(routeID, _):
+            forwardActiveChanges(from: opusDetailViewModel(for: routeID))
+        case let .video(routeID, _):
+            forwardActiveChanges(from: videoViewModel(for: routeID))
+        case .browser:
+            let presentationChanges: [AnyPublisher<Void, Never>] = [
+                browserViewModel.$navigationTitle.removeDuplicates().map { _ in () }.eraseToAnyPublisher(),
+                browserViewModel.$currentURL.removeDuplicates().map { _ in () }.eraseToAnyPublisher(),
+                browserViewModel.$entryContext.removeDuplicates().map { _ in () }.eraseToAnyPublisher(),
+                browserViewModel.$hasActiveVideoRoute.removeDuplicates().map { _ in () }.eraseToAnyPublisher(),
+                browserViewModel.$playerSnapshot.removeDuplicates().map { _ in () }.eraseToAnyPublisher(),
+                browserViewModel.$isLoadingPage.removeDuplicates().map { _ in () }.eraseToAnyPublisher(),
+                browserViewModel.$webContentFailureMessage.removeDuplicates().map { _ in () }.eraseToAnyPublisher()
+            ]
+            Publishers.MergeMany(presentationChanges)
+                .dropFirst(presentationChanges.count)
+                .sink { [weak self] in self?.objectWillChange.send() }
+                .store(in: &activeRouteCancellables)
+        }
+    }
+
+    private func forwardActiveChanges<Object: ObservableObject>(from object: Object)
+    where Object.ObjectWillChangePublisher == ObservableObjectPublisher {
+        object.objectWillChange
+            .sink { [weak self] in self?.objectWillChange.send() }
+            .store(in: &activeRouteCancellables)
     }
 
     var navigationTitle: String {
@@ -126,54 +322,64 @@ final class FocusAppViewModel: ObservableObject {
             return myViewModel.navigationTitle
         case .history:
             return historyViewModel.navigationTitle
-        case .userSpace(_):
-            return userSpaceViewModel.navigationTitle
-        case .userCollection(_):
-            return userCollectionViewModel.navigationTitle
-        case .article(_):
-            return articleViewModel.navigationTitle
-        case .opus(_):
-            return opusDetailViewModel.navigationTitle
-        case .browser(_):
+        case .favoriteFolder:
+            return favoriteFolderViewModel.navigationTitle
+        case let .userSpace(routeID, _):
+            return userSpaceViewModel(for: routeID).navigationTitle
+        case let .userCollection(routeID, _):
+            return userCollectionViewModel(for: routeID).navigationTitle
+        case let .article(routeID, _):
+            return articleViewModel(for: routeID).navigationTitle
+        case let .opus(routeID, _):
+            return opusDetailViewModel(for: routeID).navigationTitle
+        case let .video(routeID, _):
+            return videoViewModel(for: routeID).navigationTitle
+        case .browser:
             return browserViewModel.navigationTitle
         }
     }
 
     var activePrimaryTab: PrimaryTab {
-        switch route {
-        case .dynamicFeed:
-            return .dynamic
-        case .searchResults(_):
-            return .search
-        case .my:
-            return .my
-        case .history:
-            return .my
-        case .userSpace(_):
-            return primaryTab(for: userSpaceReturnRoute)
-        case .userCollection(_):
-            return primaryTab(for: userCollectionReturnRoute)
-        case .article(_):
-            return primaryTab(for: articleReturnRoute)
-        case .opus(_):
-            return primaryTab(for: opusReturnRoute)
-        case .browser(_):
-            switch browserViewModel.entryContext {
-            case .dynamic:
-                return .dynamic
-            case .search:
-                return .search
-            case .my:
-                return .my
-            }
-        }
+        primaryTab(for: routeStack.first ?? .dynamicFeed)
     }
 
     var isBrowserActive: Bool {
-        if case .browser(_) = route {
+        if case .browser = route {
             return true
         }
         return false
+    }
+
+    var hasDynamicFeedRoot: Bool {
+        guard let rootRoute = routeStack.first else {
+            return false
+        }
+        if case .dynamicFeed = rootRoute {
+            return true
+        }
+        return false
+    }
+
+    var isDynamicFeedActive: Bool {
+        if case .dynamicFeed = route {
+            return true
+        }
+        return false
+    }
+
+    var activeNativeVideoViewModel: FocusNativeVideoViewModel? {
+        guard case let .video(routeID, _) = route else {
+            return nil
+        }
+        return videoViewModel(for: routeID)
+    }
+
+    var isNativeVideoActive: Bool {
+        activeNativeVideoViewModel != nil
+    }
+
+    func applyNativeDanmakuPreference(_ enabled: Bool) {
+        videoViewModels.values.forEach { $0.applyDanmakuPreference(enabled) }
     }
 
     var showsBrowserBackButton: Bool {
@@ -181,25 +387,128 @@ final class FocusAppViewModel: ObservableObject {
     }
 
     var showsBackButton: Bool {
-        if isBrowserActive {
-            return true
+        routeStack.count > 1
+    }
+
+    private func setRootRoute(_ newRoute: AppRoute) {
+        suspend(route)
+        routeStack.dropFirst().forEach(cleanUpRoute)
+        routeStack = [newRoute]
+        observeActiveRoute()
+        activate(newRoute)
+    }
+
+    private func pushRoute(_ newRoute: AppRoute) {
+        snapshotActiveBrowserURL()
+        suspend(route)
+        routeStack.append(newRoute)
+        observeActiveRoute()
+        activate(newRoute)
+    }
+
+    @discardableResult
+    private func popRoute() -> Bool {
+        guard routeStack.count > 1, let removedRoute = routeStack.last else {
+            return false
         }
-        if case .opus(_) = route {
-            return true
+        suspend(removedRoute)
+        cleanUpRoute(removedRoute)
+        routeStack.removeLast()
+        observeActiveRoute()
+        activate(route)
+        return true
+    }
+
+    private func snapshotActiveBrowserURL() {
+        guard
+            case let .browser(_, context) = route,
+            let currentURL = browserViewModel.currentURL.map(FocusNavigationPolicy.canonicalWebURL(for:)),
+            !routeStack.isEmpty
+        else {
+            return
         }
-        if case .history = route {
-            return true
+        routeStack[routeStack.count - 1] = .browser(currentURL, context)
+    }
+
+    private func suspend(_ route: AppRoute) {
+        switch route {
+        case .dynamicFeed:
+            dynamicFeedViewModel.suspend()
+        case .searchResults:
+            searchResultsViewModel.suspend()
+        case .my:
+            myViewModel.suspend()
+        case .history:
+            historyViewModel.suspend()
+        case .favoriteFolder:
+            favoriteFolderViewModel.suspend()
+        case let .userSpace(routeID, _):
+            userSpaceViewModels[routeID]?.suspend()
+        case let .userCollection(routeID, _):
+            userCollectionViewModels[routeID]?.suspend()
+        case let .article(routeID, _):
+            articleViewModels[routeID]?.suspend()
+        case let .opus(routeID, _):
+            opusDetailViewModels[routeID]?.suspend()
+        case let .video(routeID, _):
+            videoViewModels[routeID]?.suspend()
+        case .browser:
+            browserViewModel.prepareForDismiss()
         }
-        if case .userSpace(_) = route {
-            return true
+    }
+
+    private func activate(_ route: AppRoute) {
+        switch route {
+        case .dynamicFeed:
+            dynamicFeedViewModel.loadIfNeeded()
+        case .searchResults:
+            searchResultsViewModel.loadIfNeeded()
+        case .my:
+            myViewModel.refreshForAppearance()
+        case .history:
+            historyViewModel.refreshForAppearance()
+        case .favoriteFolder:
+            favoriteFolderViewModel.loadIfNeeded()
+        case let .userSpace(routeID, url):
+            let viewModel = userSpaceViewModel(for: routeID)
+            viewModel.open(url)
+            viewModel.loadIfNeeded()
+        case let .userCollection(routeID, collection):
+            let viewModel = userCollectionViewModel(for: routeID)
+            viewModel.open(collection)
+            viewModel.loadIfNeeded()
+        case let .article(routeID, url):
+            let viewModel = articleViewModel(for: routeID)
+            viewModel.open(url)
+            viewModel.loadIfNeeded()
+        case let .opus(routeID, url):
+            opusDetailViewModel(for: routeID).open(url)
+        case let .video(routeID, url):
+            videoViewModel(for: routeID).activate(url: url)
+        case let .browser(url, context):
+            if !browserViewModel.isSessionActive
+                || browserViewModel.currentURL.map(FocusNavigationPolicy.canonicalWebURL(for:)) != url
+            {
+                browserViewModel.open(url, context: context)
+            }
         }
-        if case .userCollection(_) = route {
-            return true
+    }
+
+    private func cleanUpRoute(_ route: AppRoute) {
+        switch route {
+        case let .userSpace(routeID, _):
+            userSpaceViewModels[routeID] = nil
+        case let .userCollection(routeID, _):
+            userCollectionViewModels[routeID] = nil
+        case let .article(routeID, _):
+            articleViewModels[routeID] = nil
+        case let .opus(routeID, _):
+            opusDetailViewModels[routeID] = nil
+        case let .video(routeID, _):
+            videoViewModels[routeID] = nil
+        default:
+            break
         }
-        if case .article(_) = route {
-            return true
-        }
-        return false
     }
 
     func handleLaunchEntryIfNeeded() {
@@ -209,33 +518,37 @@ final class FocusAppViewModel: ObservableObject {
 
         didHandleLaunchEntry = true
         hasInstantiatedBrowser = true
-        refreshLoginSensitiveContent()
+        refreshLoginSensitiveContent(reloadDynamicFeed: true)
         if settingsStore.settings.defaultEntry == .search {
-            showSearch = true
+            presentSearchEntry()
         }
     }
 
     func open(_ entry: FocusEntry) {
         switch entry {
         case .dynamic:
-            if isBrowserActive {
-                browserViewModel.prepareForDismiss()
-            }
-            route = .dynamicFeed
-            dynamicFeedViewModel.loadIfNeeded()
+            setRootRoute(.dynamicFeed)
         case .search:
-            showSearch = true
+            presentSearchEntry()
         }
     }
 
     func open(card: DynamicCard) {
         let destinationURL = card.videoURL ?? card.targetURL
+        if let host = destinationURL.host?.lowercased(), host == "t.bilibili.com" {
+            openOpus(destinationURL)
+            return
+        }
         if Self.isArticleURL(destinationURL) {
             openArticle(destinationURL)
             return
         }
         if Self.isOpusURL(destinationURL) {
             openOpus(destinationURL)
+            return
+        }
+        if Self.isVideoURL(destinationURL) {
+            openVideo(destinationURL)
             return
         }
         openBrowser(destinationURL, context: .dynamic)
@@ -254,15 +567,15 @@ final class FocusAppViewModel: ObservableObject {
             openOpus(searchItem.targetURL)
             return
         }
-        openBrowser(searchItem.targetURL, context: .search)
+        openVideo(searchItem.targetURL)
     }
 
     func open(searchPreview: SearchResultItem.PreviewVideo) {
-        openBrowser(searchPreview.targetURL, context: .search)
+        openVideo(searchPreview.targetURL)
     }
 
     func openMyVideo(_ url: URL) {
-        openBrowser(url, context: .my)
+        openVideo(url)
     }
 
     func openOpusRelatedURL(_ url: URL) {
@@ -278,13 +591,13 @@ final class FocusAppViewModel: ObservableObject {
             openOpus(url)
             return
         }
-        openBrowser(url, context: entryContext(for: activePrimaryTab))
+        openVideo(url)
     }
 
     func openUserCollection(_ collection: FocusUserSpaceCollection) {
-        userCollectionReturnRoute = routeForCurrentNativeContext()
-        route = .userCollection(collection)
-        userCollectionViewModel.open(collection)
+        let routeID = RouteID()
+        _ = userCollectionViewModel(for: routeID)
+        pushRoute(.userCollection(routeID, collection))
     }
 
     func submitSearch() {
@@ -294,25 +607,31 @@ final class FocusAppViewModel: ObservableObject {
         }
 
         showSearch = false
-        route = .searchResults(query)
+        setRootRoute(.searchResults(query))
         searchResultsViewModel.search(query)
+        searchKeyword = ""
+    }
+
+    func presentSearchEntry() {
+        if case let .searchResults(query) = route {
+            searchKeyword = query.keyword
+        } else {
+            searchKeyword = ""
+        }
+        showSearch = true
     }
 
     func openMy() {
-        if isBrowserActive {
-            browserViewModel.prepareForDismiss()
-        }
-        route = .my
-        myViewModel.refreshForAppearance()
+        setRootRoute(.my)
     }
 
     func openHistory() {
-        if isBrowserActive {
-            browserViewModel.prepareForDismiss()
-        }
-        historyReturnRoute = routeForCurrentNativeContext()
-        route = .history
-        historyViewModel.loadIfNeeded()
+        pushRoute(.history)
+    }
+
+    func openFavoriteFolder(_ folder: FocusMyFolder) {
+        favoriteFolderViewModel.open(folder)
+        pushRoute(.favoriteFolder(folder))
     }
 
     func openLogin() {
@@ -329,28 +648,43 @@ final class FocusAppViewModel: ObservableObject {
             myViewModel.reload()
         case .history:
             historyViewModel.reload()
-        case .userSpace(_):
-            userSpaceViewModel.reload()
-        case .userCollection(_):
-            userCollectionViewModel.reload()
-        case .article(_):
-            articleViewModel.reload()
-        case .opus(_):
-            opusDetailViewModel.reload()
-        case .browser(_):
+        case .favoriteFolder:
+            favoriteFolderViewModel.reload()
+        case let .userSpace(routeID, _):
+            userSpaceViewModel(for: routeID).reload()
+        case let .userCollection(routeID, _):
+            userCollectionViewModel(for: routeID).reload()
+        case let .article(routeID, _):
+            articleViewModel(for: routeID).reload()
+        case let .opus(routeID, _):
+            opusDetailViewModel(for: routeID).reload()
+        case let .video(routeID, _):
+            videoViewModel(for: routeID).reload()
+        case .browser:
             browserViewModel.reload()
         }
     }
 
     func handleAppDidBecomeActive() {
-        refreshLoginSensitiveContent()
+        activeNativeVideoViewModel?.handleAppDidBecomeActive()
+        guard didHandleLaunchEntry else {
+            return
+        }
+
+        guard !didRefreshOnBecomeActive else {
+            return
+        }
+
+        didRefreshOnBecomeActive = true
+        refreshLoginSensitiveContent(reloadDynamicFeed: false)
+    }
+
+    func handleAppWillResignActive() {
+        activeNativeVideoViewModel?.handleAppWillResignActive()
     }
 
     func goBack() {
-        guard isBrowserActive else {
-            return
-        }
-        browserViewModel.goBack()
+        handleTopLevelBack()
     }
 
     func handleBrowserBack() {
@@ -371,30 +705,7 @@ final class FocusAppViewModel: ObservableObject {
             handleBrowserBack()
             return
         }
-
-        if case .opus(_) = route {
-            closeOpus()
-            return
-        }
-
-        if case .history = route {
-            closeHistory()
-            return
-        }
-
-        if case .userSpace(_) = route {
-            closeUserSpace()
-            return
-        }
-
-        if case .userCollection(_) = route {
-            closeUserCollection()
-            return
-        }
-
-        if case .article(_) = route {
-            closeArticle()
-        }
+        _ = popRoute()
     }
 
     func goForward() {
@@ -405,46 +716,26 @@ final class FocusAppViewModel: ObservableObject {
     }
 
     func closeBrowser() {
-        browserViewModel.prepareForDismiss()
-        switch browserReturnRoute {
-        case .dynamicFeed:
-            route = .dynamicFeed
-        case .searchResults(_):
-            route = browserReturnRoute
-        case .my:
-            route = .my
-        case .history:
-            route = browserReturnRoute
-        case .userSpace(_):
-            route = browserReturnRoute
-        case .userCollection(_):
-            route = browserReturnRoute
-        case .article(_):
-            route = browserReturnRoute
-        case .opus(_):
-            route = browserReturnRoute
-        case .browser(_):
-            route = .dynamicFeed
-        }
+        _ = popRoute()
     }
 
     private func openBrowser(_ url: URL, context: FocusBrowserViewModel.EntryContext) {
         let canonicalURL = FocusNavigationPolicy.canonicalWebURL(for: url)
         hasInstantiatedBrowser = true
-        if case .browser(_) = route {
-            // Keep the current return route while navigating within the browser shell.
+        if case .browser = route, !routeStack.isEmpty {
+            routeStack[routeStack.count - 1] = .browser(canonicalURL, context)
+            observeActiveRoute()
+            browserViewModel.open(canonicalURL, context: context)
         } else {
-            browserReturnRoute = route
+            pushRoute(.browser(canonicalURL, context))
         }
-        route = .browser(canonicalURL)
-        browserViewModel.open(canonicalURL, context: context)
     }
 
     private func openOpus(_ url: URL) {
         let canonicalURL = FocusNavigationPolicy.canonicalWebURL(for: url)
-        opusReturnRoute = routeForCurrentNativeContext()
-        route = .opus(canonicalURL)
-        opusDetailViewModel.open(canonicalURL)
+        let routeID = RouteID()
+        _ = opusDetailViewModel(for: routeID)
+        pushRoute(.opus(routeID, canonicalURL))
     }
 
     private func openUserSpace(_ url: URL) {
@@ -454,139 +745,44 @@ final class FocusAppViewModel: ObservableObject {
             return
         }
 
-        userSpaceReturnRoute = routeForCurrentNativeContext()
-        route = .userSpace(canonicalURL)
-        userSpaceViewModel.open(canonicalURL)
+        let routeID = RouteID()
+        _ = userSpaceViewModel(for: routeID)
+        pushRoute(.userSpace(routeID, canonicalURL))
     }
 
     private func openArticle(_ url: URL) {
+        guard let canonicalURL = FocusArticleRouting.canonicalURL(for: url) else {
+            openBrowser(FocusNavigationPolicy.canonicalWebURL(for: url), context: entryContext(for: activePrimaryTab))
+            return
+        }
+
+        let routeID = RouteID()
+        _ = articleViewModel(for: routeID)
+        pushRoute(.article(routeID, canonicalURL))
+    }
+
+    private func openVideo(_ url: URL) {
         let canonicalURL = FocusNavigationPolicy.canonicalWebURL(for: url)
-        guard Self.extractArticleCVID(from: canonicalURL) != nil else {
+        guard FocusVideoIdentifier.extract(from: canonicalURL) != nil else {
             openBrowser(canonicalURL, context: entryContext(for: activePrimaryTab))
             return
         }
 
-        articleReturnRoute = routeForCurrentNativeContext()
-        route = .article(canonicalURL)
-        articleViewModel.open(canonicalURL)
+        let routeID = RouteID()
+        _ = videoViewModel(for: routeID)
+        pushRoute(.video(routeID, canonicalURL))
     }
 
-    private func closeOpus() {
-        switch opusReturnRoute {
-        case .dynamicFeed:
-            route = .dynamicFeed
-        case .searchResults(_):
-            route = opusReturnRoute
-        case .my:
-            route = .my
-        case .history:
-            route = opusReturnRoute
-        case .userSpace(_):
-            route = opusReturnRoute
-        case .userCollection(_):
-            route = opusReturnRoute
-        case .article(_):
-            route = opusReturnRoute
-        case .opus(_):
-            route = .dynamicFeed
-        case .browser(_):
-            route = .dynamicFeed
-        }
+    func openVideoInBrowser(_ url: URL) {
+        browserViewModel.allowNextVideoNavigationInWeb(for: url)
+        openBrowser(url, context: entryContext(for: activePrimaryTab))
     }
 
-    private func closeHistory() {
-        switch historyReturnRoute {
-        case .dynamicFeed:
-            route = .dynamicFeed
-        case .searchResults(_):
-            route = historyReturnRoute
-        case .my:
-            route = .my
-        case .history:
-            route = .my
-        case .userSpace(_):
-            route = historyReturnRoute
-        case .userCollection(_):
-            route = historyReturnRoute
-        case .article(_):
-            route = historyReturnRoute
-        case .opus(_):
-            route = historyReturnRoute
-        case .browser(_):
-            route = .my
-        }
+    func openArticleInBrowser(_ url: URL) {
+        openBrowser(FocusArticleRouting.canonicalURL(for: url) ?? url, context: entryContext(for: activePrimaryTab))
     }
 
-    private func closeUserSpace() {
-        switch userSpaceReturnRoute {
-        case .dynamicFeed:
-            route = .dynamicFeed
-        case .searchResults(_):
-            route = userSpaceReturnRoute
-        case .my:
-            route = .my
-        case .history:
-            route = userSpaceReturnRoute
-        case .userSpace(_):
-            route = .dynamicFeed
-        case .userCollection(_):
-            route = userSpaceReturnRoute
-        case .article(_):
-            route = userSpaceReturnRoute
-        case .opus(_):
-            route = userSpaceReturnRoute
-        case .browser(_):
-            route = .dynamicFeed
-        }
-    }
-
-    private func closeUserCollection() {
-        switch userCollectionReturnRoute {
-        case .dynamicFeed:
-            route = .dynamicFeed
-        case .searchResults(_):
-            route = userCollectionReturnRoute
-        case .my:
-            route = .my
-        case .history:
-            route = userCollectionReturnRoute
-        case .userSpace(_):
-            route = userCollectionReturnRoute
-        case .userCollection(_):
-            route = .dynamicFeed
-        case .article(_):
-            route = userCollectionReturnRoute
-        case .opus(_):
-            route = userCollectionReturnRoute
-        case .browser(_):
-            route = .dynamicFeed
-        }
-    }
-
-    private func closeArticle() {
-        switch articleReturnRoute {
-        case .dynamicFeed:
-            route = .dynamicFeed
-        case .searchResults(_):
-            route = articleReturnRoute
-        case .my:
-            route = .my
-        case .history:
-            route = articleReturnRoute
-        case .userSpace(_):
-            route = articleReturnRoute
-        case .userCollection(_):
-            route = articleReturnRoute
-        case .article(_):
-            route = .dynamicFeed
-        case .opus(_):
-            route = articleReturnRoute
-        case .browser(_):
-            route = .dynamicFeed
-        }
-    }
-
-    private func refreshLoginSensitiveContent() {
+    private func refreshLoginSensitiveContent(reloadDynamicFeed: Bool) {
         Task { @MainActor [weak self] in
             guard let self else {
                 return
@@ -594,53 +790,46 @@ final class FocusAppViewModel: ObservableObject {
 
             _ = await cookieProvider.refreshSnapshotIfNeeded()
             switch route {
-        case .dynamicFeed:
-            dynamicFeedViewModel.reload()
-        case .searchResults(_):
-            searchResultsViewModel.reload()
-        case .my:
-            myViewModel.reload()
-        case .history:
-            historyViewModel.reload()
-        case .userSpace(_):
-            userSpaceViewModel.reload()
-        case .userCollection(_):
-            userCollectionViewModel.reload()
-            case .article(_):
-                articleViewModel.reload()
-            case .opus(_):
+            case .dynamicFeed:
+                if reloadDynamicFeed {
+                    dynamicFeedViewModel.reload()
+                }
+            case .searchResults(_):
+                searchResultsViewModel.reload()
+            case .my:
+                myViewModel.reload()
+            case .history:
+                historyViewModel.reload()
+            case .favoriteFolder:
+                favoriteFolderViewModel.reload()
+            case let .userSpace(routeID, _):
+                userSpaceViewModel(for: routeID).reload()
+            case let .userCollection(routeID, _):
+                userCollectionViewModel(for: routeID).reload()
+            case let .article(routeID, _):
+                articleViewModel(for: routeID).reload()
+            case .opus:
                 break
-            case .browser(_):
+            case .video:
+                break
+            case .browser:
                 break
             }
         }
     }
 
-    private func primaryTab(for route: Route) -> PrimaryTab {
+    private func primaryTab(for route: AppRoute) -> PrimaryTab {
         switch route {
-        case .dynamicFeed, .opus(_):
+        case .dynamicFeed, .opus:
             return .dynamic
-        case .searchResults(_):
+        case .searchResults:
             return .search
-        case .my, .history:
+        case .my, .history, .favoriteFolder:
             return .my
-        case .userSpace(_):
-            switch userSpaceReturnRoute {
-            case .searchResults(_):
-                return .search
-            case .my:
-                return .my
-            case .history:
-                return .my
-            default:
-                return .dynamic
-            }
-        case .userCollection(_):
-            return primaryTab(for: userCollectionReturnRoute)
-        case .article(_):
-            return primaryTab(for: articleReturnRoute)
-        case .browser(_):
-            switch browserViewModel.entryContext {
+        case .userSpace, .userCollection, .article, .video:
+            return routeStack.first.map(primaryTab(for:)) ?? .dynamic
+        case let .browser(_, context):
+            switch context {
             case .dynamic:
                 return .dynamic
             case .search:
@@ -648,15 +837,6 @@ final class FocusAppViewModel: ObservableObject {
             case .my:
                 return .my
             }
-        }
-    }
-
-    private func routeForCurrentNativeContext() -> Route {
-        switch route {
-        case .browser(_):
-            return browserReturnRoute
-        default:
-            return route
         }
     }
 
@@ -686,6 +866,16 @@ final class FocusAppViewModel: ObservableObject {
         extractArticleCVID(from: url) != nil
     }
 
+    private static func isVideoURL(_ url: URL) -> Bool {
+        guard let host = url.host?.lowercased() else {
+            return false
+        }
+
+        let path = url.path.lowercased()
+        return (host == "www.bilibili.com" || host == "bilibili.com" || host == "m.bilibili.com")
+            && (path.hasPrefix("/video/") || path.hasPrefix("/bangumi/play/"))
+    }
+
     private static func extractUserSpaceMID(from url: URL) -> Int64? {
         guard url.host?.lowercased() == "space.bilibili.com" else {
             return nil
@@ -704,20 +894,7 @@ final class FocusAppViewModel: ObservableObject {
     }
 
     private static func extractArticleCVID(from url: URL) -> Int64? {
-        let absoluteString = url.absoluteString
-        if let match = absoluteString.range(of: #"read/cv(\d+)"#, options: .regularExpression) {
-            let matched = String(absoluteString[match])
-            return Int64(matched.replacingOccurrences(of: "read/cv", with: ""))
-        }
-
-        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
-            return nil
-        }
-
-        return components.queryItems?
-            .first(where: { $0.name.caseInsensitiveCompare("id") == .orderedSame })?
-            .value
-            .flatMap(Int64.init)
+        FocusArticleRouting.extractCVID(from: url)
     }
 
     private func entryContext(for tab: PrimaryTab) -> FocusBrowserViewModel.EntryContext {
@@ -738,11 +915,15 @@ final class FocusAppViewModel: ObservableObject {
     func openNativeUserSpace(_ url: URL) {
         openUserSpace(url)
     }
+
+    func openNativeVideo(_ url: URL) {
+        openVideo(url)
+    }
 }
 
 @MainActor
 final class FocusBrowserViewModel: ObservableObject {
-    enum EntryContext {
+    enum EntryContext: Equatable {
         case dynamic
         case search
         case my
@@ -760,51 +941,92 @@ final class FocusBrowserViewModel: ObservableObject {
         let videoTitle: String?
     }
 
+    private struct BrowserCallbackContext: Equatable {
+        let sessionID: BrowserSessionID
+        let revision: NavigationRevision
+        let canonicalURL: URL
+        let webViewIdentifier: ObjectIdentifier
+    }
+
+    struct PlayerBridgeContext: Equatable, Sendable {
+        let sessionID: String
+        let revision: UInt64
+        let canonicalURL: URL
+    }
+
     @Published private(set) var currentURL: URL?
     @Published private(set) var canGoBack = false
     @Published private(set) var canGoForward = false
     @Published private(set) var hasActiveVideoRoute = false
-    @Published private(set) var hasDetectedPlayer = false
-    @Published private(set) var isImmersiveVideo = false
-    @Published private(set) var isPlaying = false
-    @Published private(set) var playbackRate: Double = 1.0
-    @Published private(set) var isDanmakuHidden = false
-    @Published private(set) var hasSubtitles = false
-    @Published private(set) var isSubtitleHidden = false
+    @Published private(set) var playerSnapshot = PlayerSnapshot.empty
     @Published private(set) var isLoadingPage = false
     @Published private(set) var entryContext: EntryContext = .dynamic
     @Published private(set) var navigationTitle = "浏览"
-
+    @Published private(set) var nativeVideoAuthorName = ""
+    @Published private(set) var nativeVideoAuthorAvatarURL: URL?
+    @Published private(set) var nativeVideoAuthorSpaceURL: URL?
+    @Published private(set) var nativeVideoAuthorMID: Int64 = 0
+    @Published private(set) var nativeVideoAuthorFollowers: Int64 = 0
+    @Published private(set) var nativeVideoAuthorIsFollowing = false
+    @Published private(set) var webContentFailureMessage: String?
     let settingsStore: FocusSettingsStore
 
     weak var webView: WKWebView?
     fileprivate var nativePageAugmentService: FocusNativePageAugmentService?
-    var reconfigureScripts: ((WKWebView, FocusSettings) -> Void)?
     var prepareForURL: ((WKWebView, URL) -> Void)?
     var onEntryRequest: ((FocusEntry) -> Void)?
     var onUserSpaceRequest: ((URL) -> Void)?
+    var onVideoRequest: ((URL) -> Void)?
     private var pendingURL: URL?
-    private var cancellables: Set<AnyCancellable> = []
+    private var nativeVideoWebBypassIdentifier: FocusVideoIdentifier?
+    private(set) var isSessionActive = false
     private var playerStateObservationTask: Task<Void, Never>?
     private var embeddedPlayerDetectionTask: Task<Void, Never>?
+    private var playerCommandTask: Task<Void, Never>?
     private var pageAugmentationTask: Task<Void, Never>?
+    private var pageAugmentationApplyTask: Task<Void, Never>?
+    private var nativeVideoLoadingMaskTask: Task<Void, Never>?
+    private var nativeVideoPlaceholderTask: Task<Void, Never>?
     private var pageAugmentationRevision = 0
     private var pageAugmentCache: [String: FocusNativePageAugmentPayload] = [:]
+    private var scheduledPageAugmentationKey: String?
+    private var pageAugmentationFailureCounts: [String: Int] = [:]
+    private var pageAugmentationRetryAfter: [String: Date] = [:]
     private var appBackStack: [URL] = []
     private var pendingAppBackTarget: URL?
     private var isHandlingAppBackNavigation = false
     private var lastDebugDetectedPageStateSignature: String?
     private var lastDebugPlayerStateSignature: String?
+    private var isUpdatingNativeVideoFollow = false
+    private var lastIssuedLoadURL: URL?
+    private var pendingOrientationSyncAfterPlayerReady = false
+    private var lastHandledDeviceOrientation: UIDeviceOrientation = .unknown
+    private var orientationDebounceTask: Task<Void, Never>?
+    private var fullscreenTransitionTask: Task<Void, Never>?
+    private var webContentRecoveryTask: Task<Void, Never>?
+    private var webContentRecoveryAttempts = 0
+    private var requestedInterfaceOrientationMask: UIInterfaceOrientationMask = .portrait
+    private var browserSessionID = BrowserSessionID()
+    private var navigationRevisionCounter: UInt64 = 0
+    private var navigationRevision = NavigationRevision(rawValue: 0)
+    private var sessionCanonicalURL: URL?
+    private var isAwaitingNavigationStart = false
 
     init(settingsStore: FocusSettingsStore) {
         self.settingsStore = settingsStore
+    }
 
-        settingsStore.$settings
-            .dropFirst()
-            .sink { [weak self] settings in
-                self?.applySettingsChange(settings)
-            }
-            .store(in: &cancellables)
+    deinit {
+        playerStateObservationTask?.cancel()
+        embeddedPlayerDetectionTask?.cancel()
+        playerCommandTask?.cancel()
+        pageAugmentationTask?.cancel()
+        pageAugmentationApplyTask?.cancel()
+        nativeVideoLoadingMaskTask?.cancel()
+        nativeVideoPlaceholderTask?.cancel()
+        orientationDebounceTask?.cancel()
+        fullscreenTransitionTask?.cancel()
+        webContentRecoveryTask?.cancel()
     }
 
     var router: FocusRouter {
@@ -813,6 +1035,34 @@ final class FocusBrowserViewModel: ObservableObject {
 
     var navigationPolicy: FocusNavigationPolicy {
         FocusNavigationPolicy(settings: settingsStore.settings)
+    }
+
+    var hasDetectedPlayer: Bool {
+        playerSnapshot.hasPlayer
+    }
+
+    var isImmersiveVideo: Bool {
+        playerSnapshot.isFullscreen
+    }
+
+    var isPlaying: Bool {
+        playerSnapshot.isPlaying
+    }
+
+    var playbackRate: Double {
+        playerSnapshot.playbackRate
+    }
+
+    var isDanmakuHidden: Bool {
+        playerSnapshot.isDanmakuHidden
+    }
+
+    var hasSubtitles: Bool {
+        playerSnapshot.hasSubtitles
+    }
+
+    var isSubtitleHidden: Bool {
+        playerSnapshot.isSubtitleHidden
     }
 
     var isVideoPage: Bool {
@@ -862,43 +1112,262 @@ final class FocusBrowserViewModel: ObservableObject {
         }
     }
 
-    func attach(
-        webView: WKWebView,
-        reconfigureScripts: @escaping (WKWebView, FocusSettings) -> Void,
-        prepareForURL: @escaping (WKWebView, URL) -> Void
-    ) {
-        self.webView = webView
-        self.reconfigureScripts = reconfigureScripts
-        self.prepareForURL = prepareForURL
+    func openNativeVideoAuthorSpace() {
+        guard let nativeVideoAuthorSpaceURL else {
+            return
+        }
+        openNativeUserSpace(nativeVideoAuthorSpaceURL)
+    }
 
-        if let pendingURL {
-            prepareForURL(webView, pendingURL)
-            webView.load(URLRequest(url: pendingURL))
+    func handleFocusActionURL(_ url: URL) -> Bool {
+        guard url.scheme?.lowercased() == "focus" else {
+            return false
+        }
+
+        switch url.host?.lowercased() {
+        case "toggle-follow":
+            toggleNativeVideoAuthorFollow()
+            return true
+        default:
+            return false
         }
     }
 
+    func triggerNativeVideoAction(_ action: String) {
+        guard let webView else {
+            return
+        }
+        let escapedAction = action.replacingOccurrences(of: "'", with: "\\'")
+        let script = """
+        (() => {
+          const action = '\(escapedAction)';
+          const selectorMap = {
+            like: [
+              '#arc_toolbar_report .video-like-info',
+              '.video-toolbar-container .video-like-info',
+              '.video-like-info',
+              '[class*="like-info"]',
+              '[class*="toolbar"] [class*="like"]'
+            ],
+            coin: [
+              '#arc_toolbar_report .video-coin',
+              '.video-toolbar-container .video-coin',
+              '.video-coin',
+              '[class*="video-coin"]',
+              '[class*="toolbar"] [class*="coin"]'
+            ],
+            favorite: [
+              '#arc_toolbar_report .video-fav',
+              '.video-toolbar-container .video-fav',
+              '.video-fav',
+              '[class*="video-fav"]',
+              '[class*="toolbar"] [class*="fav"]'
+            ]
+          };
+          const selectors = selectorMap[action] || [];
+          const target = selectors
+            .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
+            .find((node) => {
+              const rect = node.getBoundingClientRect?.();
+              return !!rect && rect.width > 8 && rect.height > 8;
+            });
+          if (!target) {
+            return false;
+          }
+          const clickable = target.querySelector('button, [role="button"], a') || target;
+          clickable.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+          return true;
+        })();
+        """
+        webView.evaluateJavaScript(script, completionHandler: nil)
+    }
+
+    func attach(
+        webView: WKWebView,
+        prepareForURL: @escaping (WKWebView, URL) -> Void
+    ) {
+        self.webView = webView
+        self.prepareForURL = prepareForURL
+
+        if let pendingURL {
+            loadURLIfNeeded(pendingURL, on: webView, reason: "attach")
+        }
+    }
+
+    func playerBridgeContext(for candidateWebView: WKWebView) -> PlayerBridgeContext? {
+        guard
+            webView === candidateWebView,
+            let context = makeBrowserCallbackContext(for: candidateWebView)
+        else {
+            return nil
+        }
+
+        return PlayerBridgeContext(
+            sessionID: context.sessionID.stringValue,
+            revision: context.revision.rawValue,
+            canonicalURL: context.canonicalURL
+        )
+    }
+
+    func handlePlayerStateMessage(_ body: Any, from sourceWebView: WKWebView?) {
+        guard
+            let sourceWebView,
+            let payload = body as? [String: Any],
+            let context = makeBrowserCallbackContext(for: sourceWebView),
+            payload["browserSessionID"] as? String == context.sessionID.stringValue,
+            Self.uint64Value(payload["navigationRevision"]) == context.revision.rawValue,
+            let payloadURLString = payload["pageURL"] as? String,
+            let payloadURL = URL(string: payloadURLString).map(FocusNavigationPolicy.canonicalWebURL(for:)),
+            payloadURL == context.canonicalURL,
+            isCurrent(context, webView: sourceWebView)
+        else {
+            debugLog(
+                "playerStateMessage.discarded",
+                fields: debugStateFields([
+                    "messageSessionID": (body as? [String: Any])?["browserSessionID"] as? String,
+                    "messageRevision": Self.uint64Value((body as? [String: Any])?["navigationRevision"]).map(String.init),
+                    "messageURL": (body as? [String: Any])?["pageURL"] as? String
+                ])
+            )
+            return
+        }
+
+        applyPlayerStatePayload(payload, context: context, webView: sourceWebView, source: "playerStateMessage")
+    }
+
+    private func prepareNavigationSession(to url: URL, force: Bool = false) {
+        let canonicalURL = FocusNavigationPolicy.canonicalWebURL(for: url)
+        guard force || !isAwaitingNavigationStart || sessionCanonicalURL != canonicalURL else {
+            return
+        }
+
+        advanceNavigationSession(to: canonicalURL, awaitingStart: true)
+    }
+
+    private func markNavigationStarted(at url: URL?) {
+        let canonicalURL = url.map(FocusNavigationPolicy.canonicalWebURL(for:))
+        if isAwaitingNavigationStart, sessionCanonicalURL == canonicalURL {
+            isAwaitingNavigationStart = false
+            return
+        }
+
+        advanceNavigationSession(to: canonicalURL, awaitingStart: false)
+    }
+
+    private func alignNavigationSessionIfNeeded(to url: URL?) {
+        guard let canonicalURL = url.map(FocusNavigationPolicy.canonicalWebURL(for:)) else {
+            return
+        }
+        guard sessionCanonicalURL != canonicalURL else {
+            isAwaitingNavigationStart = false
+            return
+        }
+
+        advanceNavigationSession(to: canonicalURL, awaitingStart: false)
+    }
+
+    private func advanceNavigationSession(to canonicalURL: URL?, awaitingStart: Bool) {
+        navigationRevisionCounter &+= 1
+        navigationRevision = NavigationRevision(rawValue: navigationRevisionCounter)
+        browserSessionID = BrowserSessionID()
+        sessionCanonicalURL = canonicalURL
+        isAwaitingNavigationStart = awaitingStart
+        playerStateObservationTask?.cancel()
+        playerStateObservationTask = nil
+        embeddedPlayerDetectionTask?.cancel()
+        embeddedPlayerDetectionTask = nil
+        playerCommandTask?.cancel()
+        playerCommandTask = nil
+        pageAugmentationApplyTask?.cancel()
+        pageAugmentationApplyTask = nil
+        updatePlayerSnapshot(.empty)
+    }
+
+    private func invalidateBrowserCallbacks() {
+        advanceNavigationSession(to: nil, awaitingStart: false)
+    }
+
+    private func makeBrowserCallbackContext(for candidateWebView: WKWebView) -> BrowserCallbackContext? {
+        guard webView === candidateWebView else {
+            return nil
+        }
+        guard let canonicalURL = (candidateWebView.url ?? sessionCanonicalURL ?? currentURL ?? pendingURL)
+            .map(FocusNavigationPolicy.canonicalWebURL(for:))
+        else {
+            return nil
+        }
+        guard sessionCanonicalURL == canonicalURL else {
+            return nil
+        }
+
+        return BrowserCallbackContext(
+            sessionID: browserSessionID,
+            revision: navigationRevision,
+            canonicalURL: canonicalURL,
+            webViewIdentifier: ObjectIdentifier(candidateWebView)
+        )
+    }
+
+    private func isCurrent(_ context: BrowserCallbackContext, webView candidateWebView: WKWebView) -> Bool {
+        guard webView === candidateWebView else {
+            return false
+        }
+
+        let callbackStamp = BrowserCallbackStamp(
+            sessionID: context.sessionID,
+            revision: context.revision,
+            canonicalURL: context.canonicalURL,
+            webViewIdentifier: context.webViewIdentifier
+        )
+        let currentStamp = BrowserCallbackStamp(
+            sessionID: browserSessionID,
+            revision: navigationRevision,
+            canonicalURL: sessionCanonicalURL ?? context.canonicalURL,
+            webViewIdentifier: ObjectIdentifier(candidateWebView)
+        )
+        guard
+            sessionCanonicalURL != nil,
+            BrowserCallbackGate.accepts(callbackStamp, current: currentStamp)
+        else {
+            return false
+        }
+
+        let activeURL = (candidateWebView.url ?? currentURL ?? pendingURL)
+            .map(FocusNavigationPolicy.canonicalWebURL(for:))
+        return activeURL == context.canonicalURL
+    }
+
     func open(_ url: URL, context: EntryContext) {
+        let canonicalURL = FocusNavigationPolicy.canonicalWebURL(for: url)
+        if FocusVideoIdentifier.extract(from: canonicalURL) != nativeVideoWebBypassIdentifier {
+            nativeVideoWebBypassIdentifier = nil
+        }
+        isSessionActive = true
+        webContentRecoveryTask?.cancel()
+        webContentRecoveryTask = nil
+        webContentRecoveryAttempts = 0
+        webContentFailureMessage = nil
         resetAppBackStack()
         invalidatePageAugmentation()
-        entryContext = context
-        pendingURL = url
-        isLoadingPage = true
-        playerStateObservationTask?.cancel()
-        embeddedPlayerDetectionTask?.cancel()
-        hasActiveVideoRoute = FocusUserAgent.shouldUseDesktopPlayback(for: url)
-        updateNavigationMetadata(for: url, pageTitle: nil, context: context)
-        if !hasActiveVideoRoute {
-            resetPlayerState()
-        }
+        prepareNavigationSession(to: canonicalURL, force: true)
         if let webView {
-            prepareForURL?(webView, url)
-            webView.load(URLRequest(url: url))
+            suspendActivePlayback(in: webView)
+            webView.stopLoading()
+        }
+        resetPlayerState()
+        entryContext = context
+        pendingURL = canonicalURL
+        isLoadingPage = true
+        hasActiveVideoRoute = FocusUserAgent.shouldUseDesktopPlayback(for: canonicalURL)
+        updateNavigationMetadata(for: canonicalURL, pageTitle: nil, context: context)
+        if let webView {
+            loadURLIfNeeded(canonicalURL, on: webView, reason: "open")
         }
 
         debugLog(
             "open",
             fields: debugStateFields([
-                "inputURL": url.absoluteString,
+                "inputURL": canonicalURL.absoluteString,
                 "context": entryContextLabel(context)
             ])
         )
@@ -906,6 +1375,11 @@ final class FocusBrowserViewModel: ObservableObject {
 
     func reload() {
         if let webView {
+            let targetURL = (webView.url ?? currentURL ?? pendingURL)
+                .map(FocusNavigationPolicy.canonicalWebURL(for:))
+            if let targetURL {
+                prepareNavigationSession(to: targetURL, force: true)
+            }
             webView.reload()
             return
         }
@@ -922,11 +1396,17 @@ final class FocusBrowserViewModel: ObservableObject {
 
     func goBack() {
         guard canGoBack else { return }
+        if let targetURL = webView?.backForwardList.backItem?.url {
+            prepareNavigationSession(to: targetURL, force: true)
+        }
         webView?.goBack()
     }
 
     func goForward() {
         guard canGoForward else { return }
+        if let targetURL = webView?.backForwardList.forwardItem?.url {
+            prepareNavigationSession(to: targetURL, force: true)
+        }
         webView?.goForward()
     }
 
@@ -938,6 +1418,8 @@ final class FocusBrowserViewModel: ObservableObject {
             to: canonicalTargetURL,
             navigationType: navigationType
         )
+
+        prepareNavigationSession(to: canonicalTargetURL)
 
         pendingURL = canonicalTargetURL
         updateNavigationMetadata(for: canonicalTargetURL)
@@ -992,25 +1474,35 @@ final class FocusBrowserViewModel: ObservableObject {
     }
 
     func updateNavigationState(from webView: WKWebView) {
-        currentURL = webView.url
-        pendingURL = webView.url
+        guard self.webView === webView else {
+            return
+        }
+        let resolvedURL = webView.url.map(FocusNavigationPolicy.canonicalWebURL(for:))
+        alignNavigationSessionIfNeeded(to: resolvedURL)
+        currentURL = resolvedURL
+        pendingURL = currentURL
         isLoadingPage = false
+        webContentRecoveryTask?.cancel()
+        webContentRecoveryTask = nil
+        webContentRecoveryAttempts = 0
+        webContentFailureMessage = nil
         canGoBack = webView.canGoBack
         canGoForward = webView.canGoForward
-        updateNavigationMetadata(for: webView.url, pageTitle: webView.title)
+        updateNavigationMetadata(for: currentURL, pageTitle: webView.title)
         playerStateObservationTask?.cancel()
         embeddedPlayerDetectionTask?.cancel()
+        lastIssuedLoadURL = currentURL
 
         if isHandlingAppBackNavigation,
-           let resolvedURL = webView.url,
+           let resolvedURL = currentURL,
            let pendingAppBackTarget,
-           FocusNavigationPolicy.canonicalWebURL(for: resolvedURL) == pendingAppBackTarget
+           resolvedURL == pendingAppBackTarget
         {
             isHandlingAppBackNavigation = false
             self.pendingAppBackTarget = nil
         }
 
-        if let currentURL = webView.url {
+        if let currentURL {
             hasActiveVideoRoute = FocusUserAgent.shouldUseDesktopPlayback(for: currentURL)
         }
 
@@ -1047,27 +1539,83 @@ final class FocusBrowserViewModel: ObservableObject {
         }
     }
 
+    func commitNavigationState(from webView: WKWebView) {
+        guard self.webView === webView else {
+            return
+        }
+        let resolvedURL = webView.url.map(FocusNavigationPolicy.canonicalWebURL(for:))
+        alignNavigationSessionIfNeeded(to: resolvedURL)
+        currentURL = resolvedURL
+        pendingURL = resolvedURL
+        canGoBack = webView.canGoBack
+        canGoForward = webView.canGoForward
+        updateNavigationMetadata(for: resolvedURL, pageTitle: webView.title)
+        lastIssuedLoadURL = resolvedURL
+
+        if isHandlingAppBackNavigation,
+           let resolvedURL,
+           let pendingAppBackTarget,
+           resolvedURL == pendingAppBackTarget
+        {
+            isHandlingAppBackNavigation = false
+            self.pendingAppBackTarget = nil
+        }
+
+        let isCommittedVideoRoute = resolvedURL.map(FocusUserAgent.shouldUseDesktopPlayback(for:)) ?? false
+        if isCommittedVideoRoute {
+            isLoadingPage = false
+            hasActiveVideoRoute = true
+            schedulePageAugmentationRefresh()
+            if let resolvedURL {
+                installNativeVideoOriginalSectionSuppression(for: resolvedURL)
+            }
+            startPlayerStateObservation()
+        } else {
+            nativeVideoLoadingMaskTask?.cancel()
+            nativeVideoLoadingMaskTask = nil
+            resetPlayerState()
+        }
+
+        debugLog(
+            "commitNavigationState",
+            fields: debugStateFields([
+                "webViewURL": resolvedURL?.absoluteString,
+                "webViewTitle": webView.title,
+                "canGoBack": debugBool(webView.canGoBack),
+                "canGoForward": debugBool(webView.canGoForward),
+                "isVideoRoute": debugBool(isCommittedVideoRoute)
+            ])
+        )
+    }
+
     func beginNavigation(to url: URL?) {
         var isStaleStartURL = false
-        if let url {
-            let canonicalURL = FocusNavigationPolicy.canonicalWebURL(for: url)
+        let targetURL = (pendingURL ?? url).map(FocusNavigationPolicy.canonicalWebURL(for:))
+        markNavigationStarted(at: targetURL)
+        if let targetURL {
             let canonicalCurrentURL = currentURL.map(FocusNavigationPolicy.canonicalWebURL(for:))
             let canonicalPendingURL = pendingURL.map(FocusNavigationPolicy.canonicalWebURL(for:))
-            isStaleStartURL = canonicalCurrentURL == canonicalURL
+            isStaleStartURL = canonicalCurrentURL == targetURL
                 && canonicalPendingURL != nil
-                && canonicalPendingURL != canonicalURL
+                && canonicalPendingURL != targetURL
 
             if !isStaleStartURL {
                 invalidatePageAugmentation()
-                pendingURL = canonicalURL
-                updateNavigationMetadata(for: canonicalURL)
+                pendingURL = targetURL
+                updateNavigationMetadata(for: targetURL)
             }
+        }
+        nativeVideoLoadingMaskTask?.cancel()
+        nativeVideoLoadingMaskTask = nil
+        if let targetURL, FocusUserAgent.shouldUseDesktopPlayback(for: targetURL) {
+            dismissNativeVideoPlaceholder(for: targetURL)
         }
         isLoadingPage = true
         debugLog(
             "beginNavigation",
             fields: debugStateFields([
                 "inputURL": url?.absoluteString,
+                "targetURL": targetURL?.absoluteString,
                 "isStaleStartURL": debugBool(isStaleStartURL)
             ])
         )
@@ -1078,13 +1626,91 @@ final class FocusBrowserViewModel: ObservableObject {
             pendingURL = FocusNavigationPolicy.canonicalWebURL(for: failingURL)
             updateNavigationMetadata(for: pendingURL)
         }
+        nativeVideoLoadingMaskTask?.cancel()
+        nativeVideoLoadingMaskTask = nil
         isLoadingPage = false
+        lastIssuedLoadURL = nil
+        invalidateBrowserCallbacks()
         debugLog(
             "handleNavigationFailure",
             fields: debugStateFields([
                 "failingURL": failingURL?.absoluteString
             ])
         )
+    }
+
+    func handleWebContentProcessTermination(_ terminatedWebView: WKWebView) {
+        guard webView === terminatedWebView else {
+            return
+        }
+
+        invalidateBrowserCallbacks()
+        invalidatePageAugmentation()
+        resetPlayerState()
+        webContentRecoveryTask?.cancel()
+        webContentRecoveryTask = nil
+
+        let candidateRecoveryURL = (terminatedWebView.url ?? currentURL ?? pendingURL)
+            .map(FocusNavigationPolicy.canonicalWebURL(for:))
+        let recoveryURL: URL
+        switch WebContentRecoveryPolicy.decision(
+            isSessionActive: isSessionActive,
+            attempts: webContentRecoveryAttempts,
+            recoveryURL: candidateRecoveryURL
+        ) {
+        case .inactive:
+            isLoadingPage = false
+            return
+        case let .showRetry(message):
+            isLoadingPage = false
+            webContentFailureMessage = message
+            return
+        case let .recover(url):
+            recoveryURL = url
+        }
+
+        webContentRecoveryAttempts += 1
+        webContentFailureMessage = nil
+        pendingURL = recoveryURL
+        isLoadingPage = true
+        prepareNavigationSession(to: recoveryURL, force: true)
+
+        webContentRecoveryTask = Task { @MainActor [weak self, weak terminatedWebView] in
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard
+                let self,
+                !Task.isCancelled,
+                let terminatedWebView,
+                self.webView === terminatedWebView,
+                self.isSessionActive
+            else {
+                return
+            }
+
+            self.prepareForURL?(terminatedWebView, recoveryURL)
+            self.lastIssuedLoadURL = recoveryURL
+            terminatedWebView.load(
+                URLRequest(
+                    url: recoveryURL,
+                    cachePolicy: .reloadIgnoringLocalCacheData,
+                    timeoutInterval: 30
+                )
+            )
+            self.webContentRecoveryTask = nil
+        }
+    }
+
+    func retryAfterWebContentFailure() {
+        guard let recoveryURL = currentURL ?? pendingURL else {
+            return
+        }
+
+        webContentRecoveryAttempts = 0
+        webContentFailureMessage = nil
+        isLoadingPage = true
+        if let webView {
+            loadURLIfNeeded(recoveryURL, on: webView, reason: "manualWebContentRecovery", force: true)
+        }
     }
 
     func entryRedirect(for url: URL) -> FocusEntry? {
@@ -1101,6 +1727,32 @@ final class FocusBrowserViewModel: ObservableObject {
 
     func openNativeUserSpace(_ url: URL) {
         onUserSpaceRequest?(FocusNavigationPolicy.canonicalWebURL(for: url))
+    }
+
+    func shouldRouteVideoNavigationToNative(_ url: URL, currentURL: URL?) -> Bool {
+        guard FocusVideoIdentifier.extract(from: url) != nil else {
+            return false
+        }
+
+        let identifier = FocusVideoIdentifier.extract(from: url)
+        if nativeVideoWebBypassIdentifier == identifier {
+            return false
+        }
+        let canonicalURL = FocusNavigationPolicy.canonicalWebURL(for: url)
+        if let currentURL,
+           FocusNavigationPolicy.canonicalWebURL(for: currentURL) == canonicalURL
+        {
+            return false
+        }
+        return true
+    }
+
+    func openNativeVideo(_ url: URL) {
+        onVideoRequest?(FocusNavigationPolicy.canonicalWebURL(for: url))
+    }
+
+    func allowNextVideoNavigationInWeb(for url: URL) {
+        nativeVideoWebBypassIdentifier = FocusVideoIdentifier.extract(from: url)
     }
 
     func resolveAppBackAction() -> AppBackAction {
@@ -1127,6 +1779,7 @@ final class FocusBrowserViewModel: ObservableObject {
 
         if let webView {
             if let historyItem = historyItem(for: canonicalURL, in: webView) {
+                prepareNavigationSession(to: canonicalURL, force: true)
                 debugLog(
                     "navigateAppBack",
                     fields: debugStateFields([
@@ -1139,8 +1792,7 @@ final class FocusBrowserViewModel: ObservableObject {
                 return
             }
 
-            prepareForURL?(webView, canonicalURL)
-            webView.load(URLRequest(url: canonicalURL))
+            loadURLIfNeeded(canonicalURL, on: webView, reason: "navigateAppBack")
         }
 
         debugLog(
@@ -1301,8 +1953,37 @@ final class FocusBrowserViewModel: ObservableObject {
         runPlayerCommand(
             """
             (() => {
+              if (typeof window.__FOCUS_SET_IOS_PLAYER_LAYOUT_MODE__ === 'function') {
+                window.__FOCUS_SET_IOS_PLAYER_LAYOUT_MODE__('expanded');
+              }
+              if (typeof window.__FOCUS_SUPPRESS_IOS_PLAYER_SIZING__ === 'function') {
+                window.__FOCUS_SUPPRESS_IOS_PLAYER_SIZING__(1400, 'expanded');
+              } else if (typeof window.__FOCUS_CLEAR_IOS_PLAYER_SIZING__ === 'function') {
+                window.__FOCUS_CLEAR_IOS_PLAYER_SIZING__();
+              }
+
               const trackedVideo = window.__FOCUS_ACTIVE_VIDEO__;
-              const video = trackedVideo && trackedVideo.isConnected ? trackedVideo : document.querySelector('video');
+              const videos = Array.from(document.querySelectorAll('video'));
+              const rankedVideos = videos
+                .map((video) => {
+                  const rect = video.getBoundingClientRect();
+                  const style = window.getComputedStyle(video);
+                  const area = Math.max(rect.width, 0) * Math.max(rect.height, 0);
+                  const visible = rect.width > 120
+                    && rect.height > 70
+                    && style.display !== 'none'
+                    && style.visibility !== 'hidden'
+                    && style.opacity !== '0';
+                  const insidePlayer = !!video.closest('#bilibili-player, .bpx-player-container, #playerWrap, .player-container, .bpx-player-video-wrap');
+                  const score = (insidePlayer ? 1000000 : 0) + (visible ? 100000 : 0) + area + (video.readyState > 0 ? 5000 : 0);
+                  return { video, score };
+                })
+                .sort((left, right) => right.score - left.score);
+              const video = trackedVideo && trackedVideo.isConnected ? trackedVideo : (rankedVideos[0]?.video || null);
+              if (video) {
+                window.__FOCUS_ACTIVE_VIDEO__ = video;
+              }
+
               if (video && typeof video.webkitEnterFullscreen === 'function') {
                 try {
                   video.webkitEnterFullscreen();
@@ -1313,6 +1994,13 @@ final class FocusBrowserViewModel: ObservableObject {
               if (video && typeof video.webkitSetPresentationMode === 'function') {
                 try {
                   video.webkitSetPresentationMode('fullscreen');
+                  return true;
+                } catch (_) {}
+              }
+
+              if (video && typeof video.requestFullscreen === 'function') {
+                try {
+                  video.requestFullscreen();
                   return true;
                 } catch (_) {}
               }
@@ -1329,11 +2017,6 @@ final class FocusBrowserViewModel: ObservableObject {
                 return true;
               }
 
-              if (video && typeof video.requestFullscreen === 'function') {
-                video.requestFullscreen();
-                return true;
-              }
-
               return false;
             })();
             """
@@ -1341,36 +2024,207 @@ final class FocusBrowserViewModel: ObservableObject {
     }
 
     func exitFullscreen() {
+        let shouldResumePlayback = isPlaying
         runPlayerCommand(
             """
             (() => {
-              const playerRoot = document.querySelector('.bpx-player-container, #bilibili-player, #playerWrap');
-              const playerClassName = String(playerRoot?.className || '');
-              if (/fullscreen/.test(playerClassName)) {
-                const playerExit = document.querySelector('.bpx-player-ctrl-full, .bpx-player-ctrl-web, [class*="exit-fullscreen"], [class*="web-fullscreen"]');
-                if (playerExit) {
-                  playerExit.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-                  return true;
-                }
+              if (typeof window.__FOCUS_SET_IOS_PLAYER_LAYOUT_MODE__ === 'function') {
+                window.__FOCUS_SET_IOS_PLAYER_LAYOUT_MODE__('automatic');
+              }
+              if (typeof window.__FOCUS_SUPPRESS_IOS_PLAYER_SIZING__ === 'function') {
+                window.__FOCUS_SUPPRESS_IOS_PLAYER_SIZING__(900, 'automatic');
+              } else if (typeof window.__FOCUS_CLEAR_IOS_PLAYER_SIZING__ === 'function') {
+                window.__FOCUS_CLEAR_IOS_PLAYER_SIZING__();
               }
 
-              if (document.fullscreenElement && typeof document.exitFullscreen === 'function') {
-                document.exitFullscreen();
+              const trackedVideo = window.__FOCUS_ACTIVE_VIDEO__;
+              const videos = Array.from(document.querySelectorAll('video'));
+              const rankedVideos = videos
+                .map((video) => {
+                  const rect = video.getBoundingClientRect();
+                  const style = window.getComputedStyle(video);
+                  const area = Math.max(rect.width, 0) * Math.max(rect.height, 0);
+                  const visible = rect.width > 120
+                    && rect.height > 70
+                    && style.display !== 'none'
+                    && style.visibility !== 'hidden'
+                    && style.opacity !== '0';
+                  const insidePlayer = !!video.closest('#bilibili-player, .bpx-player-container, #playerWrap, .player-container, .bpx-player-video-wrap');
+                  const score = (insidePlayer ? 1000000 : 0) + (visible ? 100000 : 0) + area + (video.readyState > 0 ? 5000 : 0);
+                  return { video, score };
+                })
+                .sort((left, right) => right.score - left.score);
+              const video = trackedVideo && trackedVideo.isConnected ? trackedVideo : (rankedVideos[0]?.video || null);
+              const shouldResumePlayback = \(shouldResumePlayback ? "true" : "false");
+              if (video) {
+                window.__FOCUS_ACTIVE_VIDEO__ = video;
               }
 
-              const video = document.querySelector('video');
-              if (video && typeof video.webkitSetPresentationMode === 'function') {
+              let exited = false;
+              const isNativeFullscreen = !!video && (
+                video.webkitDisplayingFullscreen === true
+                || video.webkitPresentationMode === 'fullscreen'
+              );
+
+              if (isNativeFullscreen && video && typeof video.webkitSetPresentationMode === 'function') {
                 try {
                   video.webkitSetPresentationMode('inline');
+                  exited = true;
                 } catch (_) {}
               }
 
-              const exitButton = document.querySelector('.bpx-player-ctrl-web, .bpx-player-ctrl-full, [class*="web-fullscreen"], [class*="exit-fullscreen"]');
-              exitButton?.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+              if (!exited && isNativeFullscreen && video && typeof video.webkitExitFullscreen === 'function') {
+                try {
+                  video.webkitExitFullscreen();
+                  exited = true;
+                } catch (_) {}
+              }
+
+              if (!exited && document.fullscreenElement && typeof document.exitFullscreen === 'function') {
+                try {
+                  document.exitFullscreen();
+                  exited = true;
+                } catch (_) {}
+              }
+
+              if (!exited) {
+                const exitButton = document.querySelector('.bpx-player-ctrl-web, .bpx-player-ctrl-full, [class*="web-fullscreen"], [class*="exit-fullscreen"]');
+                if (exitButton) {
+                  exitButton.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                  exited = true;
+                }
+              }
+
+              if (shouldResumePlayback && video && !video.ended) {
+                const resume = () => {
+                  try {
+                    const playTask = video.play?.();
+                    if (playTask && typeof playTask.catch === 'function') {
+                      playTask.catch(() => {});
+                    }
+                  } catch (_) {}
+                };
+
+                if (video.paused) {
+                  resume();
+                }
+                setTimeout(() => {
+                  if (video.paused && !video.ended) {
+                    resume();
+                  }
+                }, 80);
+                setTimeout(() => {
+                  if (video.paused && !video.ended) {
+                    resume();
+                  }
+                }, 260);
+                setTimeout(() => {
+                  if (video.paused && !video.ended) {
+                    resume();
+                  }
+                }, 520);
+              }
+
+              return exited;
+            })();
+            """
+        )
+    }
+
+    @MainActor
+    private func enterLandscapeFullscreen() {
+        let targetMask: UIInterfaceOrientationMask = .landscape
+        let requiresNativeRotation = requestedInterfaceOrientationMask != targetMask
+
+        runPlayerCommand(
+            """
+            (() => {
+              window.__FOCUS_SET_IOS_PLAYER_LAYOUT_MODE__?.('expanded');
+              window.__FOCUS_SUPPRESS_IOS_PLAYER_SIZING__?.(1800, 'expanded');
               return true;
             })();
             """
         )
+
+        if requiresNativeRotation {
+            requestedInterfaceOrientationMask = targetMask
+            updateSupportedOrientations(to: targetMask)
+        }
+
+        fullscreenTransitionTask?.cancel()
+        fullscreenTransitionTask = Task { @MainActor [weak self] in
+            let delay: UInt64 = requiresNativeRotation ? 160_000_000 : 40_000_000
+            try? await Task.sleep(nanoseconds: delay)
+            guard let self, !Task.isCancelled else {
+                return
+            }
+            if !self.isImmersiveVideo {
+                self.requestFullscreen()
+            }
+        }
+    }
+
+    @MainActor
+    private func exitLandscapeFullscreen() {
+        let needsPortraitRestore = requestedInterfaceOrientationMask != .portrait
+        let needsFullscreenExit = isImmersiveVideo
+        guard needsFullscreenExit || needsPortraitRestore else {
+            return
+        }
+
+        fullscreenTransitionTask?.cancel()
+        if needsPortraitRestore {
+            runPlayerCommand(
+                """
+                (() => {
+                  window.__FOCUS_SET_IOS_PLAYER_LAYOUT_MODE__?.('automatic');
+                  window.__FOCUS_SUPPRESS_IOS_PLAYER_SIZING__?.(900, 'automatic');
+                  return true;
+                })();
+                """
+            )
+            requestedInterfaceOrientationMask = .portrait
+            updateSupportedOrientations(to: .portrait)
+        }
+
+        guard needsFullscreenExit else {
+            return
+        }
+
+        fullscreenTransitionTask = Task { @MainActor [weak self] in
+            let delay: UInt64 = needsPortraitRestore ? 40_000_000 : 0
+            try? await Task.sleep(nanoseconds: delay)
+            guard let self, !Task.isCancelled else {
+                return
+            }
+            if self.isImmersiveVideo {
+                self.exitFullscreen()
+            }
+        }
+    }
+
+    @MainActor
+    private func updateSupportedOrientations(to mask: UIInterfaceOrientationMask) {
+        AppDelegate.orientationLock = mask
+
+        guard let rootViewController = activeRootViewController else {
+            return
+        }
+
+        rootViewController.setNeedsUpdateOfSupportedInterfaceOrientations()
+        rootViewController.navigationController?.setNeedsUpdateOfSupportedInterfaceOrientations()
+        rootViewController.presentedViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
+    }
+
+    private var activeRootViewController: UIViewController? {
+        let activeWindowScene = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first { scene in
+                scene.activationState == .foregroundActive
+            }
+        return activeWindowScene?
+            .windows.first(where: \.isKeyWindow)?
+            .rootViewController
     }
 
     func toggleSubtitles() {
@@ -1410,94 +2264,222 @@ final class FocusBrowserViewModel: ObservableObject {
             return
         }
 
-        guard showsNativeVideoControls || hasActiveVideoRoute || hasDetectedPlayer else {
+        guard orientation.isLandscape || orientation == .portrait else {
             return
         }
 
+        if lastHandledDeviceOrientation == orientation {
+            return
+        }
+        lastHandledDeviceOrientation = orientation
+
+        orientationDebounceTask?.cancel()
+        orientationDebounceTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 180_000_000)
+            guard let self, !Task.isCancelled else {
+                return
+            }
+            self.handleStableDeviceOrientationChange(orientation)
+        }
+    }
+
+    @MainActor
+    private func handleStableDeviceOrientationChange(_ orientation: UIDeviceOrientation) {
+        guard UIDevice.current.userInterfaceIdiom == .phone else {
+            return
+        }
+
+        let activeTargetURL = (isLoadingPage ? (pendingURL ?? currentURL) : (currentURL ?? pendingURL))
+            .map(FocusNavigationPolicy.canonicalWebURL(for:))
+
+        guard let activeTargetURL, FocusUserAgent.shouldUseDesktopPlayback(for: activeTargetURL) else {
+            pendingOrientationSyncAfterPlayerReady = false
+            return
+        }
+
+        guard !isLoadingPage, hasDetectedPlayer else {
+            pendingOrientationSyncAfterPlayerReady = orientation.isLandscape || orientation == .portrait
+            return
+        }
+
+        pendingOrientationSyncAfterPlayerReady = false
         switch orientation {
         case .landscapeLeft, .landscapeRight:
             if !isImmersiveVideo {
-                requestFullscreen()
+                enterLandscapeFullscreen()
             }
         case .portrait:
-            if isImmersiveVideo {
-                exitFullscreen()
-            }
+            exitLandscapeFullscreen()
         default:
             break
         }
     }
 
     func prepareForDismiss() {
+        isSessionActive = false
+        invalidateBrowserCallbacks()
+        webContentRecoveryTask?.cancel()
+        webContentRecoveryTask = nil
+        webContentFailureMessage = nil
+        if let webView {
+            suspendActivePlayback(in: webView)
+            webView.stopLoading()
+        }
         invalidatePageAugmentation()
-        playerStateObservationTask?.cancel()
-        playerStateObservationTask = nil
-        embeddedPlayerDetectionTask?.cancel()
-        embeddedPlayerDetectionTask = nil
+        resetPlayerState()
         isLoadingPage = false
-        isImmersiveVideo = false
+        requestedInterfaceOrientationMask = .portrait
+        updateSupportedOrientations(to: .portrait)
         navigationTitle = "浏览"
         entryContext = .dynamic
+        lastIssuedLoadURL = nil
+        pendingOrientationSyncAfterPlayerReady = false
+        lastHandledDeviceOrientation = .unknown
+        orientationDebounceTask?.cancel()
+        orientationDebounceTask = nil
+        fullscreenTransitionTask?.cancel()
+        fullscreenTransitionTask = nil
         resetAppBackStack()
     }
 
-    private func applySettingsChange(_ settings: FocusSettings) {
-        guard let webView else { return }
-        reconfigureScripts?(webView, settings)
-
-        if let currentURL = webView.url {
-            prepareForURL?(webView, currentURL)
-            webView.load(URLRequest(url: currentURL))
-        } else if let pendingURL {
-            prepareForURL?(webView, pendingURL)
-            webView.load(URLRequest(url: pendingURL))
-        }
-    }
-
-    private func runPlayerCommand(_ script: String) {
-        guard allowsPlayerControl else {
+    func detach(webView detachedWebView: WKWebView) {
+        guard webView === detachedWebView else {
             return
         }
 
-        webView?.evaluateJavaScript(script) { [weak self] _, _ in
-            guard let self else {
+        isSessionActive = false
+        invalidateBrowserCallbacks()
+        webContentRecoveryTask?.cancel()
+        webContentRecoveryTask = nil
+        if let webView {
+            suspendActivePlayback(in: webView)
+            webView.stopLoading()
+        }
+        invalidatePageAugmentation()
+        resetPlayerState()
+        prepareForURL = nil
+        self.webView = nil
+        webContentFailureMessage = nil
+        isLoadingPage = false
+    }
+
+    private func suspendActivePlayback(in webView: WKWebView) {
+        let script = """
+        (() => {
+          try {
+            if (document.fullscreenElement && typeof document.exitFullscreen === 'function') {
+              document.exitFullscreen();
+            }
+          } catch (_) {}
+
+          if (window.__FOCUS_LOADING_MASK_OBSERVER__) {
+            try {
+              window.__FOCUS_LOADING_MASK_OBSERVER__.disconnect();
+            } catch (_) {}
+            window.__FOCUS_LOADING_MASK_OBSERVER__ = null;
+          }
+
+          if (window.__FOCUS_NATIVE_VIDEO_AUGMENT_HELPERS__?.teardown) {
+            try {
+              window.__FOCUS_NATIVE_VIDEO_AUGMENT_HELPERS__.teardown();
+            } catch (_) {}
+          }
+          window.__FOCUS_NATIVE_VIDEO_AUGMENT_HELPERS__ = null;
+
+          document.documentElement.classList.remove('focus-native-video-ready', 'focus-hide-danmaku', 'focus-hide-subtitles');
+          document.documentElement.classList.remove('focus-native-video-fallback');
+          document.documentElement.removeAttribute('data-focus-player-layout');
+          document.body?.classList?.remove?.('focus-native-video-ready');
+          document.getElementById('focus-native-video-prehide-style')?.remove?.();
+
+          try {
+            window.__FOCUS_CLEAR_IOS_PLAYER_SIZING__?.();
+          } catch (_) {}
+          window.__FOCUS_CLEAR_IOS_PLAYER_SIZING__ = null;
+          window.__FOCUS_SUPPRESS_IOS_PLAYER_SIZING__ = null;
+          window.__FOCUS_SET_IOS_PLAYER_LAYOUT_MODE__ = null;
+
+          [
+            'focus-native-video-augment',
+            'focus-native-video-loading-mask'
+          ].forEach((id) => {
+            document.getElementById(id)?.remove?.();
+          });
+
+          Array.from(document.querySelectorAll('video')).forEach((video) => {
+            try {
+              video.pause();
+            } catch (_) {}
+
+            try {
+              if (typeof video.webkitSetPresentationMode === 'function'
+                && video.webkitPresentationMode
+                && video.webkitPresentationMode !== 'inline') {
+                video.webkitSetPresentationMode('inline');
+              }
+            } catch (_) {}
+
+            try {
+              video.removeAttribute('autoplay');
+            } catch (_) {}
+          });
+
+          window.__FOCUS_ACTIVE_VIDEO__ = null;
+          window.__FOCUS_PLAYER_STATE__ = null;
+          return true;
+        })();
+        """
+        webView.evaluateJavaScript(script, completionHandler: nil)
+    }
+
+    private func runPlayerCommand(_ script: String) {
+        guard
+            allowsPlayerControl,
+            let webView,
+            let context = makeBrowserCallbackContext(for: webView)
+        else {
+            return
+        }
+
+        playerCommandTask?.cancel()
+        playerCommandTask = Task { @MainActor [weak self, weak webView] in
+            guard let self, let webView else {
                 return
             }
 
-            Task { @MainActor [weak self] in
-                let delays: [UInt64] = [80_000_000, 220_000_000, 520_000_000, 1_000_000_000]
-                for delay in delays {
-                    try? await Task.sleep(nanoseconds: delay)
-                    self?.refreshPlayerState()
-                }
+            do {
+                _ = try await webView.evaluateJavaScript(script)
+            } catch {
+                self.debugLog(
+                    "playerCommand.error",
+                    fields: self.debugStateFields(["error": String(describing: error)])
+                )
             }
+
+            guard !Task.isCancelled, self.isCurrent(context, webView: webView) else {
+                return
+            }
+
+            _ = await self.refreshPlayerState(on: webView, context: context)
         }
     }
 
     private func startEmbeddedPlayerDetection(on webView: WKWebView) {
-        let expectedURL = webView.url
-        let shouldContinuouslyObserve = expectedURL.map(isSearchResultURL) ?? (entryContext == .search)
+        guard let context = makeBrowserCallbackContext(for: webView) else {
+            return
+        }
+        let expectedURL = context.canonicalURL
         debugLog(
             "startEmbeddedPlayerDetection",
             fields: debugStateFields([
-                "expectedURL": expectedURL?.absoluteString,
-                "continuous": debugBool(shouldContinuouslyObserve)
+                "expectedURL": expectedURL.absoluteString,
+                "continuous": debugBool(false)
             ])
         )
+        embeddedPlayerDetectionTask?.cancel()
         embeddedPlayerDetectionTask = Task { @MainActor [weak self, weak webView] in
-            let initialDelays: [UInt64] = [0, 180_000_000, 420_000_000, 900_000_000, 1_600_000_000]
-            var attempt = 0
-
-            while true {
-                let delay: UInt64
-                if attempt < initialDelays.count {
-                    delay = initialDelays[attempt]
-                } else if shouldContinuouslyObserve {
-                    delay = 950_000_000
-                } else {
-                    break
-                }
-
+            let initialDelays: [UInt64] = [0, 300_000_000, 700_000_000, 1_400_000_000, 2_500_000_000]
+            for (attempt, delay) in initialDelays.enumerated() {
                 if delay > 0 {
                     try? await Task.sleep(nanoseconds: delay)
                 }
@@ -1505,50 +2487,59 @@ final class FocusBrowserViewModel: ObservableObject {
                 guard
                     !Task.isCancelled,
                     let self,
-                    let webView
+                    let webView,
+                    self.isCurrent(context, webView: webView)
                 else {
                     return
                 }
 
-                if let state = await self.detectEmbeddedPlayerState(on: webView, fallbackURL: expectedURL) {
+                if let state = await self.detectEmbeddedPlayerState(
+                    on: webView,
+                    context: context,
+                    fallbackURL: expectedURL
+                ) {
+                    guard self.isCurrent(context, webView: webView) else {
+                        return
+                    }
                     let hasPlayer = state.hasPlayer
-                    self.hasDetectedPlayer = hasPlayer || self.hasDetectedPlayer
                     self.applyDetectedPageState(state, fallbackURL: webView.url ?? expectedURL)
+                    self.logDetectedPageState(state, source: "detectEmbeddedPlayerState")
                     self.debugLog(
                         "embeddedPlayerDetectionAttempt",
                         fields: self.debugStateFields([
                             "attempt": String(attempt),
-                            "expectedURL": expectedURL?.absoluteString,
+                            "expectedURL": expectedURL.absoluteString,
                             "detectedHasPlayer": self.debugBool(hasPlayer)
                         ])
                     )
 
                     if self.hasActiveVideoRoute || hasPlayer {
                         self.hasActiveVideoRoute = true
-                        self.hasDetectedPlayer = true
-                        self.refreshPlayerState()
+                        var snapshot = self.playerSnapshot
+                        snapshot.hasPlayer = true
+                        self.updatePlayerSnapshot(snapshot)
                         self.startPlayerStateObservation()
                         return
                     }
                 }
-
-                attempt += 1
             }
 
             guard
                 let self,
                 !Task.isCancelled,
-                self.currentURL == expectedURL,
-                !shouldContinuouslyObserve
+                let webView,
+                self.isCurrent(context, webView: webView)
             else {
                 return
             }
-
-            self.resetPlayerState()
         }
     }
 
-    private func detectEmbeddedPlayerState(on webView: WKWebView, fallbackURL: URL?) async -> DetectedPageState? {
+    private func detectEmbeddedPlayerState(
+        on webView: WKWebView,
+        context: BrowserCallbackContext,
+        fallbackURL: URL?
+    ) async -> DetectedPageState? {
         let script = """
         (() => {
           const cachedState = window.__FOCUS_PLAYER_STATE__;
@@ -1607,51 +2598,34 @@ final class FocusBrowserViewModel: ObservableObject {
         })();
         """
 
-        return await withCheckedContinuation { continuation in
-            webView.evaluateJavaScript(script) { [weak self, weak webView] value, error in
-                guard
-                    let self
-                else {
-                    continuation.resume(returning: nil)
-                    return
-                }
-
-                if let error {
-                    self.debugLog(
-                        "detectEmbeddedPlayerState.error",
-                        fields: self.debugStateFields([
-                            "fallbackURL": fallbackURL?.absoluteString,
-                            "error": String(describing: error)
-                        ])
-                    )
-                }
-
-                guard
-                    let webView,
-                    let payload = value as? [String: Any]
-                else {
-                    self.debugLog(
-                        "detectEmbeddedPlayerState.missingPayload",
-                        fields: self.debugStateFields([
-                            "fallbackURL": fallbackURL?.absoluteString,
-                            "valueType": value.map { String(describing: type(of: $0)) } ?? "nil"
-                        ])
-                    )
-                    continuation.resume(returning: nil)
-                    return
-                }
-
-                let state = self.makeDetectedPageState(from: payload)
-                self.applyDetectedPageState(state, fallbackURL: webView.url ?? fallbackURL)
-                self.logDetectedPageState(state, source: "detectEmbeddedPlayerState")
-
-                let hasPlayer = state.hasPlayer
-                if hasPlayer {
-                    self.hasDetectedPlayer = true
-                }
-
-                continuation.resume(returning: state)
+        do {
+            let value = try await webView.evaluateJavaScript(script)
+            guard !Task.isCancelled, isCurrent(context, webView: webView) else {
+                return nil
             }
+            guard let payload = value as? [String: Any] else {
+                debugLog(
+                    "detectEmbeddedPlayerState.missingPayload",
+                    fields: debugStateFields([
+                        "fallbackURL": fallbackURL?.absoluteString,
+                        "valueType": value.map { String(describing: type(of: $0)) } ?? "nil"
+                    ])
+                )
+                return nil
+            }
+            return makeDetectedPageState(from: payload)
+        } catch {
+            guard isCurrent(context, webView: webView) else {
+                return nil
+            }
+            debugLog(
+                "detectEmbeddedPlayerState.error",
+                fields: debugStateFields([
+                    "fallbackURL": fallbackURL?.absoluteString,
+                    "error": String(describing: error)
+                ])
+            )
+            return nil
         }
     }
 
@@ -1893,18 +2867,34 @@ final class FocusBrowserViewModel: ObservableObject {
     }
 
     private func resetPlayerState() {
+        if let activeURL = webView?.url ?? currentURL ?? pendingURL {
+            clearNativeVideoOriginalSectionSuppression(for: FocusNavigationPolicy.canonicalWebURL(for: activeURL))
+        }
         playerStateObservationTask?.cancel()
         playerStateObservationTask = nil
         embeddedPlayerDetectionTask?.cancel()
         embeddedPlayerDetectionTask = nil
+        nativeVideoLoadingMaskTask?.cancel()
+        nativeVideoLoadingMaskTask = nil
+        pendingOrientationSyncAfterPlayerReady = false
+        orientationDebounceTask?.cancel()
+        orientationDebounceTask = nil
+        fullscreenTransitionTask?.cancel()
+        fullscreenTransitionTask = nil
+        playerCommandTask?.cancel()
+        playerCommandTask = nil
+        lastHandledDeviceOrientation = .unknown
+        requestedInterfaceOrientationMask = .portrait
+        updateSupportedOrientations(to: .portrait)
         hasActiveVideoRoute = false
-        hasDetectedPlayer = false
-        isImmersiveVideo = false
-        isPlaying = false
-        playbackRate = 1.0
-        isDanmakuHidden = false
-        hasSubtitles = false
-        isSubtitleHidden = false
+        updatePlayerSnapshot(.empty)
+        nativeVideoAuthorName = ""
+        nativeVideoAuthorAvatarURL = nil
+        nativeVideoAuthorSpaceURL = nil
+        nativeVideoAuthorMID = 0
+        nativeVideoAuthorFollowers = 0
+        nativeVideoAuthorIsFollowing = false
+        isUpdatingNativeVideoFollow = false
         lastDebugDetectedPageStateSignature = nil
         lastDebugPlayerStateSignature = nil
     }
@@ -1913,6 +2903,62 @@ final class FocusBrowserViewModel: ObservableObject {
         pageAugmentationRevision &+= 1
         pageAugmentationTask?.cancel()
         pageAugmentationTask = nil
+        pageAugmentationApplyTask?.cancel()
+        pageAugmentationApplyTask = nil
+        nativeVideoLoadingMaskTask?.cancel()
+        nativeVideoLoadingMaskTask = nil
+        nativeVideoPlaceholderTask?.cancel()
+        nativeVideoPlaceholderTask = nil
+        scheduledPageAugmentationKey = nil
+        pageAugmentationFailureCounts.removeAll()
+        pageAugmentationRetryAfter.removeAll()
+    }
+
+    private func loadURLIfNeeded(_ url: URL, on webView: WKWebView, reason: String, force: Bool = false) {
+        let canonicalURL = FocusNavigationPolicy.canonicalWebURL(for: url)
+        let activeURL = webView.url.map(FocusNavigationPolicy.canonicalWebURL(for:))
+
+        if !force {
+            if webView.isLoading, lastIssuedLoadURL == canonicalURL {
+                debugLog(
+                    "loadURLIfNeeded.skip",
+                    fields: debugStateFields([
+                        "reason": reason,
+                        "targetURL": canonicalURL.absoluteString,
+                        "skipReason": "already-loading"
+                    ])
+                )
+                return
+            }
+
+            if activeURL == canonicalURL,
+               pendingURL == canonicalURL,
+               !isLoadingPage
+            {
+                debugLog(
+                    "loadURLIfNeeded.skip",
+                    fields: debugStateFields([
+                        "reason": reason,
+                        "targetURL": canonicalURL.absoluteString,
+                        "skipReason": "already-visible"
+                    ])
+                )
+                return
+            }
+        }
+
+        prepareNavigationSession(to: canonicalURL)
+        prepareForURL?(webView, canonicalURL)
+        lastIssuedLoadURL = canonicalURL
+        webView.load(URLRequest(url: canonicalURL))
+        debugLog(
+            "loadURLIfNeeded.load",
+            fields: debugStateFields([
+                "reason": reason,
+                "targetURL": canonicalURL.absoluteString,
+                "force": debugBool(force)
+            ])
+        )
     }
 
     private func schedulePageAugmentationRefresh() {
@@ -1925,12 +2971,47 @@ final class FocusBrowserViewModel: ObservableObject {
         }
 
         let canonicalURL = FocusNavigationPolicy.canonicalWebURL(for: activeURL)
+        let scheduleKey = "\(revisionKeyPrefix(for: kind, url: canonicalURL))::rev=\(pageAugmentationRevision)"
+        if let retryAfter = pageAugmentationRetryAfter[scheduleKey], retryAfter > Date() {
+            debugLog(
+                "nativePageAugmentation.skipRetryCooldown",
+                fields: debugStateFields([
+                    "pageKind": kind.rawValue,
+                    "pageURL": canonicalURL.absoluteString,
+                    "retryAfter": ISO8601DateFormatter().string(from: retryAfter)
+                ])
+            )
+            return
+        }
+        pageAugmentationRetryAfter[scheduleKey] = nil
+        if scheduledPageAugmentationKey == scheduleKey {
+            debugLog(
+                "nativePageAugmentation.skipDuplicateSchedule",
+                fields: debugStateFields([
+                    "pageKind": kind.rawValue,
+                    "pageURL": canonicalURL.absoluteString
+                ])
+            )
+            return
+        }
+        scheduledPageAugmentationKey = scheduleKey
         let cacheKey = kind.cacheKey(for: canonicalURL)
         let revision = pageAugmentationRevision
 
         if let cachedPayload = pageAugmentCache[cacheKey] {
+            nativeVideoLoadingMaskTask?.cancel()
+            nativeVideoLoadingMaskTask = nil
+            nativeVideoPlaceholderTask?.cancel()
+            nativeVideoPlaceholderTask = nil
+            pageAugmentationFailureCounts[scheduleKey] = nil
+            pageAugmentationRetryAfter[scheduleKey] = nil
+            syncNativeVideoMetadata(from: cachedPayload)
             applyPageAugmentation(cachedPayload, for: canonicalURL, revision: revision)
             return
+        }
+
+        if kind == .video && (pageAugmentationFailureCounts[scheduleKey] ?? 0) < 3 {
+            scheduleNativeVideoPlaceholderInstall(for: canonicalURL, revision: revision)
         }
 
         pageAugmentationTask?.cancel()
@@ -1950,13 +3031,27 @@ final class FocusBrowserViewModel: ObservableObject {
                         return
                     }
 
+                    let failureCount = (self.pageAugmentationFailureCounts[scheduleKey] ?? 0) + 1
+                    self.pageAugmentationFailureCounts[scheduleKey] = failureCount
+                    let retryDelay = min(3.0, pow(2.0, Double(max(failureCount - 1, 0))) * 0.35)
+                    self.pageAugmentationRetryAfter[scheduleKey] = Date().addingTimeInterval(retryDelay)
+                    self.scheduledPageAugmentationKey = nil
                     self.debugLog(
                         "nativePageAugmentation.missingPayload",
                         fields: self.debugStateFields([
                             "pageKind": kind.rawValue,
-                            "pageURL": canonicalURL.absoluteString
+                            "pageURL": canonicalURL.absoluteString,
+                            "failures": String(failureCount),
+                            "retryDelayMS": String(Int(retryDelay * 1000))
                         ])
                     )
+
+                    if kind == .video, failureCount >= 3 {
+                        self.nativeVideoPlaceholderTask?.cancel()
+                        self.nativeVideoPlaceholderTask = nil
+                        self.clearNativeVideoOriginalSectionSuppression(for: canonicalURL)
+                        self.dismissNativeVideoPlaceholder(for: canonicalURL)
+                    }
                 }
                 return
             }
@@ -1966,10 +3061,838 @@ final class FocusBrowserViewModel: ObservableObject {
                     return
                 }
 
+                self.nativeVideoLoadingMaskTask?.cancel()
+                self.nativeVideoLoadingMaskTask = nil
+                self.nativeVideoPlaceholderTask?.cancel()
+                self.nativeVideoPlaceholderTask = nil
+                self.pageAugmentationFailureCounts[scheduleKey] = nil
+                self.pageAugmentationRetryAfter[scheduleKey] = nil
                 self.pageAugmentCache[cacheKey] = payload
-                print("[Focus Native Augment] loaded kind=\(payload.kind.rawValue) summary=\(payload.summary) url=\(canonicalURL.absoluteString)")
+                self.syncNativeVideoMetadata(from: payload)
                 self.applyPageAugmentation(payload, for: canonicalURL, revision: revision)
             }
+        }
+    }
+
+    private func revisionKeyPrefix(for kind: FocusNativePageKind, url: URL) -> String {
+        "\(kind.rawValue)::\(url.absoluteString)"
+    }
+
+    private func scheduleNativeVideoLoadingMaskInstall(for canonicalURL: URL, revision: Int) {
+        nativeVideoLoadingMaskTask?.cancel()
+        debugLog(
+            "nativeLoadingMask.scheduled",
+            fields: debugStateFields([
+                "pageURL": canonicalURL.absoluteString,
+                "delayMS": "360",
+                "revision": String(revision)
+            ])
+        )
+        nativeVideoLoadingMaskTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 360_000_000)
+            guard
+                let self,
+                !Task.isCancelled,
+                self.pageAugmentationRevision == revision
+            else {
+                return
+            }
+
+            self.installNativeVideoLoadingMaskIfNeeded(for: canonicalURL)
+            self.nativeVideoLoadingMaskTask = nil
+        }
+    }
+
+    private func installNativeVideoOriginalSectionSuppression(for canonicalURL: URL) {
+        guard let webView else {
+            return
+        }
+
+        webView.evaluateJavaScript(
+            """
+            (() => {
+              const activeURL = location.href ? new URL(location.href, document.baseURI).href : '';
+              const targetURL = '\(canonicalURL.absoluteString.replacingOccurrences(of: "'", with: "\\'"))';
+              if (activeURL && activeURL !== targetURL && !activeURL.startsWith(targetURL)) {
+                return { applied: false, reason: 'url-mismatch' };
+              }
+
+              const id = 'focus-native-video-prehide-style';
+              document.documentElement.classList.remove('focus-native-video-fallback');
+              let style = document.getElementById(id);
+              if (!style) {
+                style = document.createElement('style');
+                style.id = id;
+                document.head.appendChild(style);
+              }
+
+              style.textContent = `
+                .video-pod,
+                .video-pod__head,
+                .video-pod__header,
+                .video-pod__body,
+                .video-pod__list,
+                .right-container,
+                .right-container-inner,
+                .side-toolbar,
+                .right-entry,
+                #viewbox_report,
+                .multi-page,
+                [class*="multi-page"],
+                [class*="episode-list"],
+                [class*="part-list"],
+                [class*="page-list"],
+                #commentapp,
+                #commentapp > *,
+                bili-comments,
+                .comment-container,
+                .bb-comment {
+                  opacity: 0 !important;
+                  pointer-events: none !important;
+                }
+              `;
+
+              return { applied: true, reason: 'installed' };
+            })();
+            """,
+            completionHandler: { [weak self] value, error in
+                guard let self else {
+                    return
+                }
+
+                if let error {
+                    self.debugLog(
+                        "nativeOriginalSectionSuppression.error",
+                        fields: self.debugStateFields([
+                            "pageURL": canonicalURL.absoluteString,
+                            "error": String(describing: error)
+                        ])
+                    )
+                    return
+                }
+
+                let payload = value as? [String: Any]
+                let applied = payload?["applied"] as? Bool
+                let reason = payload?["reason"] as? String
+                self.debugLog(
+                    "nativeOriginalSectionSuppression.install",
+                    fields: self.debugStateFields([
+                        "pageURL": canonicalURL.absoluteString,
+                        "applied": applied == true ? "true" : "false",
+                        "reason": reason,
+                        "resultType": value.map { String(describing: type(of: $0)) } ?? "nil"
+                    ])
+                )
+            }
+        )
+    }
+
+    private func clearNativeVideoOriginalSectionSuppression(for canonicalURL: URL) {
+        guard let webView else {
+            return
+        }
+
+        webView.evaluateJavaScript(
+            """
+            (() => {
+              const activeURL = location.href ? new URL(location.href, document.baseURI).href : '';
+              const targetURL = '\(canonicalURL.absoluteString.replacingOccurrences(of: "'", with: "\\'"))';
+              if (activeURL && activeURL !== targetURL && !activeURL.startsWith(targetURL)) {
+                return { cleared: false, reason: 'url-mismatch' };
+              }
+
+              document.getElementById('focus-native-video-prehide-style')?.remove?.();
+              document.documentElement.classList.add('focus-native-video-fallback');
+              return { cleared: true, reason: 'removed' };
+            })();
+            """,
+            completionHandler: { [weak self] value, error in
+                guard let self else {
+                    return
+                }
+
+                if let error {
+                    self.debugLog(
+                        "nativeOriginalSectionSuppression.clear.error",
+                        fields: self.debugStateFields([
+                            "pageURL": canonicalURL.absoluteString,
+                            "error": String(describing: error)
+                        ])
+                    )
+                    return
+                }
+
+                let payload = value as? [String: Any]
+                let cleared = payload?["cleared"] as? Bool
+                let reason = payload?["reason"] as? String
+                self.debugLog(
+                    "nativeOriginalSectionSuppression.clear",
+                    fields: self.debugStateFields([
+                        "pageURL": canonicalURL.absoluteString,
+                        "cleared": cleared == true ? "true" : "false",
+                        "reason": reason,
+                        "resultType": value.map { String(describing: type(of: $0)) } ?? "nil"
+                    ])
+                )
+            }
+        )
+    }
+
+    private func installNativeVideoLoadingMaskIfNeeded(for canonicalURL: URL) {
+        guard let webView else {
+            return
+        }
+
+        webView.evaluateJavaScript(
+            """
+            (() => {
+              const activeURL = location.href ? new URL(location.href, document.baseURI).href : '';
+              const targetURL = '\(canonicalURL.absoluteString.replacingOccurrences(of: "'", with: "\\'"))';
+              if (activeURL && activeURL !== targetURL && !activeURL.startsWith(targetURL)) {
+                return false;
+              }
+
+              const root = document.getElementById('focus-native-video-augment');
+              const hasSettledAugment = (() => {
+                if (!(root instanceof HTMLElement)) {
+                  return false;
+                }
+
+                const renderKey = root.getAttribute('data-focus-render-key');
+                const version = root.getAttribute('data-focus-version');
+                return !!renderKey && !!version && root.children.length > 0 && !root.hasAttribute('data-focus-placeholder');
+              })();
+              const hasPlaceholder = root instanceof HTMLElement
+                && root.hasAttribute('data-focus-placeholder')
+                && root.children.length > 0;
+              const isReady = document.documentElement.classList.contains('focus-native-video-ready')
+                || document.body?.classList?.contains?.('focus-native-video-ready');
+
+              if (hasSettledAugment || hasPlaceholder || isReady) {
+                if (window.__FOCUS_CLEAR_VIDEO_LOADING_MASK__) {
+                  try {
+                    window.__FOCUS_CLEAR_VIDEO_LOADING_MASK__(true);
+                  } catch (_) {}
+                }
+                return false;
+              }
+
+              const id = 'focus-native-video-loading-mask';
+              if (window.__FOCUS_CLEAR_VIDEO_LOADING_MASK__) {
+                try {
+                  window.__FOCUS_CLEAR_VIDEO_LOADING_MASK__(true);
+                } catch (_) {}
+              }
+              let mask = document.getElementById(id);
+              if (!mask) {
+                mask = document.createElement('div');
+                mask.id = id;
+                (document.body || document.documentElement).appendChild(mask);
+              }
+              mask.style.position = 'fixed';
+              mask.style.left = '0';
+              mask.style.right = '0';
+              mask.style.top = 'calc(100vw / 1.5 + 88px)';
+              mask.style.bottom = '0';
+              mask.style.background = document.documentElement.getAttribute('data-focus-theme') === 'dark' ? '#0F1115' : '#F6F7FA';
+              mask.style.pointerEvents = 'none';
+              mask.style.zIndex = '20';
+              mask.style.opacity = '1';
+
+              if (window.__FOCUS_LOADING_MASK_OBSERVER__) {
+                try {
+                  window.__FOCUS_LOADING_MASK_OBSERVER__.disconnect();
+                } catch (_) {}
+              }
+
+              const clearMask = () => {
+                const current = document.getElementById(id);
+                if (!current) {
+                  return;
+                }
+                current.style.transition = 'opacity 0.18s ease';
+                current.style.opacity = '0';
+                setTimeout(() => current.remove?.(), 220);
+                if (window.__FOCUS_LOADING_MASK_OBSERVER__) {
+                  try {
+                    window.__FOCUS_LOADING_MASK_OBSERVER__.disconnect();
+                  } catch (_) {}
+                  window.__FOCUS_LOADING_MASK_OBSERVER__ = null;
+                }
+              };
+              window.__FOCUS_CLEAR_VIDEO_LOADING_MASK__ = clearMask;
+
+              const hasVisiblePlayerLoadingOverlay = () => {
+                return Array.from(document.querySelectorAll([
+                  '#bilibili-player [class*="loading"]',
+                  '#playerWrap [class*="loading"]',
+                  '.bpx-player-container [class*="loading"]',
+                  '#bilibili-player [class*="skeleton"]',
+                  '#playerWrap [class*="skeleton"]',
+                  '.bpx-player-container [class*="skeleton"]'
+                ].join(','))).some((node) => {
+                  if (!(node instanceof HTMLElement)) {
+                    return false;
+                  }
+
+                  const rect = node.getBoundingClientRect();
+                  const style = window.getComputedStyle(node);
+                  return rect.width > 40
+                    && rect.height > 40
+                    && style.display !== 'none'
+                    && style.visibility !== 'hidden'
+                    && style.opacity !== '0';
+                });
+              };
+
+              const shouldClearMask = () => {
+                const liveRoot = document.getElementById('focus-native-video-augment');
+                const playerLoadingVisible = hasVisiblePlayerLoadingOverlay();
+                if (liveRoot instanceof HTMLElement) {
+                  const renderKey = liveRoot.getAttribute('data-focus-render-key');
+                  const version = liveRoot.getAttribute('data-focus-version');
+                  const hasRenderableAugment = !!renderKey && !!version && liveRoot.children.length > 0 && !liveRoot.hasAttribute('data-focus-placeholder');
+                  const hasLivePlaceholder = liveRoot.hasAttribute('data-focus-placeholder') && liveRoot.children.length > 0;
+                  if ((hasRenderableAugment || hasLivePlaceholder) && !playerLoadingVisible) {
+                    return true;
+                  }
+                }
+
+                return (
+                  document.documentElement.classList.contains('focus-native-video-ready')
+                  || document.body?.classList?.contains?.('focus-native-video-ready')
+                ) && !playerLoadingVisible;
+              };
+
+              if (shouldClearMask()) {
+                clearMask();
+                return false;
+              }
+
+              const observer = new MutationObserver(() => {
+                if (shouldClearMask()) {
+                  clearMask();
+                }
+              });
+              observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
+              window.__FOCUS_LOADING_MASK_OBSERVER__ = observer;
+
+              setTimeout(clearMask, 3200);
+              return true;
+            })();
+            """,
+            completionHandler: { [weak self] value, error in
+                guard let self else {
+                    return
+                }
+
+                if let error {
+                    self.debugLog(
+                        "nativeLoadingMask.error",
+                        fields: self.debugStateFields([
+                            "pageURL": canonicalURL.absoluteString,
+                            "error": String(describing: error)
+                        ])
+                    )
+                    return
+                }
+
+                let result = value as? Bool
+                self.debugLog(
+                    "nativeLoadingMask.installAttempt",
+                    fields: self.debugStateFields([
+                        "pageURL": canonicalURL.absoluteString,
+                        "installed": result == true ? "true" : "false",
+                        "resultType": value.map { String(describing: type(of: $0)) } ?? "nil"
+                    ])
+                )
+            }
+        )
+    }
+
+    private func scheduleNativeVideoPlaceholderInstall(for canonicalURL: URL, revision: Int) {
+        nativeVideoPlaceholderTask?.cancel()
+        debugLog(
+            "nativePlaceholder.scheduled",
+            fields: debugStateFields([
+                "pageURL": canonicalURL.absoluteString,
+                "delayMS": "650",
+                "revision": String(revision)
+            ])
+        )
+        nativeVideoPlaceholderTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 650_000_000)
+            guard
+                let self,
+                !Task.isCancelled,
+                self.pageAugmentationRevision == revision
+            else {
+                return
+            }
+
+            self.installNativeVideoPlaceholderIfNeeded(for: canonicalURL)
+            self.nativeVideoPlaceholderTask = nil
+        }
+    }
+
+    private func installNativeVideoPlaceholderIfNeeded(for canonicalURL: URL) {
+        guard let webView else {
+            return
+        }
+
+        webView.evaluateJavaScript(
+            """
+            (() => {
+              const activeURL = location.href ? new URL(location.href, document.baseURI).href : '';
+              const targetURL = '\(canonicalURL.absoluteString.replacingOccurrences(of: "'", with: "\\'"))';
+              if (activeURL && activeURL !== targetURL && !activeURL.startsWith(targetURL)) {
+                return { installed: false, reason: 'url-mismatch' };
+              }
+
+              const rootId = 'focus-native-video-augment';
+              const styleId = 'focus-native-video-augment-style';
+              \(focusNativeVideoAugmentMountHelpersJavaScript)
+              const hasVisibleLoadingMask = () => {
+                const mask = document.getElementById('focus-native-video-loading-mask');
+                if (!(mask instanceof HTMLElement)) {
+                  return false;
+                }
+                const opacity = Number.parseFloat(mask.style.opacity || '1');
+                return mask.isConnected && opacity > 0.01;
+              };
+              const hasVisiblePlayerLoadingOverlay = () => {
+                return Array.from(document.querySelectorAll([
+                  '#bilibili-player [class*="loading"]',
+                  '#playerWrap [class*="loading"]',
+                  '.bpx-player-container [class*="loading"]',
+                  '#bilibili-player [class*="skeleton"]',
+                  '#playerWrap [class*="skeleton"]',
+                  '.bpx-player-container [class*="skeleton"]'
+                ].join(','))).some((node) => {
+                  if (!(node instanceof HTMLElement)) {
+                    return false;
+                  }
+                  const rect = node.getBoundingClientRect?.();
+                  if (!rect) {
+                    return false;
+                  }
+                  const style = window.getComputedStyle(node);
+                  return rect.width > 40
+                    && rect.height > 40
+                    && style.display !== 'none'
+                    && style.visibility !== 'hidden'
+                    && style.opacity !== '0';
+                });
+              };
+              const hasVisiblePlayer = () => {
+                const playerShell = document.querySelector('#playerWrap, .player-wrap, #bilibili-player, .bpx-player-container, .player-container, .bpx-player-video-wrap');
+                if (!playerShell) {
+                  return false;
+                }
+
+                const video = Array.from(document.querySelectorAll('video')).find((node) => {
+                  if (!(node instanceof HTMLVideoElement)) {
+                    return false;
+                  }
+                  const rect = node.getBoundingClientRect?.();
+                  if (!rect) {
+                    return false;
+                  }
+                  const style = window.getComputedStyle(node);
+                  return rect.width > 120
+                    && rect.height > 68
+                    && style.display !== 'none'
+                    && style.visibility !== 'hidden'
+                    && style.opacity !== '0';
+                });
+
+                return !!video;
+              };
+              const hasSettledAugment = () => {
+                const existingRoot = document.getElementById(rootId);
+                if (!(existingRoot instanceof HTMLElement)) {
+                  return false;
+                }
+
+                const renderKey = existingRoot.getAttribute('data-focus-render-key');
+                const version = existingRoot.getAttribute('data-focus-version');
+                return !!renderKey && !!version && existingRoot.children.length > 0 && !existingRoot.hasAttribute('data-focus-placeholder');
+              };
+
+              if (hasSettledAugment()) {
+                return { installed: false, reason: 'augment-ready' };
+              }
+
+              if (!hasVisiblePlayer()) {
+                return { installed: false, reason: 'player-not-visible' };
+              }
+
+              const ensureStyle = () => {
+                let style = document.getElementById(styleId);
+                if (!style) {
+                  style = document.createElement('style');
+                  style.id = styleId;
+                  document.head.appendChild(style);
+                }
+                if (style.getAttribute('data-focus-placeholder') === 'true') {
+                  return style;
+                }
+                style.setAttribute('data-focus-placeholder', 'true');
+                style.textContent = `
+                  #${rootId} {
+                    display: block !important;
+                    width: 100% !important;
+                    box-sizing: border-box !important;
+                    padding: 8px 16px 24px !important;
+                    position: relative !important;
+                    z-index: 21 !important;
+                    order: 2 !important;
+                    flex: 0 0 auto !important;
+                  }
+                  #${rootId} .focus-native-section {
+                    margin-top: 8px !important;
+                    padding: 16px !important;
+                    border-radius: 20px !important;
+                    background: rgba(248, 250, 252, 0.96) !important;
+                    border: 1px solid rgba(15, 23, 42, 0.06) !important;
+                    box-shadow: 0 14px 32px rgba(15, 23, 42, 0.05) !important;
+                    box-sizing: border-box !important;
+                  }
+                  html[data-focus-theme='dark'] #${rootId} .focus-native-section {
+                    background: rgba(17, 24, 39, 0.96) !important;
+                    border-color: rgba(255, 255, 255, 0.08) !important;
+                    box-shadow: 0 12px 24px rgba(0, 0, 0, 0.22) !important;
+                  }
+                  #${rootId} .focus-native-skeleton-row,
+                  #${rootId} .focus-native-skeleton-pill,
+                  #${rootId} .focus-native-skeleton-card {
+                    background: linear-gradient(90deg, rgba(148,163,184,0.18) 0%, rgba(148,163,184,0.28) 50%, rgba(148,163,184,0.18) 100%) !important;
+                    background-size: 240px 100% !important;
+                    animation: focus-native-skeleton-shimmer 1.2s linear infinite !important;
+                  }
+                  #${rootId} .focus-native-skeleton-header {
+                    display: flex !important;
+                    align-items: center !important;
+                    gap: 12px !important;
+                  }
+                  #${rootId} .focus-native-skeleton-avatar {
+                    width: 42px !important;
+                    height: 42px !important;
+                    border-radius: 999px !important;
+                    flex: 0 0 42px !important;
+                  }
+                  #${rootId} .focus-native-skeleton-copy {
+                    flex: 1 1 auto !important;
+                    min-width: 0 !important;
+                  }
+                  #${rootId} .focus-native-skeleton-row {
+                    border-radius: 999px !important;
+                    height: 12px !important;
+                    width: 100% !important;
+                    margin-top: 8px !important;
+                  }
+                  #${rootId} .focus-native-skeleton-row:first-child {
+                    margin-top: 0 !important;
+                    width: 54% !important;
+                    height: 14px !important;
+                  }
+                  #${rootId} .focus-native-skeleton-pills {
+                    display: flex !important;
+                    gap: 10px !important;
+                    overflow: hidden !important;
+                  }
+                  #${rootId} .focus-native-skeleton-pill {
+                    border-radius: 16px !important;
+                    width: 168px !important;
+                    height: 82px !important;
+                    flex: 0 0 168px !important;
+                  }
+                  #${rootId} .focus-native-skeleton-comments {
+                    display: grid !important;
+                    gap: 12px !important;
+                  }
+                  #${rootId} .focus-native-skeleton-card {
+                    border-radius: 16px !important;
+                    height: 84px !important;
+                    width: 100% !important;
+                  }
+                  @keyframes focus-native-skeleton-shimmer {
+                    0% { background-position: -240px 0; }
+                    100% { background-position: 240px 0; }
+                  }
+                `;
+                return style;
+              };
+
+              ensureStyle();
+              const root = document.getElementById(rootId) || document.createElement('section');
+              root.id = rootId;
+              root.setAttribute('data-focus-placeholder', 'true');
+              root.style.setProperty('display', 'block', 'important');
+              root.style.setProperty('width', '100%', 'important');
+              root.style.setProperty('visibility', 'visible', 'important');
+              root.style.setProperty('opacity', '1', 'important');
+              root.style.setProperty('position', 'relative', 'important');
+              root.style.setProperty('z-index', '21', 'important');
+              root.style.setProperty('order', '2', 'important');
+              root.style.setProperty('flex', '0 0 auto', 'important');
+              if (hasVisibleLoadingMask()) {
+                return { installed: false, reason: 'loading-mask-visible' };
+              }
+              root.style.setProperty('opacity', '1', 'important');
+              root.style.removeProperty('pointer-events');
+
+              if (!root.querySelector('.focus-native-skeleton-header')) {
+                root.innerHTML = `
+                  <section class="focus-native-section">
+                    <div class="focus-native-skeleton-header">
+                      <div class="focus-native-skeleton-avatar focus-native-skeleton-row"></div>
+                      <div class="focus-native-skeleton-copy">
+                        <div class="focus-native-skeleton-row"></div>
+                        <div class="focus-native-skeleton-row" style="width: 34% !important;"></div>
+                      </div>
+                    </div>
+                  </section>
+                  <section class="focus-native-section">
+                    <div class="focus-native-skeleton-pills">
+                      <div class="focus-native-skeleton-pill"></div>
+                      <div class="focus-native-skeleton-pill"></div>
+                      <div class="focus-native-skeleton-pill"></div>
+                    </div>
+                  </section>
+                  <section class="focus-native-section">
+                    <div class="focus-native-skeleton-comments">
+                      <div class="focus-native-skeleton-card"></div>
+                      <div class="focus-native-skeleton-card"></div>
+                    </div>
+                  </section>
+                `;
+              }
+
+              mountNativeVideoAugmentRoot(root);
+              return { installed: true, reason: 'installed' };
+            })();
+            """,
+            completionHandler: { [weak self] value, error in
+                guard let self else {
+                    return
+                }
+
+                if let error {
+                    self.debugLog(
+                        "nativePlaceholder.error",
+                        fields: self.debugStateFields([
+                            "pageURL": canonicalURL.absoluteString,
+                            "error": String(describing: error)
+                        ])
+                    )
+                    return
+                }
+
+                let payload = value as? [String: Any]
+                let result = payload?["installed"] as? Bool
+                let reason = payload?["reason"] as? String
+                self.debugLog(
+                    "nativePlaceholder.installAttempt",
+                    fields: self.debugStateFields([
+                        "pageURL": canonicalURL.absoluteString,
+                        "installed": result == true ? "true" : "false",
+                        "reason": reason,
+                        "resultType": value.map { String(describing: type(of: $0)) } ?? "nil"
+                    ])
+                )
+            }
+        )
+    }
+
+    private func dismissNativeVideoPlaceholder(for canonicalURL: URL) {
+        guard let webView else {
+            return
+        }
+
+        webView.evaluateJavaScript(
+            """
+            (() => {
+              const activeURL = location.href ? new URL(location.href, document.baseURI).href : '';
+              const targetURL = '\(canonicalURL.absoluteString.replacingOccurrences(of: "'", with: "\\'"))';
+              if (activeURL && activeURL !== targetURL && !activeURL.startsWith(targetURL)) {
+                return false;
+              }
+
+              const root = document.getElementById('focus-native-video-augment');
+              if (root instanceof HTMLElement && (root.hasAttribute('data-focus-placeholder') || root.children.length === 0)) {
+                root.remove();
+              }
+
+              document.documentElement.classList.remove('focus-native-video-ready');
+              document.body?.classList?.remove?.('focus-native-video-ready');
+
+              if (window.__FOCUS_CLEAR_VIDEO_LOADING_MASK__) {
+                try {
+                  window.__FOCUS_CLEAR_VIDEO_LOADING_MASK__(true);
+                } catch (_) {}
+              }
+
+              return true;
+            })();
+            """,
+            completionHandler: { [weak self] value, error in
+                guard let self else {
+                    return
+                }
+
+                if let error {
+                    self.debugLog(
+                        "nativePlaceholder.dismiss.error",
+                        fields: self.debugStateFields([
+                            "pageURL": canonicalURL.absoluteString,
+                            "error": String(describing: error)
+                        ])
+                    )
+                    return
+                }
+
+                let result = value as? Bool
+                self.debugLog(
+                    "nativePlaceholder.dismiss",
+                    fields: self.debugStateFields([
+                        "pageURL": canonicalURL.absoluteString,
+                        "dismissed": result == true ? "true" : "false",
+                        "resultType": value.map { String(describing: type(of: $0)) } ?? "nil"
+                    ])
+                )
+            }
+        )
+    }
+
+    private func syncNativeVideoMetadata(from payload: FocusNativePageAugmentPayload) {
+        guard case let .video(videoPayload) = payload else {
+            nativeVideoAuthorName = ""
+            nativeVideoAuthorAvatarURL = nil
+            nativeVideoAuthorSpaceURL = nil
+            nativeVideoAuthorMID = 0
+            nativeVideoAuthorFollowers = 0
+            nativeVideoAuthorIsFollowing = false
+            return
+        }
+
+        nativeVideoAuthorName = videoPayload.authorName
+        nativeVideoAuthorAvatarURL = URL(string: videoPayload.authorAvatarURL)
+        nativeVideoAuthorSpaceURL = URL(string: videoPayload.authorSpaceURL)
+        nativeVideoAuthorMID = videoPayload.authorMID
+        nativeVideoAuthorFollowers = videoPayload.authorFollowers
+        nativeVideoAuthorIsFollowing = videoPayload.authorIsFollowing
+    }
+
+    private func toggleNativeVideoAuthorFollow() {
+        guard !isUpdatingNativeVideoFollow else {
+            return
+        }
+        guard nativeVideoAuthorMID > 0, let service = nativePageAugmentService else {
+            return
+        }
+
+        let targetMID = nativeVideoAuthorMID
+        let shouldFollow = !nativeVideoAuthorIsFollowing
+        isUpdatingNativeVideoFollow = true
+
+        Task { [weak self] in
+            guard let self else {
+                return
+            }
+
+            do {
+                let result = try await service.updateFollowState(mid: targetMID, shouldFollow: shouldFollow)
+                await MainActor.run {
+                    self.isUpdatingNativeVideoFollow = false
+                    self.applyNativeVideoAuthorFollowState(
+                        mid: targetMID,
+                        isFollowing: result.isFollowing,
+                        followers: result.followers
+                    )
+                }
+            } catch {
+                await MainActor.run {
+                    self.isUpdatingNativeVideoFollow = false
+                    self.debugLog(
+                        "nativeVideoAuthorFollow.failed",
+                        fields: self.debugStateFields([
+                            "mid": String(targetMID),
+                            "requestedFollowing": self.debugBool(shouldFollow),
+                            "error": error.localizedDescription
+                        ])
+                    )
+                }
+            }
+        }
+    }
+
+    private func applyNativeVideoAuthorFollowState(mid: Int64, isFollowing: Bool, followers: Int64) {
+        nativeVideoAuthorMID = mid
+        nativeVideoAuthorIsFollowing = isFollowing
+        nativeVideoAuthorFollowers = followers
+
+        if let currentURL = currentURL ?? pendingURL,
+           let kind = nativePageKind(for: currentURL),
+           kind == .video
+        {
+            let cacheKey = kind.cacheKey(for: FocusNavigationPolicy.canonicalWebURL(for: currentURL))
+            if case let .video(existingPayload)? = pageAugmentCache[cacheKey] {
+                pageAugmentCache[cacheKey] = .video(
+                    FocusNativeVideoAugmentPayload(
+                        title: existingPayload.title,
+                        authorName: existingPayload.authorName,
+                        authorAvatarURL: existingPayload.authorAvatarURL,
+                        authorSpaceURL: existingPayload.authorSpaceURL,
+                        authorMID: existingPayload.authorMID,
+                        authorFollowers: followers,
+                        authorFollowersText: Self.formatSocialCount(followers),
+                        authorIsFollowing: isFollowing,
+                        groups: existingPayload.groups,
+                        comments: existingPayload.comments
+                    )
+                )
+            }
+        }
+
+        guard let webView else {
+            return
+        }
+
+        let followText = isFollowing ? "已关注" : "关注"
+        let followersText = "\(Self.formatSocialCount(followers)) 粉丝"
+        let escapedFollowText = followText.replacingOccurrences(of: "'", with: "\\'")
+        let escapedFollowersText = followersText.replacingOccurrences(of: "'", with: "\\'")
+        webView.evaluateJavaScript(
+            """
+            (() => {
+              const root = document.getElementById('focus-native-video-augment');
+              if (!root) {
+                return;
+              }
+              const followNode = root.querySelector('.focus-native-owner-follow');
+              const followersNode = root.querySelector('.focus-native-owner-followers');
+              if (followNode) {
+                followNode.textContent = '\(escapedFollowText)';
+                followNode.setAttribute('data-following', '\(isFollowing ? "true" : "false")');
+              }
+              if (followersNode) {
+                followersNode.textContent = '\(escapedFollowersText)';
+              }
+            })();
+            """,
+            completionHandler: nil
+        )
+    }
+
+    private static func formatSocialCount(_ value: Int64) -> String {
+        switch value {
+        case 100_000_000...:
+            return String(format: "%.1f亿", Double(value) / 100_000_000).replacingOccurrences(of: ".0", with: "")
+        case 10_000...:
+            return String(format: "%.1f万", Double(value) / 10_000).replacingOccurrences(of: ".0", with: "")
+        default:
+            return "\(value)"
         }
     }
 
@@ -1978,9 +3901,12 @@ final class FocusBrowserViewModel: ObservableObject {
         for canonicalURL: URL,
         revision: Int
     ) {
-        let delays: [UInt64] = [0, 220_000_000, 900_000_000, 2_200_000_000]
-        for delay in delays {
-            Task { @MainActor [weak self] in
+        let delays: [UInt64] = [0, 150_000_000, 500_000_000, 1_200_000_000, 3_000_000_000, 6_000_000_000]
+        let expectedRenderKey = payload.renderKey
+
+        pageAugmentationApplyTask?.cancel()
+        pageAugmentationApplyTask = Task { @MainActor [weak self] in
+            for (index, delay) in delays.enumerated() {
                 guard let self else {
                     return
                 }
@@ -1990,8 +3916,11 @@ final class FocusBrowserViewModel: ObservableObject {
                 }
 
                 guard
+                    !Task.isCancelled,
                     self.pageAugmentationRevision == revision,
-                    let webView = self.webView
+                    let webView = self.webView,
+                    let callbackContext = self.makeBrowserCallbackContext(for: webView),
+                    callbackContext.canonicalURL == canonicalURL
                 else {
                     return
                 }
@@ -2002,26 +3931,211 @@ final class FocusBrowserViewModel: ObservableObject {
                     return
                 }
 
-                let script = payload.javaScript
-                webView.evaluateJavaScript(script) { [weak self] _, error in
-                    guard let self else {
+                if let expectedRenderKey, index > 0 {
+                    let existingRenderKey = await withCheckedContinuation { continuation in
+                        webView.evaluateJavaScript(
+                            "document.getElementById('focus-native-video-augment')?.getAttribute('data-focus-render-key')"
+                        ) { value, _ in
+                            continuation.resume(returning: value as? String)
+                        }
+                    }
+
+                    guard
+                        !Task.isCancelled,
+                        self.pageAugmentationRevision == revision,
+                        self.isCurrent(callbackContext, webView: webView)
+                    else {
                         return
                     }
 
-                    if let error {
-                        print("[Focus Native Augment] script-error kind=\(payload.kind.rawValue) url=\(canonicalURL.absoluteString) error=\(error)")
+                    if existingRenderKey == expectedRenderKey {
                         self.debugLog(
-                            "nativePageAugmentation.error",
+                            "nativePageAugmentation.skipStableReplay",
                             fields: self.debugStateFields([
                                 "pageURL": canonicalURL.absoluteString,
                                 "pageKind": payload.kind.rawValue,
-                                "error": String(describing: error)
+                                "attempt": String(index),
+                                "delayMS": String(delay / 1_000_000)
                             ])
                         )
                         return
                     }
+                }
 
-                    print("[Focus Native Augment] applied kind=\(payload.kind.rawValue) delayMS=\(delay / 1_000_000) url=\(canonicalURL.absoluteString)")
+                let preflightScript = """
+                (() => {
+                  const hasVisiblePlayerLoadingOverlay = () => {
+                    return Array.from(document.querySelectorAll([
+                      '#bilibili-player [class*="loading"]',
+                      '#playerWrap [class*="loading"]',
+                      '.bpx-player-container [class*="loading"]',
+                      '#bilibili-player [class*="skeleton"]',
+                      '#playerWrap [class*="skeleton"]',
+                      '.bpx-player-container [class*="skeleton"]'
+                    ].join(','))).some((node) => {
+                      if (!(node instanceof HTMLElement)) {
+                        return false;
+                      }
+                      const rect = node.getBoundingClientRect?.();
+                      if (!rect) {
+                        return false;
+                      }
+                      const style = window.getComputedStyle(node);
+                      return rect.width > 40
+                        && rect.height > 40
+                        && style.display !== 'none'
+                        && style.visibility !== 'hidden'
+                        && style.opacity !== '0';
+                    });
+                  };
+                  const hasVisiblePlayer = () => {
+                    const playerShell = document.querySelector('#playerWrap, .player-wrap, #bilibili-player, .bpx-player-container, .player-container, .bpx-player-video-wrap');
+                    if (!(playerShell instanceof HTMLElement)) {
+                      return false;
+                    }
+
+                    const playerRect = playerShell.getBoundingClientRect?.();
+                    if (!playerRect || playerRect.width < 120 || playerRect.height < 68) {
+                      return false;
+                    }
+
+                    return Array.from(document.querySelectorAll('video')).some((node) => {
+                      if (!(node instanceof HTMLVideoElement)) {
+                        return false;
+                      }
+                      const rect = node.getBoundingClientRect?.();
+                      if (!rect) {
+                        return false;
+                      }
+                      const style = window.getComputedStyle(node);
+                      return rect.width > 120
+                        && rect.height > 68
+                        && style.display !== 'none'
+                        && style.visibility !== 'hidden'
+                        && style.opacity !== '0';
+                    });
+                  };
+                  const checkTargets = () => {
+                    let score = 0;
+                    const hasPlayer = !!document.querySelector('#playerWrap, .player-wrap, #bilibili-player');
+                    const hasContainer = !!document.querySelector('.left-container, main');
+                    const hasToolbar = !!document.querySelector('.video-toolbar-container, #arc_toolbar_report');
+                    const hasCommentAnchor = !!document.querySelector('#commentapp, .comment-container, .bb-comment');
+                    const hasEpisodeAnchor = !!document.querySelector('.video-pod, .multi-page, [class*="episode-list"], [class*="part-list"], [class*="page-list"]');
+                    const hasViewbox = !!document.querySelector('#viewbox_report');
+                    const playerLoadingVisible = hasVisiblePlayerLoadingOverlay();
+                    const visiblePlayer = hasVisiblePlayer();
+
+                    if (hasPlayer) score += 25;
+                    if (hasContainer) score += 20;
+                    if (hasToolbar) score += 20;
+                    if (hasCommentAnchor) score += 15;
+                    if (hasEpisodeAnchor) score += 15;
+                    if (hasViewbox) score += 5;
+
+                    return {
+                      score: score,
+                      ready: hasPlayer && hasContainer && visiblePlayer,
+                      details: {
+                        hasPlayer: hasPlayer,
+                        hasContainer: hasContainer,
+                        hasToolbar: hasToolbar,
+                        hasCommentAnchor: hasCommentAnchor,
+                        hasEpisodeAnchor: hasEpisodeAnchor,
+                        hasViewbox: hasViewbox,
+                        playerLoadingVisible: playerLoadingVisible,
+                        visiblePlayer: visiblePlayer
+                      }
+                    };
+                  };
+
+                  return checkTargets();
+                })();
+                """
+
+                let (isReady, score, playerLoadingVisible, visiblePlayer) = await withCheckedContinuation { continuation in
+                    webView.evaluateJavaScript(preflightScript) { value, error in
+                        if let dict = value as? [String: Any],
+                           let ready = dict["ready"] as? Bool,
+                           let score = dict["score"] as? Int {
+                            let details = dict["details"] as? [String: Any]
+                            let playerLoadingVisible = details?["playerLoadingVisible"] as? Bool ?? false
+                            let visiblePlayer = details?["visiblePlayer"] as? Bool ?? false
+                            continuation.resume(returning: (ready, score, playerLoadingVisible, visiblePlayer))
+                        } else {
+                            continuation.resume(returning: (false, 0, false, false))
+                        }
+                    }
+                }
+
+                guard
+                    !Task.isCancelled,
+                    self.pageAugmentationRevision == revision,
+                    self.isCurrent(callbackContext, webView: webView)
+                else {
+                    return
+                }
+
+                self.debugLog(
+                    "nativePageAugmentation.preflight",
+                    fields: self.debugStateFields([
+                        "pageURL": canonicalURL.absoluteString,
+                        "pageKind": payload.kind.rawValue,
+                        "attempt": String(index),
+                        "delayMS": String(delay / 1_000_000),
+                        "ready": isReady ? "true" : "false",
+                        "score": String(score),
+                        "visiblePlayer": visiblePlayer ? "true" : "false",
+                        "playerLoadingVisible": playerLoadingVisible ? "true" : "false"
+                    ])
+                )
+
+                if !isReady {
+                    self.debugLog(
+                        index == delays.count - 1
+                            ? "nativePageAugmentation.preflightFinalFallback"
+                            : "nativePageAugmentation.skipPreflight",
+                        fields: self.debugStateFields([
+                            "pageURL": canonicalURL.absoluteString,
+                            "pageKind": payload.kind.rawValue,
+                            "attempt": String(index),
+                            "delayMS": String(delay / 1_000_000),
+                            "visiblePlayer": visiblePlayer ? "true" : "false",
+                            "playerLoadingVisible": playerLoadingVisible ? "true" : "false",
+                            "reason": visiblePlayer ? "dom-not-ready" : "player-not-visible"
+                        ])
+                    )
+                }
+
+                guard isReady || index == delays.count - 1 else {
+                    continue
+                }
+
+                let script = payload.javaScript
+                do {
+                    _ = try await webView.evaluateJavaScript(script)
+                } catch {
+                    self.debugLog(
+                        "nativePageAugmentation.error",
+                        fields: self.debugStateFields([
+                            "pageURL": canonicalURL.absoluteString,
+                            "pageKind": payload.kind.rawValue,
+                            "attempt": String(index),
+                            "error": String(describing: error)
+                        ])
+                    )
+                    continue
+                }
+
+                guard
+                    !Task.isCancelled,
+                    self.pageAugmentationRevision == revision,
+                    self.isCurrent(callbackContext, webView: webView)
+                else {
+                    return
+                }
+
+                    if self.settingsStore.settings.debugMode {
                     let probeScript = """
                     (() => {
                       const root = document.getElementById('focus-native-video-augment') || document.getElementById('focus-native-opus-comments');
@@ -2034,30 +4148,205 @@ final class FocusBrowserViewModel: ObservableObject {
                         top: Math.round(rect.top),
                         height: Math.round(rect.height),
                         childCount: root.children.length,
+                        mountCount: root.getAttribute ? (root.getAttribute('data-focus-mount-count') || '') : '',
+                        mountPhase: root.getAttribute ? (root.getAttribute('data-focus-mount-phase') || '') : '',
+                        isPlaceholder: root.hasAttribute ? root.hasAttribute('data-focus-placeholder') : false,
+                        renderKey: root.getAttribute ? (root.getAttribute('data-focus-render-key') || '') : '',
+                        version: root.getAttribute ? (root.getAttribute('data-focus-version') || '') : '',
+                        loadingMaskPresent: !!document.getElementById('focus-native-video-loading-mask'),
+                        readyClass: document.documentElement.classList.contains('focus-native-video-ready') || !!document.body?.classList?.contains?.('focus-native-video-ready'),
                         textSample: String(root.textContent || '').trim().slice(0, 120),
                         parentTag: root.parentElement?.tagName || '',
                         previousTag: root.previousElementSibling?.tagName || '',
-                        previousClass: root.previousElementSibling?.className || ''
+                        previousClass: root.previousElementSibling?.className || '',
+                        domProbe: (() => {
+                          const sample = (selector) => {
+                            const node = document.querySelector(selector);
+                            if (!(node instanceof HTMLElement)) {
+                              return '0';
+                            }
+                            const rect = node.getBoundingClientRect();
+                            const style = window.getComputedStyle(node);
+                            return [
+                              '1',
+                              Math.round(rect.height),
+                              style.display,
+                              style.visibility,
+                              style.opacity
+                            ].join(':');
+                          };
+                          return {
+                            rightContainer: sample('.right-container'),
+                            rightContainerInner: sample('.right-container-inner'),
+                            sideToolbar: sample('.side-toolbar, .right-entry, [class*="side-toolbar"], [class*="right-entry"]'),
+                            toolbar: sample('.video-toolbar-container, #arc_toolbar_report'),
+                            playerLoading: sample('#bilibili-player [class*="loading"], #playerWrap [class*="loading"], .bpx-player-container [class*="loading"], #bilibili-player [class*="skeleton"], #playerWrap [class*="skeleton"], .bpx-player-container [class*="skeleton"]'),
+                            viewbox: sample('#viewbox_report'),
+                            videoPod: sample('.video-pod, .video-pod__body'),
+                            commentApp: sample('#commentapp, bili-comments, .comment-container'),
+                            skeleton: sample('[class*="skeleton"]'),
+                            loading: sample('[class*="loading"]'),
+                            scrollY: Math.round(window.scrollY || document.documentElement.scrollTop || document.body.scrollTop || 0)
+                          };
+                        })()
                       };
                     })();
                     """
-                    webView.evaluateJavaScript(probeScript) { value, error in
-                        if let error {
-                            print("[Focus Native Augment] probe-error kind=\(payload.kind.rawValue) url=\(canonicalURL.absoluteString) error=\(error)")
-                            return
+                    let traceScript = """
+                    (() => {
+                      const root = document.getElementById('focus-native-video-augment');
+                      if (!(root instanceof HTMLElement)) {
+                        return { stage: 'missing-root' };
+                      }
+                      const trace = (label) => {
+                        const y = Math.round(window.scrollY || document.documentElement.scrollTop || document.body.scrollTop || 0);
+                        const rect = root.getBoundingClientRect();
+                        return {
+                          stage: label,
+                          scrollY: y,
+                          rootTop: Math.round(rect.top),
+                          rootHeight: Math.round(rect.height),
+                          mountCount: root.getAttribute('data-focus-mount-count') || '',
+                          mountPhase: root.getAttribute('data-focus-mount-phase') || '',
+                          readyClass: document.documentElement.classList.contains('focus-native-video-ready') || !!document.body?.classList?.contains?.('focus-native-video-ready'),
+                          toolbarHeight: (() => {
+                            const node = document.querySelector('.video-toolbar-container, #arc_toolbar_report');
+                            if (!(node instanceof HTMLElement)) {
+                              return 0;
+                            }
+                            return Math.round(node.getBoundingClientRect().height);
+                          })(),
+                          sideToolbarHeight: (() => {
+                            const node = document.querySelector('.side-toolbar, .right-entry, [class*="side-toolbar"], [class*="right-entry"]');
+                            if (!(node instanceof HTMLElement)) {
+                              return 0;
+                            }
+                            return Math.round(node.getBoundingClientRect().height);
+                          })()
+                        };
+                      };
+                      window.__FOCUS_TRACE_NATIVE_AUGMENT__ = trace;
+                      return trace('trace-installed');
+                    })();
+                    """
+                    Task { @MainActor in
+                        do {
+                            let value = try await webView.evaluateJavaScript(traceScript)
+                            guard
+                                self.pageAugmentationRevision == revision,
+                                self.isCurrent(callbackContext, webView: webView)
+                            else {
+                                return
+                            }
+                            self.debugLog(
+                                "nativePageAugmentation.traceInstalled",
+                                fields: self.debugStateFields([
+                                    "pageURL": canonicalURL.absoluteString,
+                                    "pageKind": payload.kind.rawValue,
+                                    "attempt": String(index),
+                                    "trace": String(describing: value)
+                                ])
+                            )
+                        } catch {
+                            guard self.isCurrent(callbackContext, webView: webView) else {
+                                return
+                            }
+                            self.debugLog(
+                                "nativePageAugmentation.traceInstallError",
+                                fields: self.debugStateFields([
+                                    "pageURL": canonicalURL.absoluteString,
+                                    "pageKind": payload.kind.rawValue,
+                                    "attempt": String(index),
+                                    "error": String(describing: error)
+                                ])
+                            )
                         }
-                        print("[Focus Native Augment] probe kind=\(payload.kind.rawValue) url=\(canonicalURL.absoluteString) value=\(String(describing: value))")
                     }
+                    Task { @MainActor in
+                        do {
+                            let value = try await webView.evaluateJavaScript(probeScript)
+                            guard
+                                self.pageAugmentationRevision == revision,
+                                self.isCurrent(callbackContext, webView: webView)
+                            else {
+                                return
+                            }
+                            self.debugLog(
+                                "nativePageAugmentation.probeCaptured",
+                                fields: self.debugStateFields([
+                                    "pageURL": canonicalURL.absoluteString,
+                                    "pageKind": payload.kind.rawValue,
+                                    "attempt": String(index),
+                                    "probeType": value.map { String(describing: type(of: $0)) } ?? "nil"
+                                ])
+                            )
+                        } catch {}
+                    }
+                    let traceSampleDelays: [UInt64] = [0, 120_000_000, 260_000_000]
+                    for (sampleIndex, sampleDelay) in traceSampleDelays.enumerated() {
+                        Task { @MainActor [weak self] in
+                            guard let self else {
+                                return
+                            }
+                            if sampleDelay > 0 {
+                                try? await Task.sleep(nanoseconds: sampleDelay)
+                            }
+                            guard
+                                self.pageAugmentationRevision == revision,
+                                let activeWebView = self.webView,
+                                (activeWebView.url ?? self.currentURL ?? self.pendingURL).map(FocusNavigationPolicy.canonicalWebURL(for:)) == canonicalURL
+                            else {
+                                return
+                            }
+
+                            do {
+                                let value = try await activeWebView.evaluateJavaScript(
+                                    "window.__FOCUS_TRACE_NATIVE_AUGMENT__ ? window.__FOCUS_TRACE_NATIVE_AUGMENT__('sample-\(sampleIndex)') : { stage: 'trace-missing' }"
+                                )
+                                guard
+                                    self.pageAugmentationRevision == revision,
+                                    self.isCurrent(callbackContext, webView: activeWebView)
+                                else {
+                                    return
+                                }
+                                self.debugLog(
+                                    "nativePageAugmentation.traceSample",
+                                    fields: self.debugStateFields([
+                                        "pageURL": canonicalURL.absoluteString,
+                                        "pageKind": payload.kind.rawValue,
+                                        "attempt": String(index),
+                                        "sampleIndex": String(sampleIndex),
+                                        "sampleDelayMS": String(sampleDelay / 1_000_000),
+                                        "trace": String(describing: value)
+                                    ])
+                                )
+                            } catch {
+                                self.debugLog(
+                                    "nativePageAugmentation.traceSampleError",
+                                    fields: self.debugStateFields([
+                                        "pageURL": canonicalURL.absoluteString,
+                                        "pageKind": payload.kind.rawValue,
+                                        "attempt": String(index),
+                                        "sampleIndex": String(sampleIndex),
+                                        "sampleDelayMS": String(sampleDelay / 1_000_000),
+                                        "error": String(describing: error)
+                                    ])
+                                )
+                            }
+                        }
+                    }
+                    }
+
                     self.debugLog(
                         "nativePageAugmentation.applied",
                         fields: self.debugStateFields([
                             "pageURL": canonicalURL.absoluteString,
                             "pageKind": payload.kind.rawValue,
+                            "attempt": String(index),
                             "delayMS": String(delay / 1_000_000),
                             "summary": payload.summary
                         ])
                     )
-                }
             }
         }
     }
@@ -2085,39 +4374,46 @@ final class FocusBrowserViewModel: ObservableObject {
         embeddedPlayerDetectionTask?.cancel()
         embeddedPlayerDetectionTask = nil
         playerStateObservationTask?.cancel()
-        playerStateObservationTask = Task { @MainActor [weak self] in
-            var attempt = 0
-            while let self, self.allowsPlayerControl, !Task.isCancelled {
-                self.refreshPlayerState()
-                attempt += 1
+        guard
+            allowsPlayerControl,
+            let webView,
+            let context = makeBrowserCallbackContext(for: webView)
+        else {
+            return
+        }
 
-                let delay: UInt64
-                if self.hasDetectedPlayer {
-                    delay = 450_000_000
-                } else if attempt < 12 {
-                    delay = 220_000_000
-                } else {
-                    delay = 550_000_000
+        playerStateObservationTask = Task { @MainActor [weak self, weak webView] in
+            let delays: [UInt64] = [0, 300_000_000, 700_000_000, 1_400_000_000, 2_500_000_000]
+            for delay in delays {
+                if delay > 0 {
+                    try? await Task.sleep(nanoseconds: delay)
+                }
+                guard
+                    let self,
+                    let webView,
+                    !Task.isCancelled,
+                    self.allowsPlayerControl,
+                    self.isCurrent(context, webView: webView)
+                else {
+                    return
                 }
 
-                try? await Task.sleep(nanoseconds: delay)
+                if await self.refreshPlayerState(on: webView, context: context) {
+                    return
+                }
             }
         }
     }
 
-    private func refreshPlayerState() {
-        guard allowsPlayerControl, let webView else {
+    @discardableResult
+    private func refreshPlayerState(
+        on webView: WKWebView,
+        context: BrowserCallbackContext
+    ) async -> Bool {
+        guard allowsPlayerControl, isCurrent(context, webView: webView) else {
             playerStateObservationTask?.cancel()
             playerStateObservationTask = nil
-            hasActiveVideoRoute = false
-            hasDetectedPlayer = false
-            isImmersiveVideo = false
-            isPlaying = false
-            playbackRate = 1.0
-            isDanmakuHidden = false
-            hasSubtitles = false
-            isSubtitleHidden = false
-            return
+            return false
         }
 
         let script = """
@@ -2242,46 +4538,101 @@ final class FocusBrowserViewModel: ObservableObject {
         })();
         """
 
-        webView.evaluateJavaScript(script) { [weak self] value, error in
-            guard
-                let self
-            else {
-                return
+        do {
+            let value = try await webView.evaluateJavaScript(script)
+            guard !Task.isCancelled, isCurrent(context, webView: webView) else {
+                return false
             }
-
-            if let error {
-                self.debugLog(
-                    "refreshPlayerState.error",
-                    fields: self.debugStateFields([
-                        "error": String(describing: error)
-                    ])
-                )
-            }
-
-            guard
-                let payload = value as? [String: Any],
-                let hasPlayer = payload["hasPlayer"] as? Bool
-            else {
-                self.debugLog(
+            guard let payload = value as? [String: Any] else {
+                debugLog(
                     "refreshPlayerState.missingPayload",
-                    fields: self.debugStateFields([
+                    fields: debugStateFields([
                         "valueType": value.map { String(describing: type(of: $0)) } ?? "nil"
                     ])
                 )
-                return
+                return false
             }
-
-            self.hasDetectedPlayer = hasPlayer || self.hasDetectedPlayer
-            self.hasActiveVideoRoute = hasPlayer || self.hasActiveVideoRoute
-            self.applyDetectedPageState(self.makeDetectedPageState(from: payload), fallbackURL: self.currentURL ?? self.pendingURL)
-            self.isPlaying = payload["isPlaying"] as? Bool ?? false
-            self.playbackRate = payload["playbackRate"] as? Double ?? 1.0
-            self.isDanmakuHidden = payload["isDanmakuHidden"] as? Bool ?? false
-            self.hasSubtitles = payload["hasSubtitles"] as? Bool ?? false
-            self.isSubtitleHidden = payload["isSubtitleHidden"] as? Bool ?? false
-            self.isImmersiveVideo = payload["isFullscreen"] as? Bool ?? self.isImmersiveVideo
-            self.logPlayerStatePayload(payload)
+            applyPlayerStatePayload(payload, context: context, webView: webView, source: "refreshPlayerState")
+            return payload["hasPlayer"] as? Bool ?? false
+        } catch {
+            guard isCurrent(context, webView: webView) else {
+                return false
+            }
+            debugLog(
+                "refreshPlayerState.error",
+                fields: debugStateFields(["error": String(describing: error)])
+            )
+            return false
         }
+    }
+
+    private func applyPlayerStatePayload(
+        _ payload: [String: Any],
+        context: BrowserCallbackContext,
+        webView: WKWebView,
+        source: String
+    ) {
+        guard isCurrent(context, webView: webView) else {
+            return
+        }
+
+        let snapshot = PlayerSnapshot(
+            hasPlayer: payload["hasPlayer"] as? Bool ?? false,
+            isPlaying: payload["isPlaying"] as? Bool ?? false,
+            playbackRate: max(Self.doubleValue(payload["playbackRate"]) ?? 1, 0.1),
+            isDanmakuHidden: payload["isDanmakuHidden"] as? Bool ?? false,
+            hasSubtitles: payload["hasSubtitles"] as? Bool ?? false,
+            isSubtitleHidden: payload["isSubtitleHidden"] as? Bool ?? false,
+            isFullscreen: payload["isFullscreen"] as? Bool ?? false
+        )
+
+        let detectedState = makeDetectedPageState(from: payload)
+        applyDetectedPageState(detectedState, fallbackURL: context.canonicalURL)
+        if snapshot.hasPlayer {
+            hasActiveVideoRoute = true
+            isLoadingPage = false
+            if nativePageKind(for: context.canonicalURL) == .video,
+               nativeVideoPlaceholderTask != nil
+            {
+                nativeVideoPlaceholderTask?.cancel()
+                nativeVideoPlaceholderTask = nil
+                installNativeVideoPlaceholderIfNeeded(for: context.canonicalURL)
+            }
+            if scheduledPageAugmentationKey == nil {
+                schedulePageAugmentationRefresh()
+            }
+        }
+
+        updatePlayerSnapshot(snapshot)
+        if pendingOrientationSyncAfterPlayerReady, snapshot.hasPlayer {
+            handleDeviceOrientationChange(UIDevice.current.orientation)
+        }
+        logDetectedPageState(detectedState, source: source)
+        logPlayerStatePayload(payload)
+    }
+
+    func updatePlayerSnapshot(_ snapshot: PlayerSnapshot) {
+        guard playerSnapshot != snapshot else {
+            return
+        }
+        playerSnapshot = snapshot
+    }
+
+    private static func doubleValue(_ value: Any?) -> Double? {
+        if let value = value as? Double {
+            return value
+        }
+        return (value as? NSNumber)?.doubleValue
+    }
+
+    private static func uint64Value(_ value: Any?) -> UInt64? {
+        if let value = value as? UInt64 {
+            return value
+        }
+        if let value = value as? Int, value >= 0 {
+            return UInt64(value)
+        }
+        return (value as? NSNumber)?.uint64Value
     }
 
     private func debugLog(_ event: String, fields: [String: String?] = [:]) {
@@ -2455,6 +4806,24 @@ final class FocusSearchResultsViewModel: ObservableObject {
     deinit {
         task?.cancel()
         loadMoreTask?.cancel()
+    }
+
+    func loadIfNeeded() {
+        guard currentQuery != nil, case .idle = state else {
+            return
+        }
+        reload()
+    }
+
+    func suspend() {
+        task?.cancel()
+        task = nil
+        loadMoreTask?.cancel()
+        loadMoreTask = nil
+        isLoadingMore = false
+        if case .loading = state {
+            state = .idle
+        }
     }
 
     func search(_ query: SearchQuery) {
@@ -2712,6 +5081,11 @@ final class FocusDynamicFeedViewModel: ObservableObject {
 
     @Published private(set) var state: State = .idle
     @Published private(set) var isLoadingMore = false
+    @Published private(set) var knownAuthors: [DynamicCard.Author] = []
+    @Published private(set) var selectedFilter: FocusDynamicFilterKind = .all
+
+    private(set) var scrollOffsetY: CGFloat = 0
+    private(set) var scrollRestorationRevision = 0
 
     private let service: DynamicFeedService
     private var task: Task<Void, Never>?
@@ -2727,15 +5101,31 @@ final class FocusDynamicFeedViewModel: ObservableObject {
         loadMoreTask?.cancel()
     }
 
+    func suspend() {
+        task?.cancel()
+        task = nil
+        loadMoreTask?.cancel()
+        loadMoreTask = nil
+        isLoadingMore = false
+        if case .loading = state {
+            state = .idle
+        }
+    }
+
     func loadIfNeeded() {
         guard case .idle = state else {
             return
         }
 
-        reload()
+        startReload()
     }
 
     func reload() {
+        resetScrollPosition()
+        startReload()
+    }
+
+    private func startReload() {
         task?.cancel()
         task = Task { [weak self] in
             await self?.performReload()
@@ -2743,6 +5133,7 @@ final class FocusDynamicFeedViewModel: ObservableObject {
     }
 
     func refresh() async {
+        resetScrollPosition()
         task?.cancel()
         task = nil
         await performReload()
@@ -2772,6 +5163,7 @@ final class FocusDynamicFeedViewModel: ObservableObject {
 
                 let mergedCards = mergeCards(currentCards, with: page.cards)
                 self.nextOffset = page.nextOffset
+                self.knownAuthors = mergeAuthors(from: mergedCards)
                 state = .loaded(mergedCards)
             } catch let error as DynamicFeedService.ServiceError {
                 guard !Task.isCancelled else {
@@ -2791,6 +5183,23 @@ final class FocusDynamicFeedViewModel: ObservableObject {
                 isLoadingMore = false
             }
         }
+    }
+
+    func selectFilter(_ filter: FocusDynamicFilterKind) {
+        guard selectedFilter != filter else {
+            return
+        }
+        selectedFilter = filter
+        resetScrollPosition()
+    }
+
+    func updateScrollOffset(_ offsetY: CGFloat) {
+        scrollOffsetY = max(offsetY, 0)
+    }
+
+    private func resetScrollPosition() {
+        scrollOffsetY = 0
+        scrollRestorationRevision &+= 1
     }
 
     private func shouldLoadMore(after currentCardID: String, in cards: [DynamicCard]) -> Bool {
@@ -2831,6 +5240,7 @@ final class FocusDynamicFeedViewModel: ObservableObject {
             }
 
             nextOffset = finalNextOffset
+            knownAuthors = mergeAuthors(from: mergedCards)
             state = .loaded(mergedCards)
         } catch let error as DynamicFeedService.ServiceError {
             guard !Task.isCancelled else {
@@ -2861,6 +5271,17 @@ final class FocusDynamicFeedViewModel: ObservableObject {
 
         return mergedCards
     }
+
+    private func mergeAuthors(from cards: [DynamicCard]) -> [DynamicCard.Author] {
+        var seen = Set<String>()
+        return cards.compactMap { card in
+            let key = card.author.mid > 0 ? "mid:\(card.author.mid)" : "name:\(card.author.name)"
+            guard seen.insert(key).inserted else {
+                return nil
+            }
+            return card.author
+        }
+    }
 }
 
 private enum FocusNativePageKind: String {
@@ -2872,7 +5293,7 @@ private enum FocusNativePageKind: String {
     }
 }
 
-private enum FocusNativePageAugmentPayload {
+private enum FocusNativePageAugmentPayload: Sendable {
     case video(FocusNativeVideoAugmentPayload)
     case opus(FocusNativeOpusAugmentPayload)
 
@@ -2903,24 +5324,45 @@ private enum FocusNativePageAugmentPayload {
             return payload.javaScript
         }
     }
+
+    var renderKey: String? {
+        switch self {
+        case let .video(payload):
+            return payload.renderKey
+        case .opus:
+            return nil
+        }
+    }
 }
 
-private struct FocusNativeVideoAugmentPayload: Encodable {
+private struct FocusNativeVideoAugmentPayload: Encodable, Sendable {
     let title: String
+    let authorName: String
+    let authorAvatarURL: String
+    let authorSpaceURL: String
+    let authorMID: Int64
+    let authorFollowers: Int64
+    let authorFollowersText: String
+    let authorIsFollowing: Bool
     let groups: [FocusNativeEpisodeGroupPayload]
     let comments: [FocusNativeCommentPayload]
+
+    var renderKey: String {
+        let episodeCount = groups.reduce(0) { $0 + $1.items.count }
+        return "\(title)::\(authorName)::\(episodeCount)::\(comments.count)"
+    }
 }
 
-private struct FocusNativeOpusAugmentPayload: Encodable {
+private struct FocusNativeOpusAugmentPayload: Encodable, Sendable {
     let comments: [FocusNativeCommentPayload]
 }
 
-private struct FocusNativeEpisodeGroupPayload: Encodable {
+private struct FocusNativeEpisodeGroupPayload: Encodable, Sendable {
     let title: String
     let items: [FocusNativeEpisodeItemPayload]
 }
 
-private struct FocusNativeEpisodeItemPayload: Encodable {
+private struct FocusNativeEpisodeItemPayload: Encodable, Sendable {
     let title: String
     let subtitle: String
     let badge: String
@@ -2928,13 +5370,15 @@ private struct FocusNativeEpisodeItemPayload: Encodable {
     let isCurrent: Bool
 }
 
-struct FocusNativeCommentPayload: Encodable {
+struct FocusNativeCommentPayload: Encodable, Sendable {
     let author: String
     let avatarURL: String
     let content: String
+    let contentRuns: [FocusRichTextRun]
     let likeText: String
     let replyText: String
     let timeText: String
+    let previewReplies: [FocusNativeCommentPayload]
 }
 
 fileprivate actor FocusNativePageAugmentService {
@@ -2989,6 +5433,20 @@ fileprivate actor FocusNativePageAugmentService {
         }
 
         let title = data.stringValue(at: "title") ?? "视频"
+        let owner = data.dictionaryValue(at: "owner") ?? [:]
+        let authorName = owner.stringValue(at: "name") ?? owner.stringValue(at: "uname") ?? "UP主"
+        let authorMID = owner.int64Value(at: "mid") ?? 0
+        let rawAuthorAvatar = owner.stringValue(at: "face") ?? ""
+        let normalizedAuthorAvatar: String
+        if rawAuthorAvatar.hasPrefix("//") {
+            normalizedAuthorAvatar = "https:\(rawAuthorAvatar)"
+        } else if rawAuthorAvatar.lowercased().hasPrefix("http://") {
+            normalizedAuthorAvatar = "https://" + rawAuthorAvatar.dropFirst("http://".count)
+        } else {
+            normalizedAuthorAvatar = rawAuthorAvatar
+        }
+        let authorAvatarURL = URL(string: normalizedAuthorAvatar)?.absoluteString ?? ""
+        let authorSpaceURL = authorMID > 0 ? "https://space.bilibili.com/\(authorMID)" : ""
         let currentPageNumber = Self.extractPageNumber(from: url)
         var groups: [FocusNativeEpisodeGroupPayload] = []
 
@@ -3005,18 +5463,39 @@ fileprivate actor FocusNativePageAugmentService {
         groups.append(contentsOf: parseEpisodeGroups(from: data, currentBvid: bvid))
 
         let aid = data.int64Value(at: "aid") ?? 0
-        let comments = aid > 0
-            ? (try? await fetchComments(oid: String(aid), type: 1, referer: referer)) ?? []
+        async let commentsTask: [FocusNativeCommentPayload] = aid > 0
+            ? ((try? await fetchComments(oid: String(aid), type: 1, referer: referer)) ?? [])
             : []
+        async let relationTask: (following: Int64, followers: Int64) = authorMID > 0
+            ? ((try? await fetchRelation(mid: authorMID)) ?? (following: 0, followers: 0))
+            : (following: 0, followers: 0)
+        async let followStateTask: Bool = authorMID > 0
+            ? ((try? await fetchFollowState(mid: authorMID, referer: authorSpaceURL.isEmpty ? referer : authorSpaceURL)) ?? false)
+            : false
+
+        let comments = await commentsTask
+        let relation = await relationTask
+        let isFollowing = await followStateTask
 
         let meaningfulGroups = groups.filter { $0.items.count > 1 }
+        let hasMeaningfulMeta = !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !authorName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !authorAvatarURL.isEmpty
+            || !authorSpaceURL.isEmpty
 
-        if meaningfulGroups.isEmpty, comments.isEmpty {
+        if meaningfulGroups.isEmpty, comments.isEmpty, !hasMeaningfulMeta {
             return nil
         }
 
         return FocusNativeVideoAugmentPayload(
             title: title,
+            authorName: authorName,
+            authorAvatarURL: authorAvatarURL,
+            authorSpaceURL: authorSpaceURL,
+            authorMID: authorMID,
+            authorFollowers: relation.followers,
+            authorFollowersText: Self.formatCount(relation.followers),
+            authorIsFollowing: isFollowing,
             groups: meaningfulGroups,
             comments: comments
         )
@@ -3092,7 +5571,7 @@ fileprivate actor FocusNativePageAugmentService {
                 title: title,
                 subtitle: "P\(pageNumber)",
                 badge: duration,
-                targetURL: "https://www.bilibili.com/video/\(bvid)?p=\(pageNumber)",
+                targetURL: "https://www.bilibili.com/video/\(bvid)/?p=\(pageNumber)",
                 isCurrent: currentPageNumber == pageNumber
             )
         }
@@ -3125,7 +5604,7 @@ fileprivate actor FocusNativePageAugmentService {
                     title: rawTitle?.nilIfBlank ?? "视频",
                     subtitle: bvid,
                     badge: badge,
-                    targetURL: "https://www.bilibili.com/video/\(bvid)",
+                    targetURL: "https://www.bilibili.com/video/\(bvid)/",
                     isCurrent: bvid.caseInsensitiveCompare(currentBvid) == .orderedSame
                 )
             }
@@ -3135,6 +5614,97 @@ fileprivate actor FocusNativePageAugmentService {
             }
 
             return FocusNativeEpisodeGroupPayload(title: groupTitle, items: episodes)
+        }
+    }
+
+    private func fetchFollowState(mid: Int64, referer: String) async throws -> Bool {
+        let query = try await signedWbiQuery(
+            parameters: [
+                "mid": String(mid)
+            ],
+            referer: referer
+        )
+        let root = try await requestObject(
+            urlString: "https://api.bilibili.com/x/space/wbi/acc/relation?\(query)",
+            referer: referer
+        )
+        let code = root.intValue(at: "code") ?? 0
+        guard code == 0 else {
+            throw URLError(.badServerResponse)
+        }
+
+        let data = root.dictionaryValue(at: "data") ?? root
+        let relation = data.dictionaryValue(at: "be_relation")
+            ?? data.dictionaryValue(at: "relation")
+            ?? data
+
+        if let explicitFollow = relation.boolValue(at: "is_follow") ?? data.boolValue(at: "is_follow") {
+            return explicitFollow
+        }
+
+        let attribute = relation.intValue(at: "attribute")
+            ?? data.intValue(at: "attribute")
+            ?? 0
+        return (attribute & 2) != 0
+    }
+
+    private func fetchRelation(mid: Int64) async throws -> (following: Int64, followers: Int64) {
+        let root = try await requestObject(
+            urlString: "https://api.bilibili.com/x/relation/stat?vmid=\(mid)",
+            referer: "https://space.bilibili.com/\(mid)"
+        )
+        let data = root.dictionaryValue(at: "data") ?? root
+        return (
+            following: data.int64Value(at: "following") ?? 0,
+            followers: data.int64Value(at: "follower") ?? 0
+        )
+    }
+
+    func updateFollowState(mid: Int64, shouldFollow: Bool) async throws -> (isFollowing: Bool, followers: Int64) {
+        try await modifyRelation(mid: mid, shouldFollow: shouldFollow)
+        async let followStateTask = fetchFollowState(mid: mid, referer: "https://space.bilibili.com/\(mid)")
+        async let relationTask = fetchRelation(mid: mid)
+        let isFollowing = try await followStateTask
+        let relation = try await relationTask
+        return (isFollowing: isFollowing, followers: relation.followers)
+    }
+
+    private func modifyRelation(mid: Int64, shouldFollow: Bool) async throws {
+        let cookies = await cookieProvider.loadCookies()
+        guard let csrf = cookies.first(where: { $0.name == "bili_jct" })?.value.nilIfBlank else {
+            throw URLError(.userAuthenticationRequired)
+        }
+
+        guard let url = URL(string: "https://api.bilibili.com/x/relation/modify") else {
+            throw URLError(.badURL)
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 18
+        request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
+        request.setValue("https://space.bilibili.com/\(mid)", forHTTPHeaderField: "Referer")
+        request.setValue("https://www.bilibili.com", forHTTPHeaderField: "Origin")
+        request.setValue("application/x-www-form-urlencoded; charset=UTF-8", forHTTPHeaderField: "Content-Type")
+        if !cookies.isEmpty {
+            request.setValue(cookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; "), forHTTPHeaderField: "Cookie")
+        }
+
+        let bodyItems = [
+            URLQueryItem(name: "fid", value: String(mid)),
+            URLQueryItem(name: "act", value: shouldFollow ? "1" : "2"),
+            URLQueryItem(name: "re_src", value: "11"),
+            URLQueryItem(name: "csrf", value: csrf),
+            URLQueryItem(name: "csrf_token", value: csrf)
+        ]
+        var components = URLComponents()
+        components.queryItems = bodyItems
+        request.httpBody = components.percentEncodedQuery?.data(using: .utf8)
+
+        let response = try await requestObject(for: request)
+        guard response.intValue(at: "code") == 0 else {
+            throw URLError(.badServerResponse)
         }
     }
 
@@ -3176,10 +5746,100 @@ fileprivate actor FocusNativePageAugmentService {
             author: member.stringValue(at: "uname")?.nilIfBlank ?? "用户",
             avatarURL: member.stringValue(at: "avatar") ?? "",
             content: message,
+            contentRuns: Self.parseCommentRuns(content: content, message: message),
             likeText: likeCount > 0 ? "\(Self.formatCount(likeCount))赞" : "",
             replyText: replyCount > 0 ? "\(Self.formatCount(replyCount))回复" : "",
-            timeText: Self.formatCommentTime(publishTime)
+            timeText: Self.formatCommentTime(publishTime),
+            previewReplies: (object.arrayValue(at: "replies") ?? []).compactMap(parseComment(from:))
         )
+    }
+
+    private static func parseCommentRuns(content: JSONObject, message: String) -> [FocusRichTextRun] {
+        if let nodes = content.arrayValue(at: "rich_text_nodes") {
+            let parsed = nodes.compactMap { node -> FocusRichTextRun? in
+                let text = node.stringValue(at: "text") ?? node.stringValue(at: "orig_text") ?? ""
+                let rawEmoji = node.stringValue(at: "emoji", "icon_url")
+                    ?? node.stringValue(at: "emoji", "url")
+                    ?? node.stringValue(at: "rich", "emoji", "icon_url")
+                    ?? node.stringValue(at: "icon_url")
+                if let rawEmoji,
+                   let normalized = Self.normalizedCommentURLString(rawEmoji),
+                   let url = URL(string: normalized)
+                {
+                    let path = url.path.lowercased()
+                    let size = node.intValue(at: "emoji", "meta", "size")
+                        ?? node.intValue(at: "rich", "emoji", "meta", "size")
+                        ?? 0
+                    return .emote(
+                        alt: text.isEmpty ? "[表情]" : text,
+                        url: url,
+                        width: node.intValue(at: "emoji", "width") ?? node.intValue(at: "rich", "emoji", "width") ?? size,
+                        height: node.intValue(at: "emoji", "height") ?? node.intValue(at: "rich", "emoji", "height") ?? size,
+                        animated: path.hasSuffix(".gif") || path.hasSuffix(".webp") || path.hasSuffix(".apng")
+                    )
+                }
+                guard !text.isEmpty else { return nil }
+                return .text(
+                    value: text,
+                    linkURL: Self.normalizedCommentURLString(node.stringValue(at: "jump_url") ?? node.stringValue(at: "link")).flatMap(URL.init(string:))
+                )
+            }
+            if !parsed.isEmpty { return parsed }
+        }
+
+        var replacements: [String: FocusRichTextRun] = [:]
+        content.dictionaryValue(at: "emote")?.forEach { token, rawValue in
+            guard
+                let emote = rawValue as? JSONObject,
+                let rawURL = emote.stringValue(at: "gif_url") ?? emote.stringValue(at: "url") ?? emote.stringValue(at: "icon_url"),
+                let normalized = Self.normalizedCommentURLString(rawURL),
+                let url = URL(string: normalized)
+            else { return }
+            let path = url.path.lowercased()
+            replacements[token] = .emote(
+                alt: emote.stringValue(at: "text") ?? token,
+                url: url,
+                width: emote.intValue(at: "meta", "size") ?? 0,
+                height: emote.intValue(at: "meta", "size") ?? 0,
+                animated: path.hasSuffix(".gif") || path.hasSuffix(".webp") || path.hasSuffix(".apng")
+            )
+        }
+        content.dictionaryValue(at: "jump_url")?.forEach { token, rawValue in
+            guard replacements[token] == nil else { return }
+            let rawURL = (rawValue as? String)
+                ?? (rawValue as? JSONObject)?.stringValue(at: "url")
+                ?? (rawValue as? JSONObject)?.stringValue(at: "jump_url")
+            if let normalized = Self.normalizedCommentURLString(rawURL), let url = URL(string: normalized) {
+                replacements[token] = .text(value: token, linkURL: url)
+            }
+        }
+        guard !replacements.isEmpty else { return [.text(value: message)] }
+        let tokens = replacements.keys.sorted { $0.count > $1.count }
+        var result: [FocusRichTextRun] = []
+        var cursor = message.startIndex
+        while cursor < message.endIndex {
+            let matches = tokens.compactMap { token in
+                message.range(of: token, range: cursor ..< message.endIndex).map { ($0, token) }
+            }
+            guard let match = matches.min(by: { lhs, rhs in
+                lhs.0.lowerBound == rhs.0.lowerBound ? lhs.1.count > rhs.1.count : lhs.0.lowerBound < rhs.0.lowerBound
+            }) else {
+                result.append(.text(value: String(message[cursor...])))
+                break
+            }
+            if cursor < match.0.lowerBound { result.append(.text(value: String(message[cursor ..< match.0.lowerBound]))) }
+            if let replacement = replacements[match.1] { result.append(replacement) }
+            cursor = match.0.upperBound
+        }
+        return result
+    }
+
+    private static func normalizedCommentURLString(_ raw: String?) -> String? {
+        guard var value = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { return nil }
+        if value.hasPrefix("//") { value = "https:\(value)" }
+        else if value.lowercased().hasPrefix("http://") { value = "https://" + value.dropFirst("http://".count) }
+        else if value.hasPrefix("/") { value = "https://www.bilibili.com\(value)" }
+        return value
     }
 
     private func requestObject(urlString: String, referer: String?) async throws -> JSONObject {
@@ -3188,6 +5848,15 @@ fileprivate actor FocusNativePageAugmentService {
         }
 
         let data = try await requestData(url: url, referer: referer)
+        let rawObject = try JSONSerialization.jsonObject(with: data)
+        guard let object = rawObject as? JSONObject else {
+            throw URLError(.cannotParseResponse)
+        }
+        return object
+    }
+
+    private func requestObject(for request: URLRequest) async throws -> JSONObject {
+        let data = try await requestData(for: request)
         let rawObject = try JSONSerialization.jsonObject(with: data)
         guard let object = rawObject as? JSONObject else {
             throw URLError(.cannotParseResponse)
@@ -3209,6 +5878,10 @@ fileprivate actor FocusNativePageAugmentService {
             request.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
         }
 
+        return try await requestData(for: request)
+    }
+
+    private func requestData(for request: URLRequest) async throws -> Data {
         let (data, response) = try await session.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse, (200 ... 299).contains(httpResponse.statusCode) else {
             throw URLError(.badServerResponse)
@@ -3361,18 +6034,177 @@ fileprivate actor FocusNativePageAugmentService {
     }
 }
 
+private let focusNativeVideoAugmentComponentVersion = "2026-07-10-video-layout-stability"
+
+private let focusNativeVideoAugmentMountHelpersJavaScript = #"""
+              const ensureNativeVideoAugmentHelpers = () => {
+                const existingHelpers = window.__FOCUS_NATIVE_VIDEO_AUGMENT_HELPERS__;
+                if (existingHelpers) {
+                  return existingHelpers;
+                }
+
+                const resolveMountHost = () => {
+                  const playerContainer = document.querySelector('.left-container.scroll-sticky, .left-container');
+                  if (playerContainer instanceof HTMLElement) {
+                    return playerContainer;
+                  }
+
+                  const main = document.querySelector('main');
+                  if (main instanceof HTMLElement) {
+                    return main;
+                  }
+
+                  return document.body || document.documentElement;
+                };
+
+                const attachRoot = (root) => {
+                  if (!(root instanceof HTMLElement)) {
+                    return false;
+                  }
+
+                  const host = resolveMountHost();
+                  if (!host) {
+                    return false;
+                  }
+
+                  if (root.parentNode !== host) {
+                    host.appendChild(root);
+                  }
+
+                  return true;
+                };
+
+                const repairRoot = () => {
+                  const liveRoot = document.getElementById('focus-native-video-augment') || window.__FOCUS_NATIVE_VIDEO_AUGMENT_ROOT__;
+                  if (!(liveRoot instanceof HTMLElement)) {
+                    return false;
+                  }
+                  return attachRoot(liveRoot);
+                };
+
+                const disconnectObserver = () => {
+                  const observer = window.__FOCUS_NATIVE_VIDEO_AUGMENT_OBSERVER__;
+                  if (observer) {
+                    try {
+                      observer.disconnect();
+                    } catch (_) {}
+                  }
+                  window.__FOCUS_NATIVE_VIDEO_AUGMENT_OBSERVER__ = null;
+                  if (window.__FOCUS_NATIVE_VIDEO_SUPPRESSION_FRAME__) {
+                    cancelAnimationFrame(window.__FOCUS_NATIVE_VIDEO_SUPPRESSION_FRAME__);
+                  }
+                  window.__FOCUS_NATIVE_VIDEO_SUPPRESSION_FRAME__ = null;
+                };
+
+                const scheduleOriginalSectionSuppression = () => {
+                  if (window.__FOCUS_NATIVE_VIDEO_SUPPRESSION_FRAME__) {
+                    return;
+                  }
+
+                  window.__FOCUS_NATIVE_VIDEO_SUPPRESSION_FRAME__ = requestAnimationFrame(() => {
+                    window.__FOCUS_NATIVE_VIDEO_SUPPRESSION_FRAME__ = null;
+                    try {
+                      window.__FOCUS_ENFORCE_NATIVE_VIDEO_ORIGINAL_SUPPRESSION__?.();
+                    } catch (_) {}
+                  });
+                };
+
+                const installObserver = (root) => {
+                  if (root instanceof HTMLElement) {
+                    window.__FOCUS_NATIVE_VIDEO_AUGMENT_ROOT__ = root;
+                  }
+
+                  window.__FOCUS_REPAIR_NATIVE_VIDEO_AUGMENT__ = repairRoot;
+                  disconnectObserver();
+
+                  const observer = new MutationObserver(() => {
+                    const liveRoot = document.getElementById('focus-native-video-augment') || window.__FOCUS_NATIVE_VIDEO_AUGMENT_ROOT__;
+                    if (!(liveRoot instanceof HTMLElement)) {
+                      return;
+                    }
+
+                    const host = resolveMountHost();
+                    if (liveRoot.parentNode !== host) {
+                      repairRoot();
+                    }
+                    scheduleOriginalSectionSuppression();
+                  });
+
+                  observer.observe(document.documentElement, { childList: true, subtree: true });
+                  window.__FOCUS_NATIVE_VIDEO_AUGMENT_OBSERVER__ = observer;
+                  scheduleOriginalSectionSuppression();
+                };
+
+                const teardown = () => {
+                  disconnectObserver();
+                  window.__FOCUS_NATIVE_VIDEO_AUGMENT_ROOT__ = null;
+                  window.__FOCUS_REPAIR_NATIVE_VIDEO_AUGMENT__ = null;
+                  window.__FOCUS_ENFORCE_NATIVE_VIDEO_ORIGINAL_SUPPRESSION__ = null;
+                };
+
+                const helpers = {
+                  resolveMountHost,
+                  attachRoot,
+                  repairRoot,
+                  installObserver,
+                  teardown
+                };
+                window.__FOCUS_NATIVE_VIDEO_AUGMENT_HELPERS__ = helpers;
+                return helpers;
+              };
+
+              const nativeVideoAugmentHelpers = ensureNativeVideoAugmentHelpers();
+              const mountNativeVideoAugmentRoot = (root) => {
+                if (!(root instanceof HTMLElement)) {
+                  return false;
+                }
+                nativeVideoAugmentHelpers.attachRoot(root);
+                nativeVideoAugmentHelpers.installObserver(root);
+                return true;
+              };
+"""#
+
 private extension FocusNativeVideoAugmentPayload {
     var javaScript: String {
         let payloadJSON = focusJSONString
+        let componentVersion = focusNativeVideoAugmentComponentVersion
         return #"""
         (() => {
           const payload = \#(payloadJSON);
           const styleId = 'focus-native-video-augment-style';
           const rootId = 'focus-native-video-augment';
-          if (!payload || ((!payload.groups || payload.groups.length === 0) && (!payload.comments || payload.comments.length === 0))) {
+          const componentVersion = '\#(componentVersion)';
+          \#(focusNativeVideoAugmentMountHelpersJavaScript)
+          const hasRenderableContent = !!payload && (
+            !!payload.authorName
+            || !!payload.authorAvatarURL
+            || !!payload.authorSpaceURL
+            || (!!payload.groups && payload.groups.length > 0)
+            || (!!payload.comments && payload.comments.length > 0)
+          );
+          if (!hasRenderableContent) {
             document.getElementById(rootId)?.remove?.();
+            if (window.__FOCUS_NATIVE_VIDEO_AUGMENT_HELPERS__?.teardown) {
+              try {
+                window.__FOCUS_NATIVE_VIDEO_AUGMENT_HELPERS__.teardown();
+              } catch (_) {}
+            }
             return;
           }
+
+          const checkExistingComponent = (existing) => {
+            if (!existing) return false;
+            if (existing.getAttribute('data-focus-version') !== componentVersion) {
+              return false;
+            }
+            const rect = existing.getBoundingClientRect();
+            const hasContent = existing.children.length > 0;
+            const isVisible = rect.height > 50;
+            const groupsReady = !payload.groups || payload.groups.length === 0 || !!existing.querySelector('.focus-native-episode-card');
+            const commentsReady = !payload.comments || payload.comments.length === 0 || !!existing.querySelector('.focus-native-comment-card');
+
+            return hasContent && isVisible && groupsReady && commentsReady;
+          };
 
           const escapeHTML = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({
             '&': '&amp;',
@@ -3382,6 +6214,43 @@ private extension FocusNativeVideoAugmentPayload {
             "'": '&#39;'
           })[char] || char);
           const nl2br = (value) => escapeHTML(value).replace(/\n/g, '<br>');
+          const safeURL = (value) => {
+            try {
+              const url = new URL(String(value || ''), location.href);
+              return (url.protocol === 'https:' || url.protocol === 'http:') ? url.href : '';
+            } catch (_) {
+              return '';
+            }
+          };
+          const renderRuns = (comment) => {
+            const runs = Array.isArray(comment?.contentRuns) ? comment.contentRuns : [];
+            if (runs.length === 0) return nl2br(comment?.content || '');
+            return runs.map((run) => {
+              if (run?.text) {
+                const node = run.text;
+                const decorations = [node.underline ? 'underline' : '', node.strikethrough ? 'line-through' : ''].filter(Boolean).join(' ');
+                const color = /^#[0-9a-f]{3,8}$/i.test(node.color || '') ? node.color : '';
+                const style = [node.bold ? 'font-weight:700' : '', node.italic ? 'font-style:italic' : '', decorations ? `text-decoration:${decorations}` : '', color ? `color:${color}` : ''].filter(Boolean).join(';');
+                const value = `<span${style ? ` style="${style}"` : ''}>${nl2br(node.value || '')}</span>`;
+                const href = safeURL(node.linkURL);
+                return href ? `<a class="focus-native-rich-link" href="${escapeHTML(href)}">${value}</a>` : value;
+              }
+              if (run?.emote) {
+                const node = run.emote;
+                const src = safeURL(node.url);
+                return src ? `<img class="focus-native-rich-emote" src="${escapeHTML(src)}" alt="${escapeHTML(node.alt || '[表情]')}" loading="lazy">` : escapeHTML(node.alt || '[表情]');
+              }
+              if (run?.resource) {
+                const node = run.resource;
+                const href = safeURL(node.url);
+                return href ? `<a class="focus-native-rich-link" href="${escapeHTML(href)}">${escapeHTML(node.label || '查看内容')}</a>` : escapeHTML(node.label || '查看内容');
+              }
+              return '';
+            }).join('');
+          };
+          const renderReplies = (comment) => (comment.previewReplies || []).slice(0, 2).map((reply) => `
+            <div class="focus-native-preview-reply"><span class="focus-native-preview-author">${escapeHTML(reply.author)}：</span>${renderRuns(reply)}</div>
+          `).join('');
           const ensureStyle = () => {
             let style = document.getElementById(styleId);
             if (!style) {
@@ -3389,18 +6258,23 @@ private extension FocusNativeVideoAugmentPayload {
               style.id = styleId;
               document.head.appendChild(style);
             }
+            style.removeAttribute('data-focus-placeholder');
             style.textContent = `
               #${rootId} {
                 display: block !important;
                 width: 100% !important;
                 box-sizing: border-box !important;
                 padding: 8px 16px 24px !important;
+                position: relative !important;
+                z-index: 3 !important;
+                order: 2 !important;
+                flex: 0 0 auto !important;
               }
               #${rootId} .focus-native-section {
                 margin-top: 8px !important;
                 padding: 16px !important;
                 border-radius: 20px !important;
-                background: rgba(255, 255, 255, 0.97) !important;
+                background: rgba(248, 250, 252, 0.96) !important;
                 border: 1px solid rgba(15, 23, 42, 0.06) !important;
                 box-shadow: 0 14px 32px rgba(15, 23, 42, 0.05) !important;
                 box-sizing: border-box !important;
@@ -3409,9 +6283,122 @@ private extension FocusNativeVideoAugmentPayload {
                 margin-top: 0 !important;
               }
               html[data-focus-theme='dark'] #${rootId} .focus-native-section {
-                background: rgba(23, 27, 35, 0.94) !important;
+                background: rgba(17, 24, 39, 0.96) !important;
                 border-color: rgba(255, 255, 255, 0.08) !important;
                 box-shadow: 0 12px 24px rgba(0, 0, 0, 0.22) !important;
+              }
+              html.focus-native-video-ready .right-container,
+              body.focus-native-video-ready .right-container,
+              html.focus-native-video-ready .right-container-inner,
+              body.focus-native-video-ready .right-container-inner,
+              html.focus-native-video-ready .side-toolbar,
+              body.focus-native-video-ready .side-toolbar,
+              html.focus-native-video-ready .right-entry,
+              body.focus-native-video-ready .right-entry,
+              html.focus-native-video-ready #viewbox_report,
+              body.focus-native-video-ready #viewbox_report,
+              html.focus-native-video-ready .video-pod,
+              body.focus-native-video-ready .video-pod,
+              html.focus-native-video-ready .video-pod__head,
+              body.focus-native-video-ready .video-pod__head,
+              html.focus-native-video-ready .video-pod__header,
+              body.focus-native-video-ready .video-pod__header,
+              html.focus-native-video-ready .video-pod__body,
+              body.focus-native-video-ready .video-pod__body,
+              html.focus-native-video-ready .video-pod__list,
+              body.focus-native-video-ready .video-pod__list,
+              html.focus-native-video-ready .multi-page,
+              body.focus-native-video-ready .multi-page,
+              html.focus-native-video-ready [class*="multi-page"],
+              body.focus-native-video-ready [class*="multi-page"],
+              html.focus-native-video-ready [class*="episode-list"],
+              body.focus-native-video-ready [class*="episode-list"],
+              html.focus-native-video-ready [class*="part-list"],
+              body.focus-native-video-ready [class*="part-list"],
+              html.focus-native-video-ready [class*="page-list"],
+              body.focus-native-video-ready [class*="page-list"],
+              html.focus-native-video-ready #commentapp,
+              body.focus-native-video-ready #commentapp,
+              html.focus-native-video-ready #commentapp > *,
+              body.focus-native-video-ready #commentapp > *,
+              html.focus-native-video-ready bili-comments,
+              body.focus-native-video-ready bili-comments,
+              html.focus-native-video-ready .comment-container,
+              body.focus-native-video-ready .comment-container,
+              html.focus-native-video-ready .bb-comment,
+              body.focus-native-video-ready .bb-comment,
+              html.focus-native-video-ready .comment-container,
+              body.focus-native-video-ready .comment-container,
+              html.focus-native-video-ready .bb-comment,
+              body.focus-native-video-ready .bb-comment {
+                display: none !important;
+                visibility: hidden !important;
+                opacity: 0 !important;
+                pointer-events: none !important;
+              }
+              #${rootId} .focus-native-video-meta {
+                display: flex !important;
+                align-items: center !important;
+                justify-content: space-between !important;
+                gap: 12px !important;
+                min-width: 0 !important;
+              }
+              #${rootId} .focus-native-owner {
+                display: flex !important;
+                align-items: center !important;
+                gap: 10px !important;
+                text-decoration: none !important;
+                color: inherit !important;
+                min-width: 0 !important;
+                flex: 1 1 auto !important;
+              }
+              #${rootId} .focus-native-owner-copy {
+                min-width: 0 !important;
+                flex: 1 1 auto !important;
+              }
+              #${rootId} .focus-native-owner-avatar {
+                width: 40px !important;
+                height: 40px !important;
+                border-radius: 999px !important;
+                overflow: hidden !important;
+                background: rgba(148, 163, 184, 0.16) !important;
+                flex: 0 0 40px !important;
+              }
+              #${rootId} .focus-native-owner-avatar img {
+                width: 100% !important;
+                height: 100% !important;
+                object-fit: cover !important;
+                display: block !important;
+              }
+              #${rootId} .focus-native-owner-name {
+                font-size: 15px !important;
+                font-weight: 700 !important;
+                line-height: 1.25 !important;
+                color: #111827 !important;
+                overflow: hidden !important;
+                text-overflow: ellipsis !important;
+                white-space: nowrap !important;
+              }
+              html[data-focus-theme='dark'] #${rootId} .focus-native-owner-name {
+                color: #f8fafc !important;
+              }
+              #${rootId} .focus-native-owner-side {
+                display: flex !important;
+                flex-direction: column !important;
+                align-items: flex-end !important;
+                justify-content: center !important;
+                gap: 4px !important;
+                flex: 0 0 auto !important;
+              }
+              #${rootId} .focus-native-owner-followers {
+                font-size: 12px !important;
+                font-weight: 600 !important;
+                line-height: 1.2 !important;
+                color: rgba(100, 116, 139, 0.92) !important;
+                white-space: nowrap !important;
+              }
+              html[data-focus-theme='dark'] #${rootId} .focus-native-owner-followers {
+                color: rgba(226, 232, 240, 0.72) !important;
               }
               #${rootId} .focus-native-header {
                 display: flex !important;
@@ -3443,8 +6430,8 @@ private extension FocusNativeVideoAugmentPayload {
               }
               #${rootId} .focus-native-episode-card {
                 flex: 0 0 168px !important;
-                min-height: 92px !important;
-                padding: 12px !important;
+                min-height: 84px !important;
+                padding: 11px 12px !important;
                 border-radius: 16px !important;
                 background: rgba(248, 250, 252, 0.98) !important;
                 border: 1px solid rgba(15, 23, 42, 0.06) !important;
@@ -3452,14 +6439,21 @@ private extension FocusNativeVideoAugmentPayload {
                 text-decoration: none !important;
                 color: inherit !important;
                 scroll-snap-align: start !important;
+                display: flex !important;
+                flex-direction: column !important;
               }
               html[data-focus-theme='dark'] #${rootId} .focus-native-episode-card {
                 background: rgba(30, 41, 59, 0.94) !important;
                 border-color: rgba(255, 255, 255, 0.06) !important;
               }
               #${rootId} .focus-native-episode-card.is-current {
-                border-color: rgba(251, 114, 153, 0.44) !important;
-                box-shadow: inset 0 0 0 1px rgba(251, 114, 153, 0.22) !important;
+                border-color: rgba(251, 114, 153, 0.98) !important;
+                border-width: 2px !important;
+                box-shadow: inset 0 0 0 1px rgba(251, 114, 153, 0.42) !important;
+              }
+              #${rootId} .focus-native-episode-card.is-compact {
+                min-height: 74px !important;
+                justify-content: center !important;
               }
               #${rootId} .focus-native-episode-subtitle {
                 font-size: 12px !important;
@@ -3483,7 +6477,7 @@ private extension FocusNativeVideoAugmentPayload {
                 color: #f8fafc !important;
               }
               #${rootId} .focus-native-episode-badge {
-                margin-top: 10px !important;
+                margin-top: 8px !important;
                 font-size: 12px !important;
                 line-height: 1.2 !important;
                 color: rgba(100, 116, 139, 0.92) !important;
@@ -3539,6 +6533,26 @@ private extension FocusNativeVideoAugmentPayload {
                 color: #0f172a !important;
                 word-break: break-word !important;
               }
+              #${rootId} .focus-native-rich-emote {
+                display: inline-block !important;
+                width: 1.35em !important;
+                height: 1.35em !important;
+                object-fit: contain !important;
+                vertical-align: -0.24em !important;
+                margin: 0 1px !important;
+              }
+              #${rootId} .focus-native-rich-link,
+              #${rootId} .focus-native-preview-author {
+                color: #fb7299 !important;
+                text-decoration: none !important;
+              }
+              #${rootId} .focus-native-preview-reply {
+                margin-top: 6px !important;
+                padding-left: 8px !important;
+                font-size: 13px !important;
+                line-height: 1.55 !important;
+                color: rgba(100, 116, 139, 0.96) !important;
+              }
               html[data-focus-theme='dark'] #${rootId} .focus-native-comment-content {
                 color: #f8fafc !important;
               }
@@ -3562,52 +6576,73 @@ private extension FocusNativeVideoAugmentPayload {
             `;
           };
 
-          const hideOriginalSections = () => {
-            if (payload.groups && payload.groups.length > 0) {
-              [
-                '.video-pod',
-                '.video-pod__head',
-                '.video-pod__header',
-                '.video-pod__body',
-                '.video-pod__list',
-                '.multi-page',
-                '[class*="multi-page"]',
-                '[class*="episode-list"]',
-                '[class*="part-list"]',
-                '[class*="page-list"]'
-              ].forEach((selector) => {
-                document.querySelectorAll(selector).forEach((node) => {
-                  if (!node.closest(`#${rootId}`)) {
-                    node.style.setProperty('display', 'none', 'important');
-                  }
-                });
-              });
+          const isPlayerRelatedNode = (node) => {
+            if (!(node instanceof Element)) {
+              return false;
             }
-            if (payload.comments && payload.comments.length > 0) {
-              [
-                '#commentapp',
-                '#commentapp > *',
-                'bili-comments',
-                '.comment-container',
-                '.bb-comment'
-              ].forEach((selector) => {
-                document.querySelectorAll(selector).forEach((node) => {
-                  if (!node.closest(`#${rootId}`)) {
-                    node.style.setProperty('display', 'none', 'important');
-                  }
-                });
-              });
-            }
+            return !!node.closest([
+              '#bilibili-player',
+              '#playerWrap',
+              '.player-wrap',
+              '.bpx-player-container',
+              '.bpx-player-video-wrap',
+              '.bpx-player-video-area',
+              '.bpx-player-state-wrap'
+            ].join(','));
           };
 
+          const hideOriginalSections = () => {
+            [
+              '.right-container',
+              '.right-container-inner',
+              '.side-toolbar',
+              '.right-entry',
+              '#viewbox_report',
+              '.video-pod',
+              '.video-pod__head',
+              '.video-pod__header',
+              '.video-pod__body',
+              '.video-pod__list',
+              '.multi-page',
+              '[class*="multi-page"]',
+              '[class*="episode-list"]',
+              '[class*="part-list"]',
+              '[class*="page-list"]',
+              '#commentapp',
+              '#commentapp > *',
+              'bili-comments',
+              '.comment-container',
+              '.bb-comment',
+              '[class*="skeleton"]',
+              '[class*="loading"]'
+            ].forEach((selector) => {
+              document.querySelectorAll(selector).forEach((node) => {
+                if (node.closest(`#${rootId}`) || isPlayerRelatedNode(node)) {
+                  return;
+                }
+                node.style.setProperty('display', 'none', 'important');
+                node.style.setProperty('visibility', 'hidden', 'important');
+                node.style.setProperty('position', 'absolute', 'important');
+                node.style.setProperty('z-index', '-9999', 'important');
+                node.style.setProperty('opacity', '0', 'important');
+                node.style.setProperty('pointer-events', 'none', 'important');
+              });
+            });
+          };
+          window.__FOCUS_ENFORCE_NATIVE_VIDEO_ORIGINAL_SUPPRESSION__ = hideOriginalSections;
+
           const buildGroupsHTML = () => (payload.groups || []).map((group) => {
-            const items = (group.items || []).map((item) => `
-              <a class="focus-native-episode-card${item.isCurrent ? ' is-current' : ''}" href="${escapeHTML(item.targetURL)}">
-                <div class="focus-native-episode-subtitle">${escapeHTML(item.subtitle)}</div>
+            const items = (group.items || []).map((item) => {
+              const subtitle = String(item.subtitle || '').trim();
+              const showSubtitle = !!subtitle && !/^BV/i.test(subtitle);
+              return `
+              <a class="focus-native-episode-card${item.isCurrent ? ' is-current' : ''}${showSubtitle ? '' : ' is-compact'}" href="${escapeHTML(item.targetURL)}">
+                ${showSubtitle ? `<div class="focus-native-episode-subtitle">${escapeHTML(subtitle)}</div>` : ''}
                 <div class="focus-native-episode-text">${escapeHTML(item.title)}</div>
                 ${item.badge ? `<div class="focus-native-episode-badge">${escapeHTML(item.badge)}</div>` : ''}
               </a>
-            `).join('');
+            `;
+            }).join('');
             return `
               <section class="focus-native-section">
                 <div class="focus-native-header">
@@ -3617,6 +6652,24 @@ private extension FocusNativeVideoAugmentPayload {
               </section>
             `;
           }).join('');
+
+          const buildMetaHTML = () => {
+            return `
+              <section class="focus-native-section">
+                <div class="focus-native-video-meta">
+                  <a class="focus-native-owner" href="${escapeHTML(payload.authorSpaceURL || '#')}">
+                    <div class="focus-native-owner-avatar">${payload.authorAvatarURL ? `<img src="${escapeHTML(payload.authorAvatarURL)}" alt="">` : ''}</div>
+                    <div class="focus-native-owner-copy">
+                      <div class="focus-native-owner-name">${escapeHTML(payload.authorName || 'UP主')}</div>
+                    </div>
+                  </a>
+                  <div class="focus-native-owner-side">
+                    <div class="focus-native-owner-followers">${escapeHTML(payload.authorFollowersText || '0')} 粉丝</div>
+                  </div>
+                </div>
+              </section>
+            `;
+          };
 
           const buildCommentsHTML = () => {
             if (!payload.comments || payload.comments.length === 0) {
@@ -3629,7 +6682,7 @@ private extension FocusNativeVideoAugmentPayload {
                 </div>
                 <div class="focus-native-comment-main">
                   <div class="focus-native-comment-author">${escapeHTML(comment.author)}</div>
-                  <div class="focus-native-comment-content">${nl2br(comment.content)}</div>
+                  <div class="focus-native-comment-content">${renderRuns(comment)}${renderReplies(comment)}</div>
                   <div class="focus-native-comment-meta">${[comment.timeText, comment.likeText, comment.replyText].filter(Boolean).map(escapeHTML).join(' · ')}</div>
                 </div>
               </article>
@@ -3649,34 +6702,127 @@ private extension FocusNativeVideoAugmentPayload {
           const preservedScrollY = window.scrollY || document.documentElement.scrollTop || document.body.scrollTop || 0;
           const root = document.getElementById(rootId) || document.createElement('section');
           root.id = rootId;
+          const renderKey = `${payload.title || ''}::${payload.authorName || ''}::${(payload.groups || []).reduce((sum, group) => sum + ((group.items || []).length), 0)}::${(payload.comments || []).length}`;
+          const loadingMaskId = 'focus-native-video-loading-mask';
+          const setMountPhase = (phase) => {
+            root.setAttribute('data-focus-mount-phase', phase);
+          };
+          const bumpMountCount = () => {
+            const previousCount = Number.parseInt(root.getAttribute('data-focus-mount-count') || '0', 10);
+            const nextCount = (Number.isFinite(previousCount) ? previousCount : 0) + 1;
+            root.setAttribute('data-focus-mount-count', String(nextCount));
+            return nextCount;
+          };
+          const mountPreparedRoot = (phase) => {
+            bumpMountCount();
+            setMountPhase(phase);
+            mountNativeVideoAugmentRoot(root);
+          };
+          const applyReadyState = (phase) => {
+            document.documentElement.classList.add('focus-native-video-ready');
+            document.body?.classList?.add('focus-native-video-ready');
+            setMountPhase(phase);
+          };
+          const clearLoadingMask = () => {
+            if (window.__FOCUS_CLEAR_VIDEO_LOADING_MASK__) {
+              try {
+                window.__FOCUS_CLEAR_VIDEO_LOADING_MASK__(true);
+                return;
+              } catch (_) {}
+            }
+
+            const liveMask = document.getElementById(loadingMaskId);
+            if (!liveMask) {
+              return;
+            }
+            liveMask.style.transition = 'opacity 0.18s ease';
+            liveMask.style.opacity = '0';
+            setTimeout(() => {
+              if (liveMask.isConnected) {
+                liveMask.remove?.();
+              }
+            }, 220);
+          };
+
+          if (root.getAttribute('data-focus-render-key') === renderKey && checkExistingComponent(root)) {
+            hideOriginalSections();
+            setMountPhase('sections-hidden');
+            root.removeAttribute('data-focus-placeholder');
+            mountPreparedRoot('existing-fast-path-mounted');
+            applyReadyState('existing-fast-path-ready');
+            clearLoadingMask();
+            return;
+          }
+
+          root.setAttribute('data-focus-version', componentVersion);
+          root.setAttribute('data-focus-render-key', renderKey);
+          root.removeAttribute('data-focus-placeholder');
           root.style.setProperty('display', 'block', 'important');
           root.style.setProperty('width', '100%', 'important');
           root.style.setProperty('visibility', 'visible', 'important');
           root.style.setProperty('opacity', '1', 'important');
-          root.innerHTML = `${buildGroupsHTML()}${buildCommentsHTML()}`;
-
-          const commentAnchor = payload.comments && payload.comments.length > 0
-            ? document.querySelector('#commentapp')
-            : null;
-          const episodeAnchor = payload.groups && payload.groups.length > 0
-            ? document.querySelector('.video-pod, .multi-page, [class*="episode-list"], [class*="part-list"], [class*="page-list"]')
-            : null;
-          const viewbox = document.querySelector('#viewbox_report');
-          const leftContainer = viewbox?.closest('.left-container') || document.querySelector('.left-container');
-
-          if (commentAnchor && commentAnchor.parentNode) {
-            commentAnchor.parentNode.insertBefore(root, commentAnchor);
-          } else if (episodeAnchor && episodeAnchor.parentNode) {
-            episodeAnchor.parentNode.insertBefore(root, episodeAnchor);
-          } else if (viewbox && viewbox.parentNode) {
-            viewbox.parentNode.insertBefore(root, viewbox.nextSibling);
-          } else if (leftContainer) {
-            leftContainer.appendChild(root);
-          } else {
-            (document.querySelector('main') || document.body || document.documentElement).appendChild(root);
-          }
+          setMountPhase('content-prepared');
+          root.innerHTML = `${buildMetaHTML()}${buildGroupsHTML()}${buildCommentsHTML()}`;
 
           hideOriginalSections();
+          setMountPhase('sections-hidden');
+          mountPreparedRoot('single-mount-attached');
+
+          const hideFloatingToolbar = () => {
+            document.querySelectorAll([
+              '.side-toolbar',
+              '.right-entry',
+              '[class*="side-toolbar"]',
+              '[class*="right-entry"]'
+            ].join(',')).forEach((node) => {
+              if (!(node instanceof HTMLElement) || node.closest(`#${rootId}`)) {
+                return;
+              }
+              node.style.setProperty('display', 'none', 'important');
+              node.style.setProperty('visibility', 'hidden', 'important');
+              node.style.setProperty('opacity', '0', 'important');
+              node.style.setProperty('pointer-events', 'none', 'important');
+            });
+
+            Array.from(document.querySelectorAll('button, a, div, span')).forEach((node) => {
+              const text = String(node.textContent || '').trim();
+              if (text === '顶部' || text === '小窗' || text === '客服') {
+                const element = node.closest('.side-toolbar, .right-entry, button, a, [role="button"], div') || node;
+                if (element instanceof HTMLElement && !element.closest(`#${rootId}`)) {
+                  element.style.setProperty('display', 'none', 'important');
+                  element.style.setProperty('visibility', 'hidden', 'important');
+                  element.style.setProperty('opacity', '0', 'important');
+                  element.style.setProperty('pointer-events', 'none', 'important');
+                }
+              }
+            });
+          };
+
+          hideFloatingToolbar();
+          requestAnimationFrame(hideFloatingToolbar);
+          setTimeout(hideFloatingToolbar, 160);
+
+          const focusCurrentEpisodeCard = () => {
+            const currentCard = root.querySelector('.focus-native-episode-card.is-current');
+            const scroller = currentCard?.closest('.focus-native-scroller');
+            if (!currentCard || !scroller) {
+              return;
+            }
+            const targetLeft = Math.max(
+              currentCard.offsetLeft - Math.max((scroller.clientWidth - currentCard.offsetWidth) / 2, 0),
+              0
+            );
+            scroller.scrollTo({ left: targetLeft, behavior: 'auto' });
+          };
+          if (payload.groups && payload.groups.length > 0) {
+            requestAnimationFrame(focusCurrentEpisodeCard);
+          }
+
+          applyReadyState('ready-class-applied');
+          requestAnimationFrame(() => {
+            setMountPhase('mask-clearing');
+            clearLoadingMask();
+          });
 
           const restoreScroll = () => {
             const currentY = window.scrollY || document.documentElement.scrollTop || document.body.scrollTop || 0;
@@ -3684,9 +6830,11 @@ private extension FocusNativeVideoAugmentPayload {
               window.scrollTo(0, preservedScrollY);
             }
           };
-          requestAnimationFrame(restoreScroll);
-          setTimeout(restoreScroll, 80);
-          setTimeout(restoreScroll, 260);
+          requestAnimationFrame(() => {
+            setMountPhase('scroll-restoring');
+            restoreScroll();
+          });
+          setTimeout(restoreScroll, 90);
         })();
         """#
     }
@@ -3712,6 +6860,43 @@ private extension FocusNativeOpusAugmentPayload {
             "'": '&#39;'
           })[char] || char);
           const nl2br = (value) => escapeHTML(value).replace(/\n/g, '<br>');
+          const safeURL = (value) => {
+            try {
+              const url = new URL(String(value || ''), location.href);
+              return (url.protocol === 'https:' || url.protocol === 'http:') ? url.href : '';
+            } catch (_) {
+              return '';
+            }
+          };
+          const renderRuns = (comment) => {
+            const runs = Array.isArray(comment?.contentRuns) ? comment.contentRuns : [];
+            if (runs.length === 0) return nl2br(comment?.content || '');
+            return runs.map((run) => {
+              if (run?.text) {
+                const node = run.text;
+                const decorations = [node.underline ? 'underline' : '', node.strikethrough ? 'line-through' : ''].filter(Boolean).join(' ');
+                const color = /^#[0-9a-f]{3,8}$/i.test(node.color || '') ? node.color : '';
+                const style = [node.bold ? 'font-weight:700' : '', node.italic ? 'font-style:italic' : '', decorations ? `text-decoration:${decorations}` : '', color ? `color:${color}` : ''].filter(Boolean).join(';');
+                const value = `<span${style ? ` style="${style}"` : ''}>${nl2br(node.value || '')}</span>`;
+                const href = safeURL(node.linkURL);
+                return href ? `<a class="focus-native-rich-link" href="${escapeHTML(href)}">${value}</a>` : value;
+              }
+              if (run?.emote) {
+                const node = run.emote;
+                const src = safeURL(node.url);
+                return src ? `<img class="focus-native-rich-emote" src="${escapeHTML(src)}" alt="${escapeHTML(node.alt || '[表情]')}" loading="lazy">` : escapeHTML(node.alt || '[表情]');
+              }
+              if (run?.resource) {
+                const node = run.resource;
+                const href = safeURL(node.url);
+                return href ? `<a class="focus-native-rich-link" href="${escapeHTML(href)}">${escapeHTML(node.label || '查看内容')}</a>` : escapeHTML(node.label || '查看内容');
+              }
+              return '';
+            }).join('');
+          };
+          const renderReplies = (comment) => (comment.previewReplies || []).slice(0, 2).map((reply) => `
+            <div class="focus-native-preview-reply"><span class="focus-native-preview-author">${escapeHTML(reply.author)}：</span>${renderRuns(reply)}</div>
+          `).join('');
           let style = document.getElementById(styleId);
           if (!style) {
             style = document.createElement('style');
@@ -3793,6 +6978,26 @@ private extension FocusNativeOpusAugmentPayload {
               color: #0f172a !important;
               word-break: break-word !important;
             }
+            #${rootId} .focus-native-rich-emote {
+              display: inline-block !important;
+              width: 1.35em !important;
+              height: 1.35em !important;
+              object-fit: contain !important;
+              vertical-align: -0.24em !important;
+              margin: 0 1px !important;
+            }
+            #${rootId} .focus-native-rich-link,
+            #${rootId} .focus-native-preview-author {
+              color: #fb7299 !important;
+              text-decoration: none !important;
+            }
+            #${rootId} .focus-native-preview-reply {
+              margin-top: 6px !important;
+              padding-left: 8px !important;
+              font-size: 13px !important;
+              line-height: 1.55 !important;
+              color: rgba(100, 116, 139, 0.96) !important;
+            }
             html[data-focus-theme='dark'] #${rootId} .focus-native-opus-content {
               color: #f8fafc !important;
             }
@@ -3834,7 +7039,7 @@ private extension FocusNativeOpusAugmentPayload {
                     </div>
                     <div class="focus-native-opus-main">
                       <div class="focus-native-opus-author">${escapeHTML(comment.author)}</div>
-                      <div class="focus-native-opus-content">${nl2br(comment.content)}</div>
+                      <div class="focus-native-opus-content">${renderRuns(comment)}${renderReplies(comment)}</div>
                       <div class="focus-native-opus-meta">${[comment.timeText, comment.likeText, comment.replyText].filter(Boolean).map(escapeHTML).join(' · ')}</div>
                     </div>
                   </article>
@@ -3879,7 +7084,7 @@ struct FocusMyHistoryItem: Identifiable {
         guard !bvid.isEmpty else {
             return nil
         }
-        return URL(string: "https://www.bilibili.com/video/\(bvid)")
+        return URL(string: "https://www.bilibili.com/video/\(bvid)/")
     }
 }
 
@@ -3888,12 +7093,30 @@ struct FocusMyFolder: Identifiable {
     let title: String
     let mediaCount: Int
     let coverURL: URL?
+    let previews: [FocusMyFavoriteItem]
 }
 
 struct FocusMyPage {
     let profile: FocusMyProfile
     let history: [FocusMyHistoryItem]
     let folders: [FocusMyFolder]
+}
+
+struct FocusMyFavoriteItem: Identifiable {
+    let id: String
+    let title: String
+    let coverURL: URL?
+    let bvid: String
+    let authorName: String
+    let durationText: String
+    let playText: String
+
+    var videoURL: URL? {
+        guard !bvid.isEmpty else {
+            return nil
+        }
+        return URL(string: "https://www.bilibili.com/video/\(bvid)/")
+    }
 }
 
 struct FocusUserSpaceProfile {
@@ -3921,7 +7144,7 @@ struct FocusUserSpaceVideo: Identifiable {
         guard !bvid.isEmpty else {
             return nil
         }
-        return URL(string: "https://www.bilibili.com/video/\(bvid)")
+        return URL(string: "https://www.bilibili.com/video/\(bvid)/")
     }
 }
 
@@ -3976,6 +7199,41 @@ struct FocusUserCollectionPage {
     let nextPage: Int?
 }
 
+enum FocusArticleRouting {
+    private static let webHosts = Set(["bilibili.com", "www.bilibili.com", "m.bilibili.com"])
+
+    static func extractCVID(from url: URL) -> Int64? {
+        if url.scheme?.lowercased() == "bilibili", url.host?.lowercased() == "article" {
+            guard let component = url.path.split(separator: "/").first else { return nil }
+            let candidate = String(component).lowercased().replacingOccurrences(of: "cv", with: "")
+            return candidate.allSatisfy(\.isNumber) ? Int64(candidate) : nil
+        }
+
+        guard webHosts.contains(url.host?.lowercased() ?? "") else { return nil }
+        let path = url.path.lowercased()
+        let pathComponents = url.path.split(separator: "/")
+        if pathComponents.count == 2,
+           pathComponents[0].caseInsensitiveCompare("read") == .orderedSame,
+           pathComponents[1].lowercased().hasPrefix("cv")
+        {
+            let candidate = String(pathComponents[1].dropFirst(2))
+            return candidate.allSatisfy(\.isNumber) ? Int64(candidate) : nil
+        }
+
+        guard path == "/read/mobile", let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return nil
+        }
+        return components.queryItems?
+            .first(where: { $0.name.caseInsensitiveCompare("id") == .orderedSame })?
+            .value
+            .flatMap { $0.allSatisfy(\.isNumber) ? Int64($0) : nil }
+    }
+
+    static func canonicalURL(for url: URL) -> URL? {
+        extractCVID(from: url).flatMap { URL(string: "https://www.bilibili.com/read/cv\($0)") }
+    }
+}
+
 struct FocusArticleAuthor {
     let mid: Int64
     let name: String
@@ -3998,20 +7256,31 @@ struct FocusArticlePage {
     let stats: FocusArticleStats
     let bannerURL: URL?
     let tags: [String]
-    let htmlContent: String
+    let blocks: [FocusArticleBlock]
+    let originalURL: URL
+}
+
+enum FocusArticleTextAlignment {
+    case leading
+    case center
+    case trailing
+}
+
+enum FocusArticleBlock {
+    case paragraph([FocusRichTextRun], alignment: FocusArticleTextAlignment)
+    case heading([FocusRichTextRun], level: Int)
+    case image(url: URL, width: Int, height: Int, caption: String)
+    case quote([FocusRichTextRun])
+    case list(ordered: Bool, items: [[FocusRichTextRun]])
+    case code(language: String, content: String)
+    case resource(title: String, url: URL)
+    case divider
 }
 
 struct FocusOpusAuthor {
     let name: String
     let mid: Int64
     let avatarURL: URL?
-}
-
-struct FocusOpusTextNode {
-    let text: String
-    let bold: Bool
-    let linkURL: URL?
-    let emojiURL: URL?
 }
 
 struct FocusOpusImage: Identifiable {
@@ -4029,7 +7298,7 @@ struct FocusOpusImage: Identifiable {
 }
 
 enum FocusOpusBlock {
-    case text([FocusOpusTextNode])
+    case text([FocusRichTextRun])
     case image([FocusOpusImage])
     case code(lang: String, content: String)
 }
@@ -4192,15 +7461,53 @@ final class FocusMyDataService: @unchecked Sendable {
         }
 
         let list = root.arrayValue(at: "data", "list") ?? []
-        return list.compactMap { folder in
+        var folders: [FocusMyFolder] = []
+        for folder in list {
             guard let id = folder.int64Value(at: "id") else {
-                return nil
+                continue
             }
-            return FocusMyFolder(
+            let previews = (try? await fetchFolderContents(mediaID: id, page: 1, pageSize: 6)) ?? []
+            folders.append(FocusMyFolder(
                 id: id,
                 title: folder.stringValue(at: "title") ?? "",
                 mediaCount: folder.intValue(at: "media_count") ?? 0,
-                coverURL: URL(string: Self.normalizedURLString(folder.stringValue(at: "cover")) ?? "")
+                coverURL: URL(string: Self.normalizedURLString(folder.stringValue(at: "cover")) ?? ""),
+                previews: previews
+            ))
+        }
+        return folders
+    }
+
+    func fetchFolderContents(mediaID: Int64, page: Int = 1, pageSize: Int = 20) async throws -> [FocusMyFavoriteItem] {
+        let root = try await requestObject(
+            urlString: "https://api.bilibili.com/x/v3/fav/resource/list?media_id=\(mediaID)&pn=\(max(page, 1))&ps=\(max(pageSize, 1))&order=mtime&type=0&tid=0&platform=web&web_location=333.1387",
+            referer: "https://www.bilibili.com/"
+        )
+        let code = root.intValue(at: "code") ?? -1
+        if code == -101 {
+            throw FocusMyServiceError.loginRequired
+        }
+        guard code == 0 else {
+            throw FocusMyServiceError.message(root.stringValue(at: "message") ?? "收藏夹内容加载失败")
+        }
+
+        let medias = root.arrayValue(at: "data", "medias") ?? []
+        return medias.compactMap { media -> FocusMyFavoriteItem? in
+            let bvid = media.stringValue(at: "bvid")?.nilIfBlank ?? ""
+            guard !bvid.isEmpty else {
+                return nil
+            }
+            return FocusMyFavoriteItem(
+                id: bvid,
+                title: Self.cleanText(media.stringValue(at: "title")).nilIfBlank ?? "视频",
+                coverURL: URL(string: Self.normalizedURLString(media.stringValue(at: "cover")) ?? ""),
+                bvid: bvid,
+                authorName: Self.cleanText(media.stringValue(at: "upper", "name")),
+                durationText: Self.formatVideoLength(
+                    media.stringValue(at: "duration"),
+                    seconds: media.int64Value(at: "duration")
+                ),
+                playText: Self.formatCount(media.int64Value(at: "cnt_info", "play") ?? 0)
             )
         }
     }
@@ -4292,6 +7599,491 @@ final class FocusMyDataService: @unchecked Sendable {
         return URL(string: Self.normalizedURLString(cover) ?? "")
     }
 
+    static func parseArticleContent(_ rawContent: String) -> [FocusArticleBlock] {
+        let content = rawContent.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !content.isEmpty else { return [] }
+        if
+            content.hasPrefix("{"),
+            let data = content.data(using: .utf8),
+            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let ops = object["ops"] as? [[String: Any]]
+        {
+            return parseArticleOps(ops)
+        }
+        return parseStructuredArticleHTML(content)
+    }
+
+    private static func parseArticleOps(_ ops: [[String: Any]]) -> [FocusArticleBlock] {
+        var blocks: [FocusArticleBlock] = []
+        var runs: [FocusRichTextRun] = []
+        func flush(_ attributes: [String: Any]? = nil) {
+            guard !runs.isEmpty else { return }
+            let value = runs
+            runs.removeAll(keepingCapacity: true)
+            if let level = attributes?["header"] as? NSNumber {
+                blocks.append(.heading(value, level: min(max(level.intValue, 1), 6)))
+            } else if (attributes?["blockquote"] as? Bool) == true {
+                blocks.append(.quote(value))
+            } else if let list = attributes?["list"] as? String {
+                let ordered = list == "ordered"
+                if case let .list(previousOrdered, items)? = blocks.last, previousOrdered == ordered {
+                    blocks[blocks.count - 1] = .list(ordered: ordered, items: items + [value])
+                } else {
+                    blocks.append(.list(ordered: ordered, items: [value]))
+                }
+            } else if attributes?["code-block"] != nil {
+                let code = value.map(\.plainText).joined()
+                if case let .code(language, previous)? = blocks.last {
+                    blocks[blocks.count - 1] = .code(language: language, content: previous + "\n" + code)
+                } else {
+                    blocks.append(.code(language: "", content: code))
+                }
+            } else {
+                let alignment: FocusArticleTextAlignment = switch attributes?["align"] as? String {
+                case "center": .center
+                case "right", "end": .trailing
+                default: .leading
+                }
+                blocks.append(.paragraph(value, alignment: alignment))
+            }
+        }
+        for op in ops {
+            let attributes = op["attributes"] as? [String: Any]
+            if let text = op["insert"] as? String {
+                let pieces = text.split(separator: "\n", omittingEmptySubsequences: false)
+                for (index, piece) in pieces.enumerated() {
+                    if !piece.isEmpty {
+                        runs.append(
+                            .text(
+                                value: decodeArticleHTMLEntities(String(piece)),
+                                bold: attributes?["bold"] as? Bool ?? false,
+                                italic: attributes?["italic"] as? Bool ?? false,
+                                underline: attributes?["underline"] as? Bool ?? false,
+                                strikethrough: attributes?["strike"] as? Bool ?? false,
+                                color: attributes?["color"] as? String,
+                                linkURL: normalizedArticleURL(attributes?["link"] as? String)
+                            )
+                        )
+                    }
+                    if index < pieces.count - 1 { flush(attributes) }
+                }
+                continue
+            }
+            guard let embed = op["insert"] as? [String: Any] else { continue }
+            if let image = (embed["native-image"] ?? embed["image"]) as? [String: Any] {
+                flush()
+                if let url = normalizedArticleURL(image["url"] as? String ?? image["src"] as? String) {
+                    blocks.append(
+                        .image(
+                            url: url,
+                            width: (image["width"] as? NSNumber)?.intValue ?? 0,
+                            height: (image["height"] as? NSNumber)?.intValue ?? 0,
+                            caption: image["alt"] as? String ?? ""
+                        )
+                    )
+                }
+                continue
+            }
+            if let rawImage = embed["image"] as? String, let url = normalizedArticleURL(rawImage) {
+                flush()
+                blocks.append(.image(url: url, width: 0, height: 0, caption: ""))
+                continue
+            }
+            if embed["cut-off"] != nil || embed["divider"] != nil || embed["hr"] != nil {
+                flush()
+                blocks.append(.divider)
+                continue
+            }
+            if let entry = embed.first(where: { $0.value is [String: Any] }),
+               let resource = entry.value as? [String: Any]
+            {
+                flush()
+                blocks.append(.resource(
+                    title: resource["title"] as? String ?? resource["name"] as? String ?? "站内内容",
+                    url: normalizedArticleURL(resource["url"] as? String ?? resource["jump_url"] as? String)
+                        ?? embeddedArticleResourceURL(kind: entry.key, resource: resource)
+                        ?? URL(string: "https://www.bilibili.com/")!
+                ))
+            }
+        }
+        flush()
+        return blocks
+    }
+
+    private static func parseLegacyArticleHTML(_ source: String) -> [FocusArticleBlock] {
+        let normalized = source
+            .replacingOccurrences(of: #"(?is)<(script|style)[^>]*>.*?</\1>"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"(?i)<br\s*/?>"#, with: "\n", options: .regularExpression)
+            .replacingOccurrences(of: #"(?i)</(p|div|h[1-6]|blockquote|li|ul|ol|pre)>"#, with: "\n\n", options: .regularExpression)
+        let tokenized = normalized.replacingOccurrences(
+            of: #"(?i)<img[^>]+(?:data-src|data-original|src)=[\"']([^\"']+)[\"'][^>]*>"#,
+            with: "\n\n[[FOCUS_IMAGE::$1]]\n\n",
+            options: .regularExpression
+        )
+        return tokenized.components(separatedBy: "\n\n").compactMap { rawSegment in
+            let segment = rawSegment.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !segment.isEmpty else { return nil }
+            if segment.hasPrefix("[[FOCUS_IMAGE::"), segment.hasSuffix("]]") {
+                let rawURL = String(segment.dropFirst("[[FOCUS_IMAGE::".count).dropLast(2))
+                guard let url = normalizedArticleURL(rawURL) else { return nil }
+                return .image(url: url, width: 0, height: 0, caption: "")
+            }
+            let text = cleanText(segment)
+            guard !text.isEmpty else { return nil }
+            let runs: [FocusRichTextRun] = [.text(
+                value: text,
+                bold: segment.range(of: #"(?i)<(strong|b)"#, options: .regularExpression) != nil,
+                italic: segment.range(of: #"(?i)<(em|i)"#, options: .regularExpression) != nil,
+                strikethrough: segment.range(of: #"(?i)<(del|s)"#, options: .regularExpression) != nil
+            )]
+            if let match = segment.range(of: #"(?i)<h[1-6]"#, options: .regularExpression),
+               let level = String(segment[match]).last?.wholeNumberValue
+            {
+                return .heading(runs, level: level)
+            }
+            if segment.range(of: #"(?i)<blockquote"#, options: .regularExpression) != nil { return .quote(runs) }
+            if segment.range(of: #"(?i)<li"#, options: .regularExpression) != nil { return .list(ordered: false, items: [runs]) }
+            if segment.range(of: #"(?i)<pre"#, options: .regularExpression) != nil { return .code(language: "", content: text) }
+            return .paragraph(runs, alignment: .leading)
+        }
+    }
+
+    private static func parseStructuredArticleHTML(_ source: String) -> [FocusArticleBlock] {
+        let html = source.replacingOccurrences(
+            of: #"(?is)<(script|style)[^>]*>.*?</\1>"#,
+            with: "",
+            options: .regularExpression
+        )
+        guard let tokenExpression = try? NSRegularExpression(pattern: #"(?s)<[^>]+>|[^<]+"#) else { return [] }
+
+        var blocks: [FocusArticleBlock] = []
+        var runs: [FocusRichTextRun] = []
+        var boldDepth = 0
+        var italicDepth = 0
+        var underlineDepth = 0
+        var strikeDepth = 0
+        var linkURL: URL?
+        var color: String?
+        var colorStack: [String?] = []
+        var alignment: FocusArticleTextAlignment = .leading
+        var headingLevel: Int?
+        var isQuote = false
+        var listOrdered: Bool?
+        var listItems: [[FocusRichTextRun]] = []
+        var codeLanguage = ""
+        var codeBuffer: String?
+
+        func trimmed(_ values: [FocusRichTextRun]) -> [FocusRichTextRun] {
+            var result = values
+            if let first = result.first,
+               case let .text(value, bold, italic, underline, strike, runColor, link) = first
+            {
+                result[0] = .text(
+                    value: value.trimmingCharacters(in: .whitespacesAndNewlines),
+                    bold: bold,
+                    italic: italic,
+                    underline: underline,
+                    strikethrough: strike,
+                    color: runColor,
+                    linkURL: link
+                )
+            }
+            if result.count > 1,
+               let last = result.last,
+               case let .text(value, bold, italic, underline, strike, runColor, link) = last
+            {
+                result[result.count - 1] = .text(
+                    value: value.trimmingCharacters(in: .whitespacesAndNewlines),
+                    bold: bold,
+                    italic: italic,
+                    underline: underline,
+                    strikethrough: strike,
+                    color: runColor,
+                    linkURL: link
+                )
+            }
+            return result.filter { !$0.plainText.isEmpty }
+        }
+
+        func flushRuns() {
+            let value = trimmed(runs)
+            runs.removeAll(keepingCapacity: true)
+            guard !value.isEmpty else { return }
+            if let headingLevel {
+                blocks.append(.heading(value, level: headingLevel))
+            } else if isQuote {
+                blocks.append(.quote(value))
+            } else if listOrdered != nil {
+                listItems.append(value)
+            } else {
+                blocks.append(.paragraph(value, alignment: alignment))
+            }
+        }
+
+        func flushList() {
+            flushRuns()
+            guard let ordered = listOrdered else { return }
+            if !listItems.isEmpty { blocks.append(.list(ordered: ordered, items: listItems)) }
+            listItems.removeAll(keepingCapacity: true)
+            listOrdered = nil
+        }
+
+        let fullRange = NSRange(html.startIndex ..< html.endIndex, in: html)
+        for match in tokenExpression.matches(in: html, range: fullRange) {
+            guard let tokenRange = Range(match.range, in: html) else { continue }
+            let token = String(html[tokenRange])
+            if !token.hasPrefix("<") {
+                let text = decodeArticleHTMLEntities(token)
+                if codeBuffer != nil {
+                    codeBuffer?.append(contentsOf: text)
+                } else if !text.isEmpty, !(runs.isEmpty && text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) {
+                    runs.append(.text(
+                        value: text,
+                        bold: boldDepth > 0,
+                        italic: italicDepth > 0,
+                        underline: underlineDepth > 0,
+                        strikethrough: strikeDepth > 0,
+                        color: color,
+                        linkURL: linkURL
+                    ))
+                }
+                continue
+            }
+
+            let closing = token.hasPrefix("</")
+            guard let tagRange = token.range(of: #"^</?\s*[A-Za-z0-9]+"#, options: .regularExpression) else { continue }
+            let tag = token[tagRange]
+                .trimmingCharacters(in: CharacterSet(charactersIn: "</> \t\r\n"))
+                .lowercased()
+            let attributes = parseArticleHTMLAttributes(token)
+
+            if closing {
+                switch tag {
+                case "strong", "b": boldDepth = max(0, boldDepth - 1)
+                case "em", "i": italicDepth = max(0, italicDepth - 1)
+                case "u": underlineDepth = max(0, underlineDepth - 1)
+                case "s", "del": strikeDepth = max(0, strikeDepth - 1)
+                case "span": color = colorStack.popLast() ?? nil
+                case "a": linkURL = nil
+                case "p", "div": flushRuns(); alignment = .leading
+                case "h1", "h2", "h3", "h4", "h5", "h6": flushRuns(); headingLevel = nil
+                case "blockquote": flushRuns(); isQuote = false
+                case "li": flushRuns()
+                case "ul", "ol": flushList()
+                case "pre":
+                    let code = codeBuffer?.trimmingCharacters(in: .newlines) ?? ""
+                    if !code.isEmpty { blocks.append(.code(language: codeLanguage, content: code)) }
+                    codeBuffer = nil
+                    codeLanguage = ""
+                case "figcaption":
+                    let caption = trimmed(runs).map(\.plainText).joined()
+                    runs.removeAll(keepingCapacity: true)
+                    if !caption.isEmpty, case let .image(url, width, height, _)? = blocks.last {
+                        blocks[blocks.count - 1] = .image(url: url, width: width, height: height, caption: caption)
+                    }
+                default: break
+                }
+                continue
+            }
+
+            switch tag {
+            case "strong", "b": boldDepth += 1
+            case "em", "i": italicDepth += 1
+            case "u": underlineDepth += 1
+            case "s", "del": strikeDepth += 1
+            case "span":
+                colorStack.append(color)
+                color = articleColor(from: attributes["style"]) ?? color
+            case "a": linkURL = normalizedArticleURL(attributes["href"])
+            case "br":
+                runs.append(.text(
+                    value: "\n",
+                    bold: boldDepth > 0,
+                    italic: italicDepth > 0,
+                    underline: underlineDepth > 0,
+                    strikethrough: strikeDepth > 0,
+                    color: color,
+                    linkURL: linkURL
+                ))
+            case "p", "div": flushRuns(); alignment = articleAlignment(from: attributes["style"])
+            case "h1", "h2", "h3", "h4", "h5", "h6":
+                flushRuns()
+                headingLevel = Int(tag.dropFirst()) ?? 2
+            case "blockquote": flushRuns(); isQuote = true
+            case "ul", "ol": flushList(); listOrdered = tag == "ol"
+            case "li": flushRuns()
+            case "pre":
+                flushRuns()
+                codeBuffer = ""
+                codeLanguage = attributes["data-lang"]?.components(separatedBy: "@").first
+                    ?? attributes["lang"]
+                    ?? ""
+                if let encoded = attributes["codecontent"] { codeBuffer = encoded.removingPercentEncoding ?? encoded }
+            case "hr": flushRuns(); blocks.append(.divider)
+            case "img":
+                let classes = attributes["class"] ?? ""
+                if classes.contains("cut-off") {
+                    flushRuns()
+                    blocks.append(.divider)
+                } else if let aid = attributes["aid"], classes.contains("card") {
+                    flushRuns()
+                    blocks.append(.resource(
+                        title: articleResourceTitle(classes),
+                        url: articleResourceURL(classes: classes, id: aid)
+                    ))
+                } else if let rawURL = attributes["data-src"] ?? attributes["data-original"] ?? attributes["src"],
+                          let url = normalizedArticleURL(rawURL)
+                {
+                    flushRuns()
+                    blocks.append(.image(
+                        url: url,
+                        width: Int(attributes["width"] ?? "") ?? 0,
+                        height: Int(attributes["height"] ?? "") ?? 0,
+                        caption: attributes["alt"] ?? ""
+                    ))
+                }
+            default: break
+            }
+        }
+
+        flushList()
+        flushRuns()
+        return blocks
+    }
+
+    private static func parseArticleHTMLAttributes(_ tag: String) -> [String: String] {
+        var attributes: [String: String] = [:]
+        let fullRange = NSRange(tag.startIndex ..< tag.endIndex, in: tag)
+        if let quoted = try? NSRegularExpression(
+            pattern: #"([A-Za-z0-9_:-]+)\s*=\s*([\"'])(.*?)\2"#,
+            options: .dotMatchesLineSeparators
+        ) {
+            for match in quoted.matches(in: tag, range: fullRange) {
+                guard
+                    let nameRange = Range(match.range(at: 1), in: tag),
+                    let valueRange = Range(match.range(at: 3), in: tag)
+                else { continue }
+                attributes[String(tag[nameRange]).lowercased()] = decodeArticleHTMLEntities(String(tag[valueRange]))
+            }
+        }
+        if let unquoted = try? NSRegularExpression(pattern: #"([A-Za-z0-9_:-]+)\s*=\s*([^\s>\"']+)"#) {
+            for match in unquoted.matches(in: tag, range: fullRange) {
+                guard
+                    let nameRange = Range(match.range(at: 1), in: tag),
+                    let valueRange = Range(match.range(at: 2), in: tag)
+                else { continue }
+                let name = String(tag[nameRange]).lowercased()
+                if attributes[name] == nil {
+                    attributes[name] = decodeArticleHTMLEntities(String(tag[valueRange]))
+                }
+            }
+        }
+        return attributes
+    }
+
+    private static func articleAlignment(from style: String?) -> FocusArticleTextAlignment {
+        let value = style?.lowercased() ?? ""
+        if value.range(of: #"text-align\s*:\s*center"#, options: .regularExpression) != nil { return .center }
+        if value.range(of: #"text-align\s*:\s*(right|end)"#, options: .regularExpression) != nil { return .trailing }
+        return .leading
+    }
+
+    private static func articleColor(from style: String?) -> String? {
+        guard
+            let style,
+            let range = style.range(of: #"(?i)color\s*:\s*([^;]+)"#, options: .regularExpression),
+            let value = style[range].split(separator: ":", maxSplits: 1).last
+        else { return nil }
+        return value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func articleResourceTitle(_ classes: String) -> String {
+        if classes.contains("video-card") { return "视频" }
+        if classes.contains("article-card") { return "专栏" }
+        if classes.contains("fanju-card") { return "番剧" }
+        if classes.contains("live-card") { return "直播" }
+        if classes.contains("music-card") { return "音频" }
+        return "站内内容"
+    }
+
+    private static func articleResourceURL(classes: String, id: String) -> URL {
+        let raw: String
+        if classes.contains("video-card") {
+            raw = "https://www.bilibili.com/video/av\(id.components(separatedBy: ",").first ?? id)"
+        } else if classes.contains("article-card") {
+            raw = "https://www.bilibili.com/read/cv\(id)"
+        } else if classes.contains("fanju-card") {
+            raw = "https://www.bilibili.com/bangumi/play/\(id)"
+        } else if classes.contains("live-card") {
+            raw = "https://live.bilibili.com/\(id)"
+        } else if classes.contains("music-card") {
+            raw = "https://www.bilibili.com/audio/\(id)"
+        } else {
+            raw = "https://www.bilibili.com/"
+        }
+        return URL(string: raw)!
+    }
+
+    private static func embeddedArticleResourceURL(kind: String, resource: [String: Any]) -> URL? {
+        let type = (resource.stringValue(at: "type") ?? kind).lowercased()
+        let bvid = resource.stringValue(at: "bvid") ?? resource.stringValue(at: "bv_id")
+        if let bvid { return URL(string: "https://www.bilibili.com/video/\(bvid)") }
+        if type.contains("video") || type.contains("archive") {
+            if let aid = resource.stringValue(at: "aid") ?? resource.stringValue(at: "id") ?? resource.int64Value(at: "aid").map(String.init) {
+                return URL(string: "https://www.bilibili.com/video/av\(aid.replacingOccurrences(of: "av", with: ""))")
+            }
+        }
+        if type.contains("article"),
+           let cvid = resource.stringValue(at: "cvid") ?? resource.stringValue(at: "id") ?? resource.int64Value(at: "id").map(String.init)
+        {
+            return URL(string: "https://www.bilibili.com/read/cv\(cvid.replacingOccurrences(of: "cv", with: ""))")
+        }
+        if type.contains("bangumi") || type.contains("pgc") || type.contains("episode"),
+           let episode = resource.stringValue(at: "ep_id") ?? resource.stringValue(at: "id") ?? resource.int64Value(at: "ep_id").map(String.init)
+        {
+            return URL(string: "https://www.bilibili.com/bangumi/play/ep\(episode.replacingOccurrences(of: "ep", with: ""))")
+        }
+        if type.contains("live"),
+           let room = resource.stringValue(at: "room_id") ?? resource.stringValue(at: "id") ?? resource.int64Value(at: "room_id").map(String.init)
+        {
+            return URL(string: "https://live.bilibili.com/\(room)")
+        }
+        if type.contains("audio") || type.contains("music"),
+           let audio = resource.stringValue(at: "auid") ?? resource.stringValue(at: "id") ?? resource.int64Value(at: "id").map(String.init)
+        {
+            return URL(string: "https://www.bilibili.com/audio/au\(audio.replacingOccurrences(of: "au", with: ""))")
+        }
+        return nil
+    }
+
+    private static func decodeArticleHTMLEntities(_ raw: String) -> String {
+        var result = raw
+            .replacingOccurrences(of: "&nbsp;", with: " ")
+            .replacingOccurrences(of: "&quot;", with: "\"")
+            .replacingOccurrences(of: "&#39;", with: "'")
+            .replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">")
+            .replacingOccurrences(of: "&amp;", with: "&")
+        guard let expression = try? NSRegularExpression(pattern: #"&#(x?[0-9A-Fa-f]+);"#) else { return result }
+        while let match = expression.firstMatch(in: result, range: NSRange(result.startIndex..., in: result)),
+              let fullRange = Range(match.range(at: 0), in: result),
+              let valueRange = Range(match.range(at: 1), in: result)
+        {
+            let value = String(result[valueRange])
+            let scalar = value.lowercased().hasPrefix("x")
+                ? UInt32(value.dropFirst(), radix: 16)
+                : UInt32(value, radix: 10)
+            result.replaceSubrange(fullRange, with: scalar.flatMap(UnicodeScalar.init).map(String.init) ?? "")
+        }
+        return result
+    }
+
+    private static func normalizedArticleURL(_ raw: String?) -> URL? {
+        guard let value = normalizedURLString(raw) else { return nil }
+        if value.hasPrefix("/") { return URL(string: "https://www.bilibili.com\(value)") }
+        return URL(string: value)
+    }
+
     private static func firstString(in rawValue: Any?) -> String? {
         if let string = rawValue as? String {
             return string
@@ -4315,6 +8107,48 @@ final class FocusMyDataService: @unchecked Sendable {
             }
         }
         return nil
+    }
+
+    private static func cleanText(_ raw: String?) -> String {
+        guard let raw else {
+            return ""
+        }
+        return raw
+            .replacingOccurrences(of: "<em class=\"keyword\">", with: "")
+            .replacingOccurrences(of: "</em>", with: "")
+            .replacingOccurrences(of: #"<[^>]+>"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: "&quot;", with: "\"")
+            .replacingOccurrences(of: "&amp;", with: "&")
+            .replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func formatCount(_ value: Int64) -> String {
+        switch value {
+        case 100_000_000...:
+            return String(format: "%.1f亿", Double(value) / 100_000_000).replacingOccurrences(of: ".0", with: "")
+        case 10_000...:
+            return String(format: "%.1f万", Double(value) / 10_000).replacingOccurrences(of: ".0", with: "")
+        default:
+            return "\(value)"
+        }
+    }
+
+    private static func formatVideoLength(_ length: String?, seconds: Int64?) -> String {
+        if let length = length?.nilIfBlank {
+            return length
+        }
+        guard let seconds, seconds > 0 else {
+            return ""
+        }
+        let hours = seconds / 3600
+        let minutes = (seconds % 3600) / 60
+        let remainingSeconds = seconds % 60
+        if hours > 0 {
+            return String(format: "%lld:%02lld:%02lld", hours, minutes, remainingSeconds)
+        }
+        return String(format: "%02lld:%02lld", minutes, remainingSeconds)
     }
 
     static func normalizedURLString(_ raw: String?) -> String? {
@@ -4352,6 +8186,14 @@ final class FocusMyViewModel: ObservableObject {
 
     deinit {
         task?.cancel()
+    }
+
+    func suspend() {
+        task?.cancel()
+        task = nil
+        if case .loading = state {
+            state = .idle
+        }
     }
 
     var navigationTitle: String {
@@ -4457,6 +8299,17 @@ final class FocusHistoryViewModel: ObservableObject {
         loadMoreTask?.cancel()
     }
 
+    func suspend() {
+        task?.cancel()
+        task = nil
+        loadMoreTask?.cancel()
+        loadMoreTask = nil
+        isLoadingMore = false
+        if case .loading = state {
+            state = .idle
+        }
+    }
+
     var navigationTitle: String {
         "播放历史"
     }
@@ -4465,6 +8318,13 @@ final class FocusHistoryViewModel: ObservableObject {
         if case .loaded = state {
             return
         }
+        guard case .loading = state else {
+            reload()
+            return
+        }
+    }
+
+    func refreshForAppearance() {
         guard case .loading = state else {
             reload()
             return
@@ -4570,11 +8430,26 @@ final class FocusUserSpaceViewModel: ObservableObject {
         loadMoreTask?.cancel()
     }
 
+    func suspend() {
+        task?.cancel()
+        task = nil
+        loadMoreTask?.cancel()
+        loadMoreTask = nil
+        isLoadingMoreVideos = false
+        if case .loading = state {
+            state = .idle
+        }
+    }
+
     var navigationTitle: String {
         if case let .loaded(page) = state, !page.profile.name.isEmpty {
             return page.profile.name
         }
         return "UP主空间"
+    }
+
+    var hasActiveLoadTask: Bool {
+        task.map { !$0.isCancelled } ?? false
     }
 
     func open(_ url: URL) {
@@ -4706,6 +8581,404 @@ final class FocusUserSpaceViewModel: ObservableObject {
         }
 
         return Int64(candidate)
+    }
+}
+
+@MainActor
+final class FocusFavoriteFolderViewModel: ObservableObject {
+    enum State {
+        case idle
+        case loading
+        case loginRequired
+        case failed(String)
+        case loaded(FocusMyFolder, [FocusMyFavoriteItem])
+    }
+
+    @Published private(set) var state: State = .idle
+    @Published private(set) var isLoadingMore = false
+
+    private let service: FocusMyDataService
+    private var folder: FocusMyFolder?
+    private var currentPage = 1
+    private var hasMore = false
+    private var task: Task<Void, Never>?
+    private var loadMoreTask: Task<Void, Never>?
+
+    init(service: FocusMyDataService) {
+        self.service = service
+    }
+
+    deinit {
+        task?.cancel()
+        loadMoreTask?.cancel()
+    }
+
+    func loadIfNeeded() {
+        guard folder != nil, case .idle = state else {
+            return
+        }
+        reload()
+    }
+
+    func suspend() {
+        task?.cancel()
+        task = nil
+        loadMoreTask?.cancel()
+        loadMoreTask = nil
+        isLoadingMore = false
+        if case .loading = state {
+            state = .idle
+        }
+    }
+
+    var navigationTitle: String {
+        switch state {
+        case let .loaded(folder, _):
+            return folder.title
+        default:
+            return folder?.title ?? "收藏夹"
+        }
+    }
+
+    func open(_ folder: FocusMyFolder) {
+        self.folder = folder
+        reload()
+    }
+
+    func reload() {
+        guard let folder else {
+            return
+        }
+        task?.cancel()
+        loadMoreTask?.cancel()
+        task = Task { [weak self] in
+            await self?.performLoad(folder: folder)
+        }
+    }
+
+    func loadMoreIfNeeded(currentItemID: String) {
+        guard case let .loaded(folder, items) = state else {
+            return
+        }
+        guard hasMore, !isLoadingMore else {
+            return
+        }
+        guard let index = items.firstIndex(where: { $0.id == currentItemID }), index >= items.count - 6 else {
+            return
+        }
+
+        isLoadingMore = true
+        let nextPage = currentPage + 1
+        loadMoreTask?.cancel()
+        loadMoreTask = Task { [weak self] in
+            guard let self else {
+                return
+            }
+            do {
+                let pageItems = try await service.fetchFolderContents(mediaID: folder.id, page: nextPage)
+                guard !Task.isCancelled else {
+                    return
+                }
+                var seen = Set<String>()
+                let merged = (items + pageItems).filter { seen.insert($0.id).inserted }
+                currentPage = nextPage
+                hasMore = pageItems.count >= 20
+                state = .loaded(folder, merged)
+            } catch {
+                // 保留已加载结果。
+            }
+            isLoadingMore = false
+        }
+    }
+
+    private func performLoad(folder: FocusMyFolder) async {
+        state = .loading
+        currentPage = 1
+        hasMore = false
+
+        do {
+            let items = try await service.fetchFolderContents(mediaID: folder.id, page: 1)
+            guard !Task.isCancelled else {
+                return
+            }
+            hasMore = items.count >= 20
+            state = .loaded(folder, items)
+        } catch let error as FocusMyServiceError {
+            guard !Task.isCancelled else {
+                return
+            }
+            switch error {
+            case .loginRequired:
+                state = .loginRequired
+            case let .message(message):
+                state = .failed(message)
+            }
+        } catch {
+            guard !Task.isCancelled else {
+                return
+            }
+            state = .failed(error.localizedDescription)
+        }
+    }
+}
+
+@MainActor
+final class FocusDynamicAuthorSettingsViewModel: ObservableObject {
+    enum State {
+        case idle
+        case loading
+        case loaded([DynamicCard.Author])
+        case failed(String)
+    }
+
+    @Published private(set) var state: State = .idle
+
+    private let service: FocusFollowingAuthorsService
+    private let fallbackAuthors: [DynamicCard.Author]
+    private var task: Task<Void, Never>?
+
+    init(service: FocusFollowingAuthorsService, fallbackAuthors: [DynamicCard.Author] = []) {
+        self.service = service
+        self.fallbackAuthors = Self.deduplicatedAuthors(fallbackAuthors)
+    }
+
+    deinit {
+        task?.cancel()
+    }
+
+    func loadIfNeeded() {
+        guard case .idle = state else {
+            return
+        }
+        reload()
+    }
+
+    func reload() {
+        task?.cancel()
+        task = Task { [weak self] in
+            guard let self else { return }
+            state = .loading
+            do {
+                let authors = try await service.fetchFollowingAuthors()
+                guard !Task.isCancelled else { return }
+                state = .loaded(Self.mergedAuthors(primary: authors, fallback: fallbackAuthors))
+            } catch {
+                guard !Task.isCancelled else { return }
+                if !fallbackAuthors.isEmpty {
+                    state = .loaded(fallbackAuthors)
+                } else {
+                    state = .failed(error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    private static func mergedAuthors(primary: [DynamicCard.Author], fallback: [DynamicCard.Author]) -> [DynamicCard.Author] {
+        deduplicatedAuthors(primary + fallback)
+    }
+
+    private static func deduplicatedAuthors(_ authors: [DynamicCard.Author]) -> [DynamicCard.Author] {
+        var seen = Set<String>()
+        var result: [DynamicCard.Author] = []
+        result.reserveCapacity(authors.count)
+
+        for author in authors {
+            let normalizedName = author.name.nilIfBlank ?? "UP主"
+            let normalized = DynamicCard.Author(mid: author.mid, name: normalizedName, avatarURL: author.avatarURL)
+            let key = normalized.filterIdentity
+            guard seen.insert(key).inserted else {
+                continue
+            }
+            result.append(normalized)
+        }
+
+        return result
+    }
+}
+
+final class FocusFollowingAuthorsService: @unchecked Sendable {
+    enum ServiceError: Error, LocalizedError {
+        case loginRequired
+        case invalidResponse
+        case message(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .loginRequired:
+                return "需要登录"
+            case .invalidResponse:
+                return "关注列表返回无效数据"
+            case let .message(message):
+                return message
+            }
+        }
+    }
+
+    private let cookieProvider: WebViewCookieSnapshotProvider
+    private let session: URLSession
+
+    init(cookieProvider: WebViewCookieSnapshotProvider) {
+        self.cookieProvider = cookieProvider
+        let configuration = URLSessionConfiguration.default
+        configuration.timeoutIntervalForRequest = 16
+        configuration.timeoutIntervalForResource = 24
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        self.session = URLSession(configuration: configuration)
+    }
+
+    func fetchFollowingAuthors() async throws -> [DynamicCard.Author] {
+        let nav = try await requestObject(urlString: "https://api.bilibili.com/x/web-interface/nav", referer: "https://www.bilibili.com/")
+        guard nav.intValue(at: "code") == 0, let mid = nav.int64Value(at: "data", "mid"), mid > 0 else {
+            throw ServiceError.loginRequired
+        }
+
+        var aggregated: [DynamicCard.Author] = []
+        var seen = Set<String>()
+
+        if let allFollowings = try? await fetchAllFollowingAuthors(mid: mid), !allFollowings.isEmpty {
+            for author in allFollowings {
+                let key = author.filterIdentity
+                guard seen.insert(key).inserted else {
+                    continue
+                }
+                aggregated.append(author)
+            }
+        }
+
+        let pageSize = FocusFollowingAuthorsPagination.pageSize
+        var page = 1
+        var expectedTotal: Int?
+        var fetchedFollowingCount = 0
+
+        while page <= FocusFollowingAuthorsPagination.maxPages {
+            let root: [String: Any]
+            do {
+                root = try await requestObject(
+                    urlString: "https://api.bilibili.com/x/relation/followings?vmid=\(mid)&pn=\(page)&ps=\(pageSize)&order=desc&order_type=attention",
+                    referer: "https://space.bilibili.com/\(mid)/fans/follow"
+                )
+            } catch {
+                if aggregated.isEmpty {
+                    throw error
+                }
+                break
+            }
+            if root.intValue(at: "code") == -101 {
+                throw ServiceError.loginRequired
+            }
+            guard root.intValue(at: "code") == 0 else {
+                if !aggregated.isEmpty {
+                    break
+                }
+                throw ServiceError.message(root.stringValue(at: "message") ?? "关注列表加载失败")
+            }
+
+            if expectedTotal == nil {
+                expectedTotal = root.intValue(at: "data", "total")
+            }
+
+            let pageAuthors = (root.arrayValue(at: "data", "list") ?? []).compactMap(Self.makeAuthor(from:))
+            fetchedFollowingCount += pageAuthors.count
+            for author in pageAuthors {
+                let key = author.filterIdentity
+                guard seen.insert(key).inserted else {
+                    continue
+                }
+                aggregated.append(author)
+            }
+
+            guard FocusFollowingAuthorsPagination.shouldLoadNextPage(
+                currentPage: page,
+                receivedCount: pageAuthors.count,
+                fetchedCount: fetchedFollowingCount,
+                expectedTotal: expectedTotal
+            ) else {
+                break
+            }
+            page += 1
+        }
+
+        return aggregated
+    }
+
+    private func fetchAllFollowingAuthors(mid: Int64) async throws -> [DynamicCard.Author] {
+        let root = try await requestObject(
+            urlString: "https://api.bilibili.com/x/web-interface/attentions?mid=\(mid)",
+            referer: "https://space.bilibili.com/\(mid)/fans/follow"
+        )
+        if root.intValue(at: "code") == -101 {
+            throw ServiceError.loginRequired
+        }
+        guard root.intValue(at: "code") == 0 else {
+            throw ServiceError.message(root.stringValue(at: "message") ?? "关注列表加载失败")
+        }
+
+        let list = root.arrayValue(at: "data", "list")
+            ?? root.arrayValue(at: "data")
+            ?? root.arrayValue(at: "list")
+            ?? []
+        return list.compactMap(Self.makeAuthor(from:))
+    }
+
+    private static func makeAuthor(from item: [String: Any]) -> DynamicCard.Author? {
+        let itemMid = item.int64Value(at: "mid") ?? item.int64Value(at: "uid") ?? 0
+        let name = item.stringValue(at: "uname")?.nilIfBlank ?? item.stringValue(at: "name")?.nilIfBlank ?? "UP主"
+        let avatarURL = URL(string: FocusMyDataService.normalizedURLString(item.stringValue(at: "face")) ?? "")
+        if itemMid <= 0, name == "UP主" {
+            return nil
+        }
+        return DynamicCard.Author(mid: itemMid, name: name, avatarURL: avatarURL)
+    }
+
+    private func requestObject(urlString: String, referer: String) async throws -> [String: Any] {
+        guard let url = URL(string: urlString) else {
+            throw ServiceError.invalidResponse
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 18
+        request.setValue(FocusNativePageAugmentService.userAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
+        request.setValue(referer, forHTTPHeaderField: "Referer")
+        let cookies = await cookieProvider.loadCookies()
+        if !cookies.isEmpty {
+            request.setValue(cookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; "), forHTTPHeaderField: "Cookie")
+        }
+        let (data, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse, (200 ... 299).contains(httpResponse.statusCode) else {
+            throw ServiceError.invalidResponse
+        }
+        let raw = try JSONSerialization.jsonObject(with: data)
+        guard let object = raw as? [String: Any] else {
+            throw ServiceError.invalidResponse
+        }
+        return object
+    }
+}
+
+enum FocusFollowingAuthorsPagination {
+    static let pageSize = 50
+    static let maxPages = 200
+
+    static func shouldLoadNextPage(
+        currentPage: Int,
+        receivedCount: Int,
+        fetchedCount: Int,
+        expectedTotal: Int?
+    ) -> Bool {
+        guard currentPage < maxPages, receivedCount > 0 else {
+            return false
+        }
+        if let expectedTotal {
+            return fetchedCount < expectedTotal
+        }
+        return receivedCount >= pageSize
+    }
+}
+
+extension DynamicCard.Author {
+    var filterIdentity: String {
+        mid > 0 ? "mid:\(mid)" : "name:\(name)"
     }
 }
 
@@ -5361,6 +9634,17 @@ final class FocusUserCollectionViewModel: ObservableObject {
         loadMoreTask?.cancel()
     }
 
+    func suspend() {
+        task?.cancel()
+        task = nil
+        loadMoreTask?.cancel()
+        loadMoreTask = nil
+        isLoadingMoreVideos = false
+        if case .loading = state {
+            state = .idle
+        }
+    }
+
     var navigationTitle: String {
         switch state {
         case let .loaded(page):
@@ -5498,11 +9782,23 @@ final class FocusArticleViewModel: ObservableObject {
         task?.cancel()
     }
 
+    func suspend() {
+        task?.cancel()
+        task = nil
+        if case .loading = state {
+            state = .idle
+        }
+    }
+
     var navigationTitle: String {
         if case let .loaded(page) = state, !page.title.isEmpty {
             return page.title
         }
         return "专栏"
+    }
+
+    var originalURL: URL? {
+        currentURL.flatMap { FocusArticleRouting.canonicalURL(for: $0) }
     }
 
     func open(_ url: URL) {
@@ -5599,7 +9895,7 @@ final class FocusArticleService: @unchecked Sendable {
         }
 
         let root = try await requestObject(
-            urlString: "https://api.bilibili.com/x/article/viewinfo?id=\(cvid)",
+            urlString: "https://api.bilibili.com/x/article/view?id=\(cvid)&mobi_app=pc&from=web",
             referer: url.absoluteString
         )
         let code = root.intValue(at: "code") ?? -1
@@ -5612,25 +9908,36 @@ final class FocusArticleService: @unchecked Sendable {
 
         let authorData = data.dictionaryValue(at: "author") ?? [:]
         let statsData = data.dictionaryValue(at: "stats") ?? [:]
-        let tags = (data.arrayValue(at: "tags") ?? []).compactMap {
+        var tags = (data.arrayValue(at: "tags") ?? []).compactMap {
             $0.stringValue(at: "name")?.nilIfBlank
         }
+        if let keywords = data.stringValue(at: "keywords") {
+            tags.append(contentsOf: keywords.split(whereSeparator: { $0 == "," || $0 == "，" }).map(String.init))
+        }
+        if let category = data.stringValue(at: "category", "name")?.nilIfBlank {
+            tags.append(category)
+        }
+        tags = Array(Set(tags.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })).sorted()
         let bannerURLString = Self.normalizedURLString(
             data.stringValue(at: "banner_url")
                 ?? Self.firstString(in: data["origin_image_urls"])
                 ?? Self.firstString(in: data["image_urls"])
         )
-        let htmlContent = Self.normalizedArticleHTML(data.stringValue(at: "content") ?? "")
+        let blocks = FocusMyDataService.parseArticleContent(data.stringValue(at: "content") ?? "")
+        guard !blocks.isEmpty else {
+            throw ServiceError.message("专栏正文为空或暂时无法解析")
+        }
+        let originalURL = URL(string: "https://www.bilibili.com/read/cv\(cvid)")!
 
         return FocusArticlePage(
             cvid: cvid,
             title: data.stringValue(at: "title")?.nilIfBlank ?? "专栏",
             author: FocusArticleAuthor(
-                mid: authorData.int64Value(at: "mid") ?? 0,
-                name: authorData.stringValue(at: "name")?.nilIfBlank ?? "作者",
-                avatarURL: URL(string: Self.normalizedURLString(authorData.stringValue(at: "face")) ?? "")
+                mid: authorData.int64Value(at: "mid") ?? data.int64Value(at: "mid") ?? 0,
+                name: authorData.stringValue(at: "name")?.nilIfBlank ?? data.stringValue(at: "author_name")?.nilIfBlank ?? "作者",
+                avatarURL: URL(string: Self.normalizedURLString(authorData.stringValue(at: "face") ?? data.stringValue(at: "author_face")) ?? "")
             ),
-            publishTime: data.int64Value(at: "publish_time") ?? 0,
+            publishTime: data.int64Value(at: "publish_time") ?? data.int64Value(at: "ctime") ?? 0,
             stats: FocusArticleStats(
                 views: statsData.int64Value(at: "view") ?? 0,
                 likes: statsData.int64Value(at: "like") ?? 0,
@@ -5640,7 +9947,8 @@ final class FocusArticleService: @unchecked Sendable {
             ),
             bannerURL: URL(string: bannerURLString ?? ""),
             tags: tags,
-            htmlContent: htmlContent
+            blocks: blocks,
+            originalURL: originalURL
         )
     }
 
@@ -5677,19 +9985,7 @@ final class FocusArticleService: @unchecked Sendable {
     }
 
     private static func extractCVID(from url: URL) -> Int64? {
-        let absoluteString = url.absoluteString
-        if let match = absoluteString.range(of: #"read/cv(\d+)"#, options: .regularExpression) {
-            let matched = String(absoluteString[match])
-            return Int64(matched.replacingOccurrences(of: "read/cv", with: ""))
-        }
-
-        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
-            return nil
-        }
-        return components.queryItems?
-            .first(where: { $0.name.caseInsensitiveCompare("id") == .orderedSame })?
-            .value
-            .flatMap(Int64.init)
+        FocusArticleRouting.extractCVID(from: url)
     }
 
     private static func normalizedArticleHTML(_ html: String) -> String {
@@ -5699,6 +9995,68 @@ final class FocusArticleService: @unchecked Sendable {
         return html
             .replacingOccurrences(of: #"(?i)src="//"#, with: #"src="https://"#, options: .regularExpression)
             .replacingOccurrences(of: #"(?i)href="//"#, with: #"href="https://"#, options: .regularExpression)
+            .replacingOccurrences(of: #"(?i)data-src="//"#, with: #"src="https://"#, options: .regularExpression)
+            .replacingOccurrences(of: #"(?i)data-src="/"#, with: #"src="https://www.bilibili.com/"#, options: .regularExpression)
+            .replacingOccurrences(of: #"(?i)data-original="//"#, with: #"src="https://"#, options: .regularExpression)
+            .replacingOccurrences(of: #"(?i)poster="//"#, with: #"poster="https://"#, options: .regularExpression)
+            .replacingOccurrences(of: #"(?i)src="/"#, with: #"src="https://www.bilibili.com/"#, options: .regularExpression)
+            .replacingOccurrences(of: #"(?i)href="/"#, with: #"href="https://www.bilibili.com/"#, options: .regularExpression)
+            .replacingOccurrences(of: #"(?i)<script[^>]*?>[\s\S]*?</script>"#, with: "", options: .regularExpression)
+    }
+
+    private static func parseArticleParagraphs(from html: String) -> [FocusOpusParagraph] {
+        guard !html.isEmpty else {
+            return []
+        }
+
+        var paragraphs: [FocusOpusParagraph] = []
+        let normalized = html
+            .replacingOccurrences(of: #"(?i)<br\s*/?>"#, with: "\n", options: .regularExpression)
+            .replacingOccurrences(of: #"(?i)</(p|div|h[1-6]|blockquote|li|ul|ol)>"#, with: "\n\n", options: .regularExpression)
+
+        let tokenized = normalized.replacingOccurrences(
+            of: #"(?i)<img[^>]+src=\"([^\"]+)\"[^>]*>"#,
+            with: "\n\n[[FOCUS_IMAGE::$1]]\n\n",
+            options: .regularExpression
+        )
+
+        let segments = tokenized
+            .components(separatedBy: "\n\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        for segment in segments {
+            if segment.hasPrefix("[[FOCUS_IMAGE::"), segment.hasSuffix("]]") {
+                let rawURL = String(segment.dropFirst("[[FOCUS_IMAGE::".count).dropLast(2))
+                if let normalizedURL = Self.normalizedURLString(rawURL) {
+                    paragraphs.append(
+                        FocusOpusParagraph(
+                            blocks: [.image([FocusOpusImage(id: normalizedURL, url: URL(string: normalizedURL), width: 0, height: 0)])]
+                        )
+                    )
+                }
+                continue
+            }
+
+            let text = segment
+                .replacingOccurrences(of: #"<[^>]+>"#, with: "", options: .regularExpression)
+                .replacingOccurrences(of: "&nbsp;", with: " ")
+                .replacingOccurrences(of: "&quot;", with: "\"")
+                .replacingOccurrences(of: "&amp;", with: "&")
+                .replacingOccurrences(of: "&lt;", with: "<")
+                .replacingOccurrences(of: "&gt;", with: ">")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else {
+                continue
+            }
+            paragraphs.append(
+                FocusOpusParagraph(
+                    blocks: [.text([.text(value: text)])]
+                )
+            )
+        }
+
+        return paragraphs
     }
 
     private static func firstString(in rawValue: Any?) -> String? {
@@ -5764,6 +10122,14 @@ final class FocusOpusDetailViewModel: ObservableObject {
 
     deinit {
         task?.cancel()
+    }
+
+    func suspend() {
+        task?.cancel()
+        task = nil
+        if case .loading = state {
+            state = .idle
+        }
     }
 
     var navigationTitle: String {
@@ -5928,11 +10294,24 @@ final class FocusOpusDetailService: @unchecked Sendable {
             return nil
         }
 
-        guard
-            let item = root.dictionaryValue(at: "data", "item"),
-            let modules = item.dictionaryValue(at: "modules"),
-            let dynamic = modules.dictionaryValue(at: "module_dynamic")
-        else {
+        guard let item = root.dictionaryValue(at: "data", "item") else {
+            return nil
+        }
+
+        let modules = item.dictionaryValue(at: "modules") ?? [:]
+        let dynamic = modules.dictionaryValue(at: "module_dynamic")
+        let forwardOrigin = item.dictionaryValue(at: "orig")
+            ?? item.dictionaryValue(at: "origin")
+            ?? dynamic?.dictionaryValue(at: "major", "archive")
+        let originModules = forwardOrigin?.dictionaryValue(at: "modules")
+
+        if let originModules,
+           let forwarded = parseForwardedDetail(from: originModules, fallbackID: opusID)
+        {
+            return forwarded
+        }
+
+        guard let dynamic else {
             return nil
         }
 
@@ -5940,10 +10319,17 @@ final class FocusOpusDetailService: @unchecked Sendable {
         let major = dynamic.dictionaryValue(at: "major")
 
         var blocks: [FocusOpusBlock] = []
-        if let text = dynamic.stringValue(at: "desc", "text") ?? major?.stringValue(at: "opus", "summary", "text"),
+        let richTextRuns = parseOpusTextNodes(
+            dynamic.arrayValue(at: "desc", "rich_text_nodes")
+                ?? dynamic.arrayValue(at: "desc", "rich_text_nodes_v2")
+                ?? []
+        )
+        if !richTextRuns.isEmpty {
+            blocks.append(.text(richTextRuns))
+        } else if let text = dynamic.stringValue(at: "desc", "text") ?? major?.stringValue(at: "opus", "summary", "text"),
            let normalizedText = text.nilIfBlank
         {
-            blocks.append(.text([FocusOpusTextNode(text: normalizedText, bold: false, linkURL: nil, emojiURL: nil)]))
+            blocks.append(.text([.text(value: normalizedText)]))
         }
 
         var images: [FocusOpusImage] = []
@@ -5993,6 +10379,73 @@ final class FocusOpusDetailService: @unchecked Sendable {
         )
     }
 
+    private func parseForwardedDetail(from modules: [String: Any], fallbackID: String) -> FocusOpusDetailContent? {
+        let author = modules.dictionaryValue(at: "module_author") ?? [:]
+        let dynamic = modules.dictionaryValue(at: "module_dynamic") ?? [:]
+        let major = dynamic.dictionaryValue(at: "major")
+
+        var blocks: [FocusOpusBlock] = []
+        let richTextRuns = parseOpusTextNodes(
+            dynamic.arrayValue(at: "desc", "rich_text_nodes")
+                ?? dynamic.arrayValue(at: "desc", "rich_text_nodes_v2")
+                ?? []
+        )
+        if !richTextRuns.isEmpty {
+            blocks.append(.text(richTextRuns))
+        } else if let text = dynamic.stringValue(at: "desc", "text") ?? major?.stringValue(at: "opus", "summary", "text"),
+           let normalizedText = text.nilIfBlank
+        {
+            blocks.append(.text([.text(value: normalizedText)]))
+        }
+
+        var images: [FocusOpusImage] = []
+        func appendPictures(from items: [[String: Any]], keys: [String]) {
+            for item in items {
+                let rawURL = keys.compactMap { item.stringValue(at: $0) }.first
+                guard let rawURL, let normalized = Self.normalizedURLString(rawURL) else {
+                    continue
+                }
+                images.append(
+                    FocusOpusImage(
+                        id: normalized,
+                        url: URL(string: normalized),
+                        width: item.intValue(at: "width") ?? 0,
+                        height: item.intValue(at: "height") ?? 0
+                    )
+                )
+            }
+        }
+
+        if let pics = major?.arrayValue(at: "opus", "pics") {
+            appendPictures(from: pics, keys: ["url", "src"])
+        }
+        if let drawItems = major?.arrayValue(at: "draw", "items") {
+            appendPictures(from: drawItems, keys: ["src", "url"])
+        }
+        if !images.isEmpty {
+            blocks.append(.image(images))
+        }
+
+        let paragraphs = parseParagraphs(modules: modules)
+        let resolvedParagraphs = paragraphs.isEmpty ? (blocks.isEmpty ? [] : [FocusOpusParagraph(blocks: blocks)]) : paragraphs
+        guard !resolvedParagraphs.isEmpty else {
+            return nil
+        }
+
+        return FocusOpusDetailContent(
+            id: dynamic.stringValue(at: "id_str") ?? fallbackID,
+            author: FocusOpusAuthor(
+                name: author.stringValue(at: "name") ?? "用户",
+                mid: author.int64Value(at: "mid") ?? 0,
+                avatarURL: URL(string: Self.normalizedURLString(author.stringValue(at: "face")) ?? "")
+            ),
+            publishTime: author.stringValue(at: "pub_time")
+                ?? author.stringValue(at: "pub_time_text")
+                ?? "",
+            paragraphs: resolvedParagraphs
+        )
+    }
+
     private func parseParagraphs(modules: [String: Any]) -> [FocusOpusParagraph] {
         let contentModule = modules.dictionaryValue(at: "module_content")
             ?? modules.dictionaryValue(at: "content")
@@ -6022,30 +10475,7 @@ final class FocusOpusDetailService: @unchecked Sendable {
             let nodes = paragraph.arrayValue(at: "text", "nodes")
                 ?? paragraph.arrayValue(at: "nodes")
                 ?? []
-            let textNodes = nodes.compactMap { node -> FocusOpusTextNode? in
-                let text = node.stringValue(at: "word", "words")
-                    ?? node.stringValue(at: "words")
-                    ?? node.stringValue(at: "text")
-                    ?? ""
-                let bold = (node.intValue(at: "word", "style", "bold") ?? 0) == 1
-                    || (node.intValue(at: "style", "bold") ?? 0) == 1
-                let linkURL = URL(string: Self.normalizedURLString(node.stringValue(at: "rich", "jump_url")
-                    ?? node.stringValue(at: "jump_url")) ?? "")
-                let emojiURL = URL(string: Self.normalizedURLString(node.stringValue(at: "rich", "emoji", "icon_url")
-                    ?? node.stringValue(at: "emoji", "icon_url")
-                    ?? node.stringValue(at: "icon_url")) ?? "")
-
-                guard !text.isEmpty || linkURL != nil || emojiURL != nil else {
-                    return nil
-                }
-
-                return FocusOpusTextNode(
-                    text: text,
-                    bold: bold,
-                    linkURL: linkURL,
-                    emojiURL: emojiURL
-                )
-            }
+            let textNodes = parseOpusTextNodes(nodes)
             return textNodes.isEmpty ? [] : [.text(textNodes)]
 
         case 2:
@@ -6078,6 +10508,56 @@ final class FocusOpusDetailService: @unchecked Sendable {
 
         default:
             return []
+        }
+    }
+
+    private func parseOpusTextNodes(_ nodes: [[String: Any]]) -> [FocusRichTextRun] {
+        nodes.compactMap { node -> FocusRichTextRun? in
+            let text = node.stringValue(at: "word", "words")
+                ?? node.stringValue(at: "words")
+                ?? node.stringValue(at: "text")
+                ?? node.stringValue(at: "orig_text")
+                ?? ""
+            let style = node.dictionaryValue(at: "word", "style") ?? node.dictionaryValue(at: "style") ?? [:]
+            let linkURL = URL(string: Self.normalizedURLString(
+                node.stringValue(at: "rich", "jump_url")
+                    ?? node.stringValue(at: "jump_url")
+                    ?? node.stringValue(at: "link")
+            ) ?? "")
+            let emojiURL = URL(string: Self.normalizedURLString(
+                node.stringValue(at: "rich", "emoji", "icon_url")
+                    ?? node.stringValue(at: "rich", "emoji", "url")
+                    ?? node.stringValue(at: "emoji", "icon_url")
+                    ?? node.stringValue(at: "emoji", "url")
+                    ?? node.stringValue(at: "icon_url")
+            ) ?? "")
+
+            if let emojiURL {
+                let path = emojiURL.path.lowercased()
+                let size = node.intValue(at: "rich", "emoji", "meta", "size")
+                    ?? node.intValue(at: "emoji", "meta", "size")
+                    ?? 0
+                return .emote(
+                    alt: text.isEmpty ? "[表情]" : text,
+                    url: emojiURL,
+                    width: node.intValue(at: "rich", "emoji", "width") ?? node.intValue(at: "emoji", "width") ?? size,
+                    height: node.intValue(at: "rich", "emoji", "height") ?? node.intValue(at: "emoji", "height") ?? size,
+                    animated: path.hasSuffix(".gif") || path.hasSuffix(".webp") || path.hasSuffix(".apng")
+                )
+            }
+            guard !text.isEmpty else {
+                if let linkURL { return .resource(label: "查看内容", url: linkURL) }
+                return nil
+            }
+            return .text(
+                value: text,
+                bold: (style.intValue(at: "bold") ?? 0) == 1,
+                italic: (style.intValue(at: "italic") ?? 0) == 1,
+                underline: (style.intValue(at: "underline") ?? 0) == 1,
+                strikethrough: (style.intValue(at: "strikethrough") ?? style.intValue(at: "strike") ?? 0) == 1,
+                color: style.stringValue(at: "color"),
+                linkURL: linkURL
+            )
         }
     }
 
@@ -6155,13 +10635,18 @@ final class FocusOpusDetailService: @unchecked Sendable {
 
 final class WebViewCookieSnapshotProvider: @unchecked Sendable, CookieSnapshotProvider {
     private let cookieStore: WKHTTPCookieStore
+    private let performsLoginWarmup: Bool
     private let lock = NSLock()
     private var snapshot: [HTTPCookie] = []
     private var hasCompletedInitialWarmup = false
 
     @MainActor
-    init(websiteDataStore: WKWebsiteDataStore = .default()) {
+    init(
+        websiteDataStore: WKWebsiteDataStore = .default(),
+        performsLoginWarmup: Bool = true
+    ) {
         self.cookieStore = websiteDataStore.httpCookieStore
+        self.performsLoginWarmup = performsLoginWarmup
     }
 
     func loadCookies() async -> [HTTPCookie] {
@@ -6178,7 +10663,7 @@ final class WebViewCookieSnapshotProvider: @unchecked Sendable, CookieSnapshotPr
         var cookies = await currentCookies()
         let shouldWarmUp = lock.withLock { !hasCompletedInitialWarmup }
 
-        if shouldWarmUp, !containsLikelyLoginCookies(in: cookies) {
+        if performsLoginWarmup, shouldWarmUp, !containsLikelyLoginCookies(in: cookies) {
             for delay in [180_000_000, 350_000_000, 700_000_000, 1_100_000_000] {
                 try? await Task.sleep(nanoseconds: UInt64(delay))
                 cookies = await currentCookies()

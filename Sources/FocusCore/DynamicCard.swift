@@ -9,10 +9,12 @@ public struct DynamicCard: Identifiable, Equatable, Sendable {
     }
 
     public struct Author: Equatable, Sendable {
+        public let mid: Int64
         public let name: String
         public let avatarURL: URL?
 
-        public init(name: String, avatarURL: URL?) {
+        public init(mid: Int64 = 0, name: String, avatarURL: URL?) {
+            self.mid = mid
             self.name = name
             self.avatarURL = avatarURL
         }

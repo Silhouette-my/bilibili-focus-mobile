@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.grid.LazyGridState
@@ -106,7 +107,7 @@ fun FocusFavFolderScreen(
                 } else {
                     LazyVerticalGrid(
                         state = gridState,
-                        columns = GridCells.Fixed(2),
+                        columns = GridCells.Adaptive(minSize = 156.dp),
                         modifier = Modifier.fillMaxSize().padding(innerPadding),
                         contentPadding = PaddingValues(16.dp),
                         horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -132,7 +133,7 @@ fun FocusFavFolderScreen(
 @Composable
 private fun FavResourceCard(resource: FavResource) {
     Column {
-        Box(modifier = Modifier.fillMaxWidth().height(104.dp)) {
+        Box(modifier = Modifier.fillMaxWidth().aspectRatio(16f / 9f)) {
             AsyncImage(
                 model = ImageRequest.Builder(LocalContext.current)
                     .data(resource.coverURL)

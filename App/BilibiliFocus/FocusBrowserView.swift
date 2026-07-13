@@ -1,16 +1,16 @@
 #if canImport(UIKit)
 import FocusCore
-import ImageIO
 import SwiftUI
 import UIKit
-import WebKit
 
 private enum FocusDesign {
-    static let primary = Color(red: 0.984, green: 0.447, blue: 0.600) // Bilibili pink #FB7299
-    static let primaryLight = primary.opacity(0.12)
-    static let primaryStroke = primary.opacity(0.22)
+    static var primary: Color { .accentColor }
+    static var primaryLight: Color { primary.opacity(0.12) }
+    static var primaryStroke: Color { primary.opacity(0.22) }
     static let tabInactive = Color(red: 0.55, green: 0.58, blue: 0.63) // #8C94A1
-    static let videoControlForeground = Color(red: 0.18, green: 0.21, blue: 0.27) // #2E3645
+    static let videoControlForeground = Color(uiColor: .label)
+    static let chromeButtonBackground = Color(uiColor: .secondarySystemBackground)
+    static let chromePanelBackground = Color(uiColor: .systemBackground)
 }
 
 struct FocusBrowserView: View {
@@ -18,8 +18,7 @@ struct FocusBrowserView: View {
     @StateObject private var settingsStore: FocusSettingsStore
     @StateObject private var viewModel: FocusAppViewModel
 
-    init() {
-        let store = FocusSettingsStore()
+    init(settingsStore store: FocusSettingsStore) {
         _settingsStore = StateObject(wrappedValue: store)
         _viewModel = StateObject(wrappedValue: FocusAppViewModel(settingsStore: store))
     }
@@ -27,19 +26,23 @@ struct FocusBrowserView: View {
     var body: some View {
         NavigationStack {
             ZStack {
-                browserLayer
-                nativeContentLayer
+                persistentDynamicFeedLayer
+
+                ZStack {
+                    browserLayer
+                    activeNativeContentLayer
+                }
+                .padding(
+                    .bottom,
+                    (viewModel.isBrowserActive || viewModel.isNativeVideoActive)
+                        ? bottomChromeContentInset(safeAreaBottom: FocusWindowMetrics.safeAreaBottom)
+                        : 0
+                )
             }
-            .padding(
-                .bottom,
-                viewModel.isBrowserActive
-                    ? bottomChromeContentInset(safeAreaBottom: FocusWindowMetrics.safeAreaBottom)
-                    : 0
-            )
             .overlay(alignment: .leading) {
-                if viewModel.isBrowserActive {
+                if viewModel.showsBackButton {
                     FocusEdgeSwipeBackArea {
-                        viewModel.handleBrowserBack()
+                        viewModel.handleTopLevelBack()
                     }
                 }
             }
@@ -70,7 +73,7 @@ struct FocusBrowserView: View {
 
                 ToolbarItem(placement: .topBarTrailing) {
                     HStack(spacing: 12) {
-                        if viewModel.isBrowserActive {
+                        if viewModel.isBrowserActive || viewModel.isNativeVideoActive {
                             Button {
                                 viewModel.reloadCurrent()
                             } label: {
@@ -87,7 +90,10 @@ struct FocusBrowserView: View {
                 }
             }
             .sheet(isPresented: $viewModel.showSettings) {
-                FocusSettingsView(settingsStore: settingsStore)
+                FocusSettingsView(
+                    settingsStore: settingsStore,
+                    dynamicAuthors: viewModel.dynamicFeedViewModel.knownAuthors
+                )
             }
             .sheet(isPresented: $viewModel.showSearch) {
                 FocusSearchEntryView(
@@ -97,16 +103,27 @@ struct FocusBrowserView: View {
             }
             .onAppear {
                 UIDevice.current.beginGeneratingDeviceOrientationNotifications()
-                viewModel.browserViewModel.handleDeviceOrientationChange(UIDevice.current.orientation)
+                if viewModel.isBrowserActive {
+                    viewModel.browserViewModel.handleDeviceOrientationChange(UIDevice.current.orientation)
+                }
             }
             .onDisappear {
                 UIDevice.current.endGeneratingDeviceOrientationNotifications()
             }
             .onReceive(NotificationCenter.default.publisher(for: UIDevice.orientationDidChangeNotification)) { _ in
+                guard viewModel.isBrowserActive else {
+                    return
+                }
                 viewModel.browserViewModel.handleDeviceOrientationChange(UIDevice.current.orientation)
             }
             .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
                 viewModel.handleAppDidBecomeActive()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
+                viewModel.handleAppWillResignActive()
+            }
+            .onChange(of: settingsStore.settings.nativeDanmakuEnabled) { enabled in
+                viewModel.applyNativeDanmakuPreference(enabled)
             }
             .task {
                 viewModel.handleLaunchEntryIfNeeded()
@@ -117,34 +134,72 @@ struct FocusBrowserView: View {
     private var browserLayer: some View {
         Group {
             if viewModel.hasInstantiatedBrowser {
-                FocusWebView(viewModel: viewModel.browserViewModel, settingsStore: settingsStore)
-                    .opacity(viewModel.isBrowserActive ? 1 : 0)
-                    .allowsHitTesting(viewModel.isBrowserActive)
-                    .accessibilityHidden(!viewModel.isBrowserActive)
+                ZStack {
+                    FocusWebView(viewModel: viewModel.browserViewModel, settingsStore: settingsStore)
+                        .background(colorScheme == .dark ? Color(red: 0.06, green: 0.07, blue: 0.09) : Color(red: 0.965, green: 0.969, blue: 0.98))
+
+                    if let message = viewModel.browserViewModel.webContentFailureMessage {
+                        FocusStateView(
+                            title: "网页加载失败",
+                            message: message,
+                            buttonTitle: "重新加载",
+                            action: viewModel.browserViewModel.retryAfterWebContentFailure
+                        )
+                        .background(colorScheme == .dark ? Color(red: 0.06, green: 0.07, blue: 0.09) : Color(red: 0.965, green: 0.969, blue: 0.98))
+                    } else if viewModel.browserViewModel.isLoadingPage && !viewModel.browserViewModel.showsNativeVideoControls {
+                        (colorScheme == .dark ? Color(red: 0.06, green: 0.07, blue: 0.09) : Color(red: 0.965, green: 0.969, blue: 0.98))
+                            .ignoresSafeArea()
+                            .overlay {
+                                ProgressView()
+                                    .scaleEffect(1.2)
+                            }
+                    }
+                }
+                .opacity(viewModel.isBrowserActive ? 1 : 0)
+                .allowsHitTesting(viewModel.isBrowserActive)
+                .accessibilityHidden(!viewModel.isBrowserActive)
             }
         }
     }
 
     @ViewBuilder
-    private var nativeContentLayer: some View {
-        ZStack {
+    private var persistentDynamicFeedLayer: some View {
+        if viewModel.hasDynamicFeedRoot {
             FocusDynamicFeedView(
                 viewModel: viewModel.dynamicFeedViewModel,
+                settingsStore: settingsStore,
+                isActive: viewModel.isDynamicFeedActive,
                 searchPrompt: viewModel.searchKeyword.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                     ? "搜索视频、UP主、直播"
                     : viewModel.searchKeyword,
                 onOpenCard: { card in
                     viewModel.open(card: card)
                 },
+                onOpenUser: { mid in
+                    guard mid > 0,
+                          let url = URL(string: "https://space.bilibili.com/\(mid)")
+                    else {
+                        return
+                    }
+                    viewModel.openNativeUserSpace(url)
+                },
                 onOpenLogin: viewModel.openLogin,
                 onSearch: {
-                    viewModel.showSearch = true
+                    viewModel.presentSearchEntry()
                 }
             )
-            .opacity(isDynamicRouteActive ? 1 : 0)
-            .allowsHitTesting(isDynamicRouteActive)
-            .accessibilityHidden(!isDynamicRouteActive)
+            .opacity(viewModel.isDynamicFeedActive ? 1 : 0)
+            .allowsHitTesting(viewModel.isDynamicFeedActive)
+            .accessibilityHidden(!viewModel.isDynamicFeedActive)
+        }
+    }
 
+    @ViewBuilder
+    private var activeNativeContentLayer: some View {
+        switch viewModel.route {
+        case .dynamicFeed:
+            EmptyView()
+        case .searchResults:
             FocusSearchResultsView(
                 viewModel: viewModel.searchResultsViewModel,
                 onOpenItem: { item in
@@ -154,37 +209,38 @@ struct FocusBrowserView: View {
                     viewModel.open(searchPreview: preview)
                 },
                 onEditQuery: {
-                    viewModel.showSearch = true
+                    viewModel.presentSearchEntry()
                 }
             )
-            .opacity(isSearchRouteActive ? 1 : 0)
-            .allowsHitTesting(isSearchRouteActive)
-            .accessibilityHidden(!isSearchRouteActive)
-
+        case .my:
             FocusMyView(
                 viewModel: viewModel.myViewModel,
                 onOpenLogin: viewModel.openLogin,
                 onOpenHistory: viewModel.openHistory,
+                onOpenFavoriteFolder: { folder in
+                    viewModel.openFavoriteFolder(folder)
+                },
                 onOpenVideo: { url in
                     viewModel.openMyVideo(url)
                 }
             )
-            .opacity(isMyRouteActive ? 1 : 0)
-            .allowsHitTesting(isMyRouteActive)
-            .accessibilityHidden(!isMyRouteActive)
-
+        case .history:
             FocusHistoryView(
                 viewModel: viewModel.historyViewModel,
                 onOpenVideo: { url in
                     viewModel.openMyVideo(url)
                 }
             )
-            .opacity(isHistoryRouteActive ? 1 : 0)
-            .allowsHitTesting(isHistoryRouteActive)
-            .accessibilityHidden(!isHistoryRouteActive)
-
+        case .favoriteFolder:
+            FocusFavoriteFolderView(
+                viewModel: viewModel.favoriteFolderViewModel,
+                onOpenVideo: { url in
+                    viewModel.openMyVideo(url)
+                }
+            )
+        case let .userSpace(routeID, _):
             FocusUserSpaceView(
-                viewModel: viewModel.userSpaceViewModel,
+                viewModel: viewModel.userSpaceViewModel(for: routeID),
                 onOpenVideo: { url in
                     viewModel.openOpusRelatedURL(url)
                 },
@@ -195,107 +251,71 @@ struct FocusBrowserView: View {
                     viewModel.openOpusRelatedURL(url)
                 }
             )
-            .opacity(isUserSpaceRouteActive ? 1 : 0)
-            .allowsHitTesting(isUserSpaceRouteActive)
-            .accessibilityHidden(!isUserSpaceRouteActive)
-
+        case let .userCollection(routeID, _):
             FocusUserCollectionView(
-                viewModel: viewModel.userCollectionViewModel,
+                viewModel: viewModel.userCollectionViewModel(for: routeID),
                 onOpenVideo: { url in
                     viewModel.openOpusRelatedURL(url)
                 }
             )
-            .opacity(isUserCollectionRouteActive ? 1 : 0)
-            .allowsHitTesting(isUserCollectionRouteActive)
-            .accessibilityHidden(!isUserCollectionRouteActive)
-
+        case let .article(routeID, _):
             FocusArticleView(
-                viewModel: viewModel.articleViewModel,
+                viewModel: viewModel.articleViewModel(for: routeID),
                 onOpenUser: { mid in
                     guard let url = URL(string: "https://space.bilibili.com/\(mid)") else {
                         return
                     }
                     viewModel.openNativeUserSpace(url)
-                }
+                },
+                onOpenURL: { url in viewModel.openOpusRelatedURL(url) },
+                onOpenWeb: { url in viewModel.openArticleInBrowser(url) }
             )
-            .opacity(isArticleRouteActive ? 1 : 0)
-            .allowsHitTesting(isArticleRouteActive)
-            .accessibilityHidden(!isArticleRouteActive)
-
+        case let .opus(routeID, _):
             FocusOpusDetailView(
-                viewModel: viewModel.opusDetailViewModel,
+                viewModel: viewModel.opusDetailViewModel(for: routeID),
                 onOpenURL: { url in
                     viewModel.openOpusRelatedURL(url)
                 }
             )
-            .opacity(isOpusRouteActive ? 1 : 0)
-            .allowsHitTesting(isOpusRouteActive)
-            .accessibilityHidden(!isOpusRouteActive)
+        case let .video(routeID, _):
+            FocusNativeVideoDetailView(
+                viewModel: viewModel.videoViewModel(for: routeID),
+                onOpenUser: { mid in
+                    guard let url = URL(string: "https://space.bilibili.com/\(mid)") else {
+                        return
+                    }
+                    viewModel.openNativeUserSpace(url)
+                },
+                onOpenVideo: { url in
+                    viewModel.openNativeVideo(url)
+                },
+                onOpenURL: { url in
+                    viewModel.openOpusRelatedURL(url)
+                },
+                onOpenWeb: { url in
+                    viewModel.openVideoInBrowser(url)
+                }
+            )
+        case .browser:
+            EmptyView()
         }
-    }
-
-    private var isDynamicRouteActive: Bool {
-        if case .dynamicFeed = viewModel.route {
-            return true
-        }
-        return false
-    }
-
-    private var isSearchRouteActive: Bool {
-        if case .searchResults(_) = viewModel.route {
-            return true
-        }
-        return false
-    }
-
-    private var isMyRouteActive: Bool {
-        if case .my = viewModel.route {
-            return true
-        }
-        return false
-    }
-
-    private var isHistoryRouteActive: Bool {
-        if case .history = viewModel.route {
-            return true
-        }
-        return false
-    }
-
-    private var isUserSpaceRouteActive: Bool {
-        if case .userSpace(_) = viewModel.route {
-            return true
-        }
-        return false
-    }
-
-    private var isUserCollectionRouteActive: Bool {
-        if case .userCollection(_) = viewModel.route {
-            return true
-        }
-        return false
-    }
-
-    private var isArticleRouteActive: Bool {
-        if case .article(_) = viewModel.route {
-            return true
-        }
-        return false
-    }
-
-    private var isOpusRouteActive: Bool {
-        if case .opus(_) = viewModel.route {
-            return true
-        }
-        return false
     }
 
     private func bottomChrome(safeAreaBottom: CGFloat) -> some View {
         let tabBottomPadding = bottomTabBarPadding(safeAreaBottom: safeAreaBottom)
-        let tabTopPadding = viewModel.isBrowserActive && viewModel.browserViewModel.showsNativeVideoControls ? 2.0 : 3.0
+        let hasVideoControls = (viewModel.isBrowserActive && viewModel.browserViewModel.showsNativeVideoControls)
+            || (viewModel.activeNativeVideoViewModel?.showsPlaybackControls == true)
+        let tabTopPadding = hasVideoControls ? 2.0 : 3.0
 
         return VStack(spacing: 0) {
-            if viewModel.isBrowserActive, viewModel.browserViewModel.showsNativeVideoControls {
+            if let nativeVideoViewModel = viewModel.activeNativeVideoViewModel,
+               nativeVideoViewModel.showsPlaybackControls
+            {
+                FocusNativeVideoControlDock(viewModel: nativeVideoViewModel)
+                    .padding(.horizontal, 12)
+                    .padding(.top, 8)
+                    .padding(.bottom, 8)
+            } else if viewModel.isBrowserActive, viewModel.browserViewModel.showsNativeVideoControls {
                 videoControls
                     .padding(.horizontal, 12)
                     .padding(.top, 8)
@@ -320,6 +340,9 @@ struct FocusBrowserView: View {
 
     private func bottomChromeContentInset(safeAreaBottom: CGFloat) -> CGFloat {
         let tabInset = 54 + bottomTabBarPadding(safeAreaBottom: safeAreaBottom)
+        if viewModel.activeNativeVideoViewModel?.showsPlaybackControls == true {
+            return tabInset + 74
+        }
         if viewModel.isBrowserActive, viewModel.browserViewModel.showsNativeVideoControls {
             return tabInset + 74
         }
@@ -345,7 +368,7 @@ struct FocusBrowserView: View {
                 systemImage: "magnifyingglass",
                 isSelected: viewModel.activePrimaryTab == .search
             ) {
-                viewModel.showSearch = true
+                viewModel.presentSearchEntry()
             }
 
             FocusPrimaryTabButton(
@@ -393,7 +416,7 @@ struct FocusBrowserView: View {
         .frame(maxWidth: .infinity)
         .background(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(Color.white.opacity(0.10))
+                .fill(FocusDesign.chromePanelBackground.opacity(colorScheme == .dark ? 0.18 : 0.32))
         )
     }
 }
@@ -415,34 +438,6 @@ private struct FocusEdgeSwipeBackArea: View {
                         onBack()
                     }
             )
-    }
-}
-
-private struct FocusVideoControlButton: View {
-    let systemImage: String
-    var title: String? = nil
-    let accessibilityLabel: String
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: title == nil ? 0 : 8) {
-                Image(systemName: systemImage)
-                    .font(.system(size: 15, weight: .semibold))
-                if let title {
-                    Text(title)
-                        .font(.subheadline.weight(.semibold))
-                }
-            }
-            .foregroundStyle(FocusDesign.videoControlForeground)
-            .frame(maxWidth: .infinity, minHeight: 42)
-            .background(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(Color.white.opacity(0.9))
-            )
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(accessibilityLabel)
     }
 }
 
@@ -498,19 +493,19 @@ private struct FocusBottomChromeBackground: View {
 
     var body: some View {
         ZStack(alignment: .top) {
-            FocusVisualEffectBlur(style: isDarkMode ? .systemChromeMaterialDark : .systemThinMaterialLight)
+            FocusVisualEffectBlur(style: isDarkMode ? .systemUltraThinMaterialDark : .systemUltraThinMaterialLight)
                 .ignoresSafeArea(edges: .bottom)
 
             Rectangle()
-                .fill(isDarkMode ? Color.white.opacity(0.02) : Color.white.opacity(0.16))
+                .fill(isDarkMode ? Color.black.opacity(0.14) : Color.white.opacity(0.24))
                 .ignoresSafeArea(edges: .bottom)
 
             Rectangle()
                 .fill(
                     LinearGradient(
                         colors: [
-                            isDarkMode ? Color.white.opacity(0.10) : Color.white.opacity(0.30),
-                            isDarkMode ? Color.white.opacity(0.02) : Color.white.opacity(0.08),
+                            isDarkMode ? Color.white.opacity(0.08) : Color.white.opacity(0.24),
+                            isDarkMode ? Color.black.opacity(0.04) : Color.white.opacity(0.06),
                             Color.clear
                         ],
                         startPoint: .top,
@@ -524,7 +519,7 @@ private struct FocusBottomChromeBackground: View {
                     LinearGradient(
                         colors: [
                             Color.clear,
-                            isDarkMode ? Color.white.opacity(0.03) : Color.white.opacity(0.13)
+                            isDarkMode ? Color.black.opacity(0.10) : Color.white.opacity(0.10)
                         ],
                         startPoint: .top,
                         endPoint: .bottom
@@ -539,8 +534,8 @@ private struct FocusBottomChromeBackground: View {
                     LinearGradient(
                         colors: [
                             Color.clear,
-                            isDarkMode ? Color.white.opacity(0.018) : Color.white.opacity(0.075),
-                            isDarkMode ? Color.white.opacity(0.018) : Color.white.opacity(0.075),
+                            isDarkMode ? Color.white.opacity(0.02) : Color.white.opacity(0.08),
+                            isDarkMode ? Color.white.opacity(0.02) : Color.white.opacity(0.08),
                             Color.clear
                         ],
                         startPoint: .leading,
@@ -551,400 +546,61 @@ private struct FocusBottomChromeBackground: View {
                 .ignoresSafeArea(edges: .bottom)
 
             Rectangle()
-                .fill(isDarkMode ? Color.white.opacity(0.12) : Color.white.opacity(0.52))
+                .fill(isDarkMode ? Color.white.opacity(0.08) : Color.white.opacity(0.34))
                 .frame(height: 0.5)
         }
     }
 }
 
-private struct FocusVisualEffectBlur: UIViewRepresentable {
-    let style: UIBlurEffect.Style
-
-    func makeUIView(context _: Context) -> UIVisualEffectView {
-        UIVisualEffectView(effect: UIBlurEffect(style: style))
-    }
-
-    func updateUIView(_ view: UIVisualEffectView, context _: Context) {
-        view.effect = UIBlurEffect(style: style)
-        view.clipsToBounds = true
-        view.backgroundColor = .clear
-    }
-}
-
-private enum FocusRemoteImagePhase {
-    case empty
-    case success(Image)
-    case failure
-}
-
-private struct FocusRemoteImage<Content: View>: View {
-    let url: URL?
-    let referer: String
-    let content: (FocusRemoteImagePhase) -> Content
-
-    @StateObject private var loader = FocusRemoteImageLoader()
-
-    init(
-        url: URL?,
-        referer: String = "https://www.bilibili.com/",
-        @ViewBuilder content: @escaping (FocusRemoteImagePhase) -> Content
-    ) {
-        self.url = url
-        self.referer = referer
-        self.content = content
-    }
-
-    var body: some View {
-        content(displayPhase)
-            .task(id: url) {
-                await loader.load(url: url, referer: referer)
-            }
-    }
-
-    private var displayPhase: FocusRemoteImagePhase {
-        if case .empty = loader.phase,
-           let url,
-           let cachedImage = FocusRemoteImageLoader.cachedUIImage(for: url)
-        {
-            return .success(Image(uiImage: cachedImage))
-        }
-
-        return loader.phase
-    }
-}
-
-private struct FocusRemoteImageWebFallback: UIViewRepresentable {
-    let url: URL?
-    let referer: String
-    var objectFit: String = "cover"
-
-    func makeUIView(context: Context) -> WKWebView {
-        let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = .default()
-        let webView = WKWebView(frame: .zero, configuration: configuration)
-        webView.isOpaque = false
-        webView.backgroundColor = .clear
-        webView.scrollView.isScrollEnabled = false
-        webView.scrollView.bounces = false
-        webView.scrollView.backgroundColor = .clear
-        webView.isUserInteractionEnabled = false
-        webView.customUserAgent = FocusUserAgent.mobileSafari()
-        return webView
-    }
-
-    func updateUIView(_ webView: WKWebView, context: Context) {
-        guard let url else {
-            webView.loadHTMLString("", baseURL: nil)
-            return
-        }
-
-        let escapedURL = url.absoluteString
-            .replacingOccurrences(of: "&", with: "&amp;")
-            .replacingOccurrences(of: "\"", with: "&quot;")
-        let html = """
-        <!doctype html>
-        <html>
-          <head>
-            <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-            <style>
-              html, body {
-                margin: 0;
-                padding: 0;
-                width: 100%;
-                height: 100%;
-                overflow: hidden;
-                background: transparent;
-              }
-
-              body {
-                display: flex;
-                align-items: stretch;
-                justify-content: stretch;
-              }
-
-              img {
-                width: 100%;
-                height: 100%;
-                object-fit: \(objectFit);
-                display: block;
-              }
-            </style>
-          </head>
-          <body>
-            <img src="\(escapedURL)" loading="eager" referrerpolicy="origin">
-          </body>
-        </html>
-        """
-
-        let baseURL = URL(string: referer) ?? URL(string: "https://www.bilibili.com/")
-        webView.loadHTMLString(html, baseURL: baseURL)
-    }
-}
-
-@MainActor
-private final class FocusRemoteImageLoader: ObservableObject {
-    private static let cache: NSCache<NSURL, UIImage> = {
-        let cache = NSCache<NSURL, UIImage>()
-        cache.countLimit = 192
-        cache.totalCostLimit = 48 * 1024 * 1024
-        return cache
-    }()
-    private static let session: URLSession = {
-        let configuration = URLSessionConfiguration.default
-        configuration.urlCache = URLCache(
-            memoryCapacity: 48 * 1024 * 1024,
-            diskCapacity: 256 * 1024 * 1024,
-            diskPath: "FocusRemoteImageCache"
-        )
-        configuration.requestCachePolicy = .returnCacheDataElseLoad
-        configuration.timeoutIntervalForRequest = 20
-        return URLSession(configuration: configuration)
-    }()
-
-    @Published fileprivate var phase: FocusRemoteImagePhase = .empty
-
-    private var currentURL: URL?
-    private var task: Task<Void, Never>?
-
-    deinit {
-        task?.cancel()
-    }
-
-    func load(url: URL?, referer: String) async {
-        task?.cancel()
-        currentURL = url
-
-        guard let url else {
-            phase = .failure
-            return
-        }
-
-        if let cachedImage = Self.cache.object(forKey: url as NSURL) {
-            phase = .success(Image(uiImage: cachedImage))
-            return
-        }
-
-        phase = .empty
-
-        task = Task {
-            do {
-                let uiImage = try await Self.fetchImage(from: url, preferredReferer: referer)
-                guard !Task.isCancelled, self.currentURL == url else {
-                    return
+private struct FocusScrollBounceDisabler: UIViewRepresentable {
+    func makeUIView(context _: Context) -> UIView {
+        let view = UIView(frame: .zero)
+        DispatchQueue.main.async {
+            var candidate: UIView? = view
+            while let current = candidate {
+                if let scrollView = current.superview?.superview as? UIScrollView {
+                    scrollView.bounces = false
+                    scrollView.alwaysBounceVertical = false
+                    break
                 }
+                candidate = current.superview
+            }
+        }
+        return view
+    }
 
-                Self.cache.setObject(uiImage, forKey: url as NSURL, cost: Self.cacheCost(for: uiImage))
-                phase = .success(Image(uiImage: uiImage))
-            } catch {
-                guard !Task.isCancelled else {
-                    return
+    func updateUIView(_ uiView: UIView, context _: Context) {
+        DispatchQueue.main.async {
+            var candidate: UIView? = uiView
+            while let current = candidate {
+                if let scrollView = current.superview?.superview as? UIScrollView {
+                    scrollView.bounces = false
+                    scrollView.alwaysBounceVertical = false
+                    break
                 }
-                phase = .failure
+                candidate = current.superview
             }
         }
-
-        await task?.value
-    }
-
-    static func cachedUIImage(for url: URL) -> UIImage? {
-        cache.object(forKey: url as NSURL)
-    }
-
-    private static func fetchImage(from url: URL, preferredReferer: String) async throws -> UIImage {
-        let cookieHeader = await cookieHeaderValue()
-        let referers = [preferredReferer, "https://t.bilibili.com/", "https://www.bilibili.com/", ""]
-
-        for referer in referers {
-            for candidate in imageURLCandidates(for: url) {
-                do {
-                    var request = URLRequest(url: candidate)
-                    request.timeoutInterval = 20
-                    if !referer.isEmpty {
-                        request.setValue(referer, forHTTPHeaderField: "Referer")
-                    }
-                    if let cookieHeader, !cookieHeader.isEmpty {
-                        request.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
-                    }
-                    request.httpShouldHandleCookies = true
-                    request.setValue(
-                        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
-                        forHTTPHeaderField: "User-Agent"
-                    )
-                    request.setValue("https://www.bilibili.com", forHTTPHeaderField: "Origin")
-                    request.setValue("image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
-                    request.setValue("zh-CN,zh-Hans;q=0.9", forHTTPHeaderField: "Accept-Language")
-
-                    let (data, response) = try await session.data(for: request)
-                    guard
-                        let httpResponse = response as? HTTPURLResponse,
-                        (200 ..< 300).contains(httpResponse.statusCode),
-                        let image = decodeImage(from: data)
-                    else {
-                        continue
-                    }
-
-                    return image
-                } catch {
-                    continue
-                }
-            }
-        }
-
-        throw URLError(.cannotDecodeContentData)
-    }
-
-    static func prefetch(urls: [URL], referer: String) {
-        Task(priority: .utility) { @MainActor in
-            for url in urls {
-                if cache.object(forKey: url as NSURL) != nil {
-                    continue
-                }
-
-                guard let image = try? await fetchImage(from: url, preferredReferer: referer) else {
-                    continue
-                }
-
-                cache.setObject(image, forKey: url as NSURL, cost: cacheCost(for: image))
-            }
-        }
-    }
-
-    private static func cacheCost(for image: UIImage) -> Int {
-        guard let cgImage = image.cgImage else {
-            return Int(image.size.width * image.size.height * image.scale * image.scale)
-        }
-
-        return cgImage.bytesPerRow * cgImage.height
-    }
-
-    private static func decodeImage(from data: Data) -> UIImage? {
-        guard
-            let source = CGImageSourceCreateWithData(data as CFData, nil)
-        else {
-            return nil
-        }
-
-        let options: [CFString: Any] = [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceThumbnailMaxPixelSize: 1280,
-        ]
-
-        if let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) {
-            return UIImage(cgImage: thumbnail)
-        }
-
-        guard let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
-            return nil
-        }
-
-        return UIImage(cgImage: cgImage)
-    }
-
-    private static func cookieHeaderValue() async -> String? {
-        let cookies = await withCheckedContinuation { continuation in
-            WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
-                continuation.resume(returning: cookies)
-            }
-        }
-
-        guard !cookies.isEmpty else {
-            return nil
-        }
-
-        return HTTPCookie.requestHeaderFields(with: cookies)["Cookie"]
-    }
-
-    private static func imageURLCandidates(for url: URL) -> [URL] {
-        var candidates: [URL] = [url]
-        let absoluteString = url.absoluteString
-        let isHDSlbImage = (url.host?.lowercased().contains("hdslb.com") == true)
-        var squareFallbackURL: URL?
-
-        if absoluteString.lowercased().hasPrefix("http://"),
-           let secureURL = URL(string: "https://" + absoluteString.dropFirst("http://".count))
-        {
-            candidates.insert(secureURL, at: 0)
-        }
-
-        if let atIndex = absoluteString.lastIndex(of: "@"),
-           let slashIndex = absoluteString[absoluteString.startIndex...].lastIndex(of: "/"),
-           atIndex > slashIndex,
-           let strippedURL = URL(string: String(absoluteString[..<atIndex]))
-        {
-            candidates.append(strippedURL)
-        }
-
-        if isHDSlbImage,
-           !absoluteString.contains("@"),
-           let optimizedURL = URL(string: absoluteString + "@480w_480h_1c.webp")
-        {
-            squareFallbackURL = optimizedURL
-        }
-
-        if var components = URLComponents(url: url, resolvingAgainstBaseURL: false),
-           components.query != nil
-        {
-            components.query = nil
-            if let querylessURL = components.url {
-                candidates.append(querylessURL)
-            }
-        }
-
-        let lowercasedPath = url.path.lowercased()
-        if lowercasedPath.hasSuffix(".avif") || lowercasedPath.hasSuffix(".webp") {
-            let baseString: String
-            if let dotIndex = absoluteString.lastIndex(of: ".") {
-                baseString = String(absoluteString[..<dotIndex])
-            } else {
-                baseString = absoluteString
-            }
-
-            ["jpg", "jpeg", "png"].forEach { `extension` in
-                if let candidate = URL(string: "\(baseString).\(`extension`)") {
-                    candidates.append(candidate)
-                }
-            }
-        }
-
-        if let squareFallbackURL {
-            candidates.append(squareFallbackURL)
-        }
-
-        let secureVariants = candidates.compactMap { candidate -> URL? in
-            let raw = candidate.absoluteString
-            guard raw.lowercased().hasPrefix("http://") else {
-                return nil
-            }
-            return URL(string: "https://" + String(raw.dropFirst("http://".count)))
-        }
-        if !secureVariants.isEmpty {
-            candidates.insert(contentsOf: secureVariants, at: 0)
-        }
-
-        var deduplicated: [URL] = []
-        var seen = Set<String>()
-        for candidate in candidates {
-            guard seen.insert(candidate.absoluteString).inserted else {
-                continue
-            }
-            deduplicated.append(candidate)
-        }
-        return deduplicated
     }
 }
 
 private struct FocusDynamicFeedView: View {
     @ObservedObject var viewModel: FocusDynamicFeedViewModel
+    @ObservedObject var settingsStore: FocusSettingsStore
+    let isActive: Bool
     let searchPrompt: String
     let onOpenCard: (DynamicCard) -> Void
+    let onOpenUser: (Int64) -> Void
     let onOpenLogin: () -> Void
     let onSearch: () -> Void
-
+    @State private var galleryRequest: FocusImageGalleryRequest?
     var body: some View {
         content
             .task {
                 viewModel.loadIfNeeded()
+            }
+            .fullScreenCover(item: $galleryRequest) { request in
+                FocusImageGalleryView(request: request)
             }
     }
 
@@ -956,29 +612,64 @@ private struct FocusDynamicFeedView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
 
         case let .loaded(cards):
-            if cards.isEmpty {
-                FocusStateView(
-                    title: "暂无可显示的关注动态",
-                    message: "当前页面没有拿到内容，稍后可以再刷新一次。",
-                    buttonTitle: "重新加载",
-                    action: viewModel.reload
-                )
-            } else {
-                ScrollView {
-                    LazyVStack(spacing: 12) {
-                        FocusSearchQueryButton(
-                            title: searchPrompt,
-                            inactiveAccessorySystemImage: "chevron.right",
-                            action: onSearch
-                        )
+            let filteredCards = visibleCards(from: cards)
+            ScrollView {
+                LazyVStack(spacing: 12) {
+                    FocusSearchQueryButton(
+                        title: searchPrompt,
+                        inactiveAccessorySystemImage: "chevron.right",
+                        action: onSearch
+                    )
 
-                        ForEach(cards) { card in
-                            Button {
-                                onOpenCard(card)
-                            } label: {
-                                FocusDynamicCardView(card: card)
+                    Picker(
+                        "动态分类",
+                        selection: Binding(
+                            get: { viewModel.selectedFilter },
+                            set: { filter in
+                                viewModel.selectFilter(filter)
                             }
-                            .buttonStyle(.plain)
+                        )
+                    ) {
+                        ForEach(FocusDynamicFilterKind.allCases, id: \.self) { filter in
+                            Text(filter.title).tag(filter)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+
+                    if filteredCards.isEmpty {
+                        VStack(spacing: 12) {
+                            Text("暂无可显示的关注动态")
+                                .font(.headline)
+
+                            Text("当前筛选条件下没有可显示的动态。你可以切换分类，或在设置里调整每个 UP 主的显示类别。")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                                .multilineTextAlignment(.center)
+
+                            Button("重新加载", action: viewModel.reload)
+                                .buttonStyle(.borderedProminent)
+                        }
+                        .padding(.horizontal, 18)
+                        .padding(.vertical, 28)
+                        .frame(maxWidth: .infinity)
+                        .background(
+                            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                .fill(Color(uiColor: .secondarySystemGroupedBackground))
+                        )
+                    } else {
+                        ForEach(filteredCards) { card in
+                            FocusDynamicCardView(
+                                card: card,
+                                onOpenCard: { onOpenCard(card) },
+                                onOpenUser: onOpenUser,
+                                onOpenImage: { index in
+                                    galleryRequest = FocusImageGalleryRequest(
+                                        urls: card.coverURLs,
+                                        initialIndex: index,
+                                        referer: card.targetURL.absoluteString
+                                    )
+                                }
+                            )
                             .onAppear {
                                 viewModel.loadMoreIfNeeded(currentCardID: card.id)
                             }
@@ -990,33 +681,39 @@ private struct FocusDynamicFeedView: View {
                                 .padding(.vertical, 12)
                         }
                     }
-                    .padding(.horizontal, 16)
-                    .padding(.top, 14)
-                    .padding(.bottom, 126)
                 }
-                .background(Color(uiColor: .systemGroupedBackground))
-                .refreshable {
-                    await viewModel.refresh()
+                .padding(.horizontal, 16)
+                .padding(.top, 14)
+                .padding(.bottom, 126)
+                .background {
+                    FocusDynamicFeedScrollBridge(
+                        offsetY: viewModel.scrollOffsetY,
+                        restorationRevision: viewModel.scrollRestorationRevision,
+                        isActive: isActive,
+                        onOffsetChange: { offsetY in
+                            viewModel.updateScrollOffset(offsetY)
+                        }
+                    )
+                    .frame(width: 1, height: 1)
                 }
-                .task(id: cards.map(\.id)) {
-                    prefetchImages(for: cards)
-                }
+            }
+            .background(Color(uiColor: .systemGroupedBackground))
+            .id("dynamic-feed-scroll")
+            .refreshable {
+                await viewModel.refresh()
+            }
+            .task(id: filteredCards.map(\.id)) {
+                await prefetchImages(for: filteredCards)
             }
 
         case let .loginRequired(message):
-            VStack(spacing: 12) {
-                FocusStateView(
-                    title: "需要登录",
-                    message: "\(message)\n先点“去登录”，网页登录完成后再回来刷新。",
-                    buttonTitle: "重新检测登录态",
-                    action: viewModel.reload
-                )
-
-                Button("去登录") {
-                    onOpenLogin()
-                }
-                .buttonStyle(.borderedProminent)
-            }
+            FocusLoginRequiredView(
+                title: "需要登录",
+                message: "\(message)\n先点“去登录”，网页登录完成后再回来刷新。",
+                reloadTitle: "重新检测登录态",
+                reloadAction: viewModel.reload,
+                loginAction: onOpenLogin
+            )
 
         case let .failed(message):
             FocusStateView(
@@ -1028,69 +725,385 @@ private struct FocusDynamicFeedView: View {
         }
     }
 
-    private func prefetchImages(for cards: [DynamicCard]) {
+    private func prefetchImages(for cards: [DynamicCard]) async {
         for card in cards.prefix(8) {
             let urls = ([card.author.avatarURL] + Array(card.coverURLs.prefix(2))).compactMap { $0 }
             guard !urls.isEmpty else {
                 continue
             }
-            FocusRemoteImageLoader.prefetch(urls: urls, referer: card.targetURL.absoluteString)
+            await FocusRemoteImageLoader.prefetch(urls: urls, referer: card.targetURL.absoluteString)
         }
+    }
+
+    private func visibleCards(from cards: [DynamicCard]) -> [DynamicCard] {
+        cards.filter { card in
+            let authorKinds = settingsStore.dynamicKinds(for: card.author)
+            let normalizedKind = normalizedFilterKind(for: card)
+            guard authorKinds.contains(normalizedKind) else {
+                return false
+            }
+            switch viewModel.selectedFilter {
+            case .all:
+                return true
+            case .video:
+                return normalizedKind == .video
+            case .articleLike:
+                return normalizedKind == .articleLike
+            }
+        }
+    }
+
+    private func normalizedFilterKind(for card: DynamicCard) -> FocusDynamicFilterKind {
+        switch card.kind {
+        case .video:
+            return .video
+        case .text, .image, .articleLike:
+            return .articleLike
+        }
+    }
+}
+
+enum FocusDynamicFeedScrollRestorationPolicy {
+    struct Placement: Equatable {
+        let contentOffsetY: CGFloat
+        let normalizedOffsetY: CGFloat
+        let reachedTarget: Bool
+    }
+
+    static func shouldPersistObservedOffset(
+        isTracking: Bool,
+        isDragging: Bool,
+        isDecelerating: Bool,
+        isPanActive: Bool
+    ) -> Bool {
+        isTracking || isDragging || isDecelerating || isPanActive
+    }
+
+    static func normalizedOffset(contentOffsetY: CGFloat, minimumY: CGFloat) -> CGFloat {
+        max(contentOffsetY - minimumY, 0)
+    }
+
+    static func placement(
+        requestedOffsetY: CGFloat,
+        minimumY: CGFloat,
+        maximumY: CGFloat
+    ) -> Placement {
+        let normalizedRequest = max(requestedOffsetY, 0)
+        let maximumOffsetY = max(maximumY - minimumY, 0)
+        let restoredOffsetY = min(normalizedRequest, maximumOffsetY)
+        return Placement(
+            contentOffsetY: minimumY + restoredOffsetY,
+            normalizedOffsetY: restoredOffsetY,
+            reachedTarget: normalizedRequest <= maximumOffsetY + 1
+        )
+    }
+}
+
+private struct FocusDynamicFeedScrollBridge: UIViewRepresentable {
+    let offsetY: CGFloat
+    let restorationRevision: Int
+    let isActive: Bool
+    let onOffsetChange: @MainActor (CGFloat) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    func makeUIView(context: Context) -> FocusDynamicFeedScrollProbeView {
+        let view = FocusDynamicFeedScrollProbeView()
+        view.isUserInteractionEnabled = false
+        context.coordinator.update(
+            probe: view,
+            offsetY: offsetY,
+            restorationRevision: restorationRevision,
+            isActive: isActive,
+            onOffsetChange: onOffsetChange
+        )
+        return view
+    }
+
+    func updateUIView(_ uiView: FocusDynamicFeedScrollProbeView, context: Context) {
+        context.coordinator.update(
+            probe: uiView,
+            offsetY: offsetY,
+            restorationRevision: restorationRevision,
+            isActive: isActive,
+            onOffsetChange: onOffsetChange
+        )
+    }
+
+    static func dismantleUIView(
+        _ uiView: FocusDynamicFeedScrollProbeView,
+        coordinator: Coordinator
+    ) {
+        uiView.onDidMoveToWindow = nil
+        coordinator.detach()
+    }
+
+    @MainActor
+    final class Coordinator {
+        private weak var scrollView: UIScrollView?
+        private var observation: NSKeyValueObservation?
+        private var restorationWorkItem: DispatchWorkItem?
+        private var appliedRestorationRevision: Int?
+        private var requestedOffsetY: CGFloat = 0
+        private var restorationRevision = 0
+        private var restorationGeneration = 0
+        private var isActive = false
+        private var onOffsetChange: (@MainActor (CGFloat) -> Void)?
+
+        func update(
+            probe: FocusDynamicFeedScrollProbeView,
+            offsetY: CGFloat,
+            restorationRevision: Int,
+            isActive: Bool,
+            onOffsetChange: @escaping @MainActor (CGFloat) -> Void
+        ) {
+            let shouldFreezeCurrentPosition = self.isActive && !isActive
+            requestedOffsetY = max(offsetY, 0)
+            self.restorationRevision = restorationRevision
+            self.isActive = isActive
+            self.onOffsetChange = onOffsetChange
+            if shouldFreezeCurrentPosition {
+                freezeCurrentPosition()
+            }
+            probe.onDidMoveToWindow = { [weak self] probe in
+                guard probe.window != nil else {
+                    self?.detach()
+                    return
+                }
+                self?.attachIfPossible(from: probe)
+            }
+            DispatchQueue.main.async { [weak self, weak probe] in
+                guard let self, let probe, probe.window != nil else {
+                    return
+                }
+                self.attachIfPossible(from: probe)
+            }
+        }
+
+        private func attachIfPossible(from probe: UIView) {
+            guard probe.window != nil,
+                  let resolvedScrollView = probe.enclosingScrollView
+            else {
+                return
+            }
+            if scrollView !== resolvedScrollView {
+                detach()
+                scrollView = resolvedScrollView
+                appliedRestorationRevision = nil
+                observation = resolvedScrollView.observe(\.contentOffset, options: [.new]) { [weak self] scrollView, change in
+                    // UIScrollView can only mutate its geometry on the main thread, so
+                    // its synchronous KVO callback is safe to handle on MainActor.
+                    MainActor.assumeIsolated {
+                        guard let self else {
+                            return
+                        }
+                        guard self.isActive else {
+                            return
+                        }
+                        // SwiftUI may change contentOffset while removing the hierarchy
+                        // or recalculating safe-area insets. Only a gesture-driven change
+                        // is a position the user intentionally chose and is safe to persist.
+                        let panState = scrollView.panGestureRecognizer.state
+                        let isUserDriven = FocusDynamicFeedScrollRestorationPolicy.shouldPersistObservedOffset(
+                            isTracking: scrollView.isTracking,
+                            isDragging: scrollView.isDragging,
+                            isDecelerating: scrollView.isDecelerating,
+                            isPanActive: panState == .began || panState == .changed
+                        )
+                        guard isUserDriven else {
+                            return
+                        }
+                        let contentOffsetY = change.newValue?.y ?? scrollView.contentOffset.y
+                        let minimumY = -scrollView.adjustedContentInset.top
+                        let normalizedOffsetY = FocusDynamicFeedScrollRestorationPolicy.normalizedOffset(
+                            contentOffsetY: contentOffsetY,
+                            minimumY: minimumY
+                        )
+                        // A real gesture wins over a pending delayed restoration.
+                        self.cancelRestoration()
+                        self.requestedOffsetY = normalizedOffsetY
+                        self.onOffsetChange?(normalizedOffsetY)
+                    }
+                }
+            }
+            guard appliedRestorationRevision != restorationRevision else {
+                return
+            }
+            appliedRestorationRevision = restorationRevision
+            startRestoration()
+        }
+
+        func detach() {
+            cancelRestoration()
+            observation?.invalidate()
+            observation = nil
+            scrollView = nil
+            appliedRestorationRevision = nil
+        }
+
+        private func startRestoration() {
+            cancelRestoration()
+            restorationGeneration &+= 1
+            restoreOffset(attempt: 0, generation: restorationGeneration)
+        }
+
+        private func cancelRestoration() {
+            restorationGeneration &+= 1
+            restorationWorkItem?.cancel()
+            restorationWorkItem = nil
+        }
+
+        private func freezeCurrentPosition() {
+            guard let scrollView else {
+                return
+            }
+
+            cancelRestoration()
+            let contentOffset = scrollView.contentOffset
+            scrollView.setContentOffset(contentOffset, animated: false)
+            let minimumY = -scrollView.adjustedContentInset.top
+            let normalizedOffsetY = FocusDynamicFeedScrollRestorationPolicy.normalizedOffset(
+                contentOffsetY: contentOffset.y,
+                minimumY: minimumY
+            )
+            requestedOffsetY = normalizedOffsetY
+            onOffsetChange?(normalizedOffsetY)
+        }
+
+        private func restoreOffset(attempt: Int, generation: Int) {
+            guard generation == restorationGeneration,
+                  let scrollView,
+                  scrollView.window != nil
+            else {
+                return
+            }
+
+            scrollView.layoutIfNeeded()
+            let minimumY = -scrollView.adjustedContentInset.top
+            let maximumY = max(
+                minimumY,
+                scrollView.contentSize.height
+                    - scrollView.bounds.height
+                    + scrollView.adjustedContentInset.bottom
+            )
+            let placement = FocusDynamicFeedScrollRestorationPolicy.placement(
+                requestedOffsetY: requestedOffsetY,
+                minimumY: minimumY,
+                maximumY: maximumY
+            )
+            scrollView.setContentOffset(
+                CGPoint(x: scrollView.contentOffset.x, y: placement.contentOffsetY),
+                animated: false
+            )
+
+            guard !placement.reachedTarget else {
+                restorationWorkItem = nil
+                return
+            }
+
+            // LazyVStack initially reports only a partial content height. Keep the
+            // original target intact while it materializes instead of saving the
+            // temporary clamped offset and jumping to it on the next update.
+            guard attempt < 30 else {
+                restorationWorkItem = nil
+                requestedOffsetY = placement.normalizedOffsetY
+                onOffsetChange?(placement.normalizedOffsetY)
+                return
+            }
+
+            let workItem = DispatchWorkItem { [weak self] in
+                guard let self else {
+                    return
+                }
+                self.restoreOffset(attempt: attempt + 1, generation: generation)
+            }
+            restorationWorkItem = workItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: workItem)
+        }
+    }
+}
+
+private final class FocusDynamicFeedScrollProbeView: UIView {
+    var onDidMoveToWindow: ((FocusDynamicFeedScrollProbeView) -> Void)?
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        onDidMoveToWindow?(self)
+    }
+}
+
+private extension UIView {
+    var enclosingScrollView: UIScrollView? {
+        var candidate = superview
+        while let current = candidate {
+            if let scrollView = current as? UIScrollView {
+                return scrollView
+            }
+            candidate = current.superview
+        }
+        return nil
     }
 }
 
 private struct FocusDynamicCardView: View {
     let card: DynamicCard
+    let onOpenCard: () -> Void
+    let onOpenUser: (Int64) -> Void
+    let onOpenImage: (Int) -> Void
+    @State private var areImagesExpanded = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 12) {
-                avatar
+                Button {
+                    guard card.author.mid > 0 else {
+                        return
+                    }
+                    onOpenUser(card.author.mid)
+                } label: {
+                    avatar
+                }
+                .buttonStyle(.plain)
+                .disabled(card.author.mid <= 0)
+                .accessibilityLabel("打开\(card.author.name)的个人主页")
 
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(card.author.name)
-                        .font(.headline)
-                        .foregroundStyle(.primary)
+                Button(action: onOpenCard) {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(card.author.name)
+                                .font(.headline)
+                                .foregroundStyle(.primary)
 
-                    HStack(spacing: 8) {
-                        if !card.publishTime.isEmpty {
-                            Text(card.publishTime)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                            HStack(spacing: 8) {
+                                if !card.publishTime.isEmpty {
+                                    Text(card.publishTime)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+
+                                FocusKindBadge(kind: card.kind)
+                            }
                         }
 
-                        FocusKindBadge(kind: card.kind)
+                        Spacer(minLength: 0)
                     }
+                    .contentShape(Rectangle())
                 }
-
-                Spacer(minLength: 0)
+                .buttonStyle(.plain)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
 
             if !card.text.isEmpty {
-                Text(card.text)
-                    .font(.body)
-                    .foregroundStyle(.primary)
-                    .multilineTextAlignment(.leading)
+                FocusExpandableDynamicText(
+                    text: card.text,
+                    onOpenCard: onOpenCard
+                )
             }
 
             if !card.coverURLs.isEmpty {
-                if let firstURL = card.coverURLs.first, card.coverURLs.count == 1 {
-                    FocusDynamicMediaCover(
-                        url: firstURL,
-                        referer: card.targetURL.absoluteString,
-                        height: 176
-                    )
-                } else {
-                    LazyVGrid(columns: coverColumns, spacing: 10) {
-                        ForEach(Array(card.coverURLs.enumerated()), id: \.offset) { item in
-                            FocusDynamicMediaCover(
-                                url: item.element,
-                                referer: card.targetURL.absoluteString,
-                                height: coverHeight(for: card.coverURLs.count, index: item.offset)
-                            )
-                        }
-                    }
-                }
+                covers
             }
         }
         .padding(16)
@@ -1102,8 +1115,58 @@ private struct FocusDynamicCardView: View {
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
     }
 
-    private var coverColumns: [GridItem] {
-        let count = card.coverURLs.count
+    @ViewBuilder
+    private var covers: some View {
+        let canFoldImages = card.kind == .image && card.coverURLs.count > 4
+        let visibleCoverURLs = canFoldImages && !areImagesExpanded
+            ? Array(card.coverURLs.prefix(4))
+            : card.coverURLs
+
+        if let firstURL = visibleCoverURLs.first, visibleCoverURLs.count == 1 {
+            FocusDynamicMediaCover(
+                url: firstURL,
+                referer: card.targetURL.absoluteString,
+                height: 176
+            )
+            .contentShape(Rectangle())
+            .onTapGesture {
+                card.kind == .image ? onOpenImage(0) : onOpenCard()
+            }
+        } else {
+            LazyVGrid(columns: coverColumns(for: visibleCoverURLs.count), spacing: 10) {
+                ForEach(Array(visibleCoverURLs.enumerated()), id: \.offset) { item in
+                    FocusDynamicMediaCover(
+                        url: item.element,
+                        referer: card.targetURL.absoluteString,
+                        height: coverHeight(for: visibleCoverURLs.count, index: item.offset)
+                    )
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        card.kind == .image ? onOpenImage(item.offset) : onOpenCard()
+                    }
+                }
+            }
+        }
+
+        if canFoldImages {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    areImagesExpanded.toggle()
+                }
+            } label: {
+                Label(
+                    areImagesExpanded ? "收起图片" : "展开全部 \(card.coverURLs.count) 张图片",
+                    systemImage: areImagesExpanded ? "chevron.up" : "chevron.down"
+                )
+                .font(.subheadline.weight(.semibold))
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(FocusDesign.primary)
+        }
+    }
+
+    private func coverColumns(for count: Int) -> [GridItem] {
         let columnCount = count == 1 ? 1 : 2
         return Array(repeating: GridItem(.flexible(), spacing: 10), count: columnCount)
     }
@@ -1122,7 +1185,9 @@ private struct FocusDynamicCardView: View {
                         .resizable()
                         .scaledToFill()
                 case .failure:
-                    FocusRemoteImageWebFallback(url: avatarURL, referer: card.targetURL.absoluteString)
+                    Circle()
+                        .fill(Color(uiColor: .secondarySystemFill))
+                        .overlay(Image(systemName: "person.fill").foregroundStyle(.secondary))
                 case .empty:
                     Circle()
                         .fill(Color(uiColor: .secondarySystemFill))
@@ -1146,6 +1211,108 @@ private struct FocusDynamicCardView: View {
     }
 }
 
+private struct FocusExpandableDynamicText: View {
+    let text: String
+    let onOpenCard: () -> Void
+    @State private var isExpanded = false
+    @State private var collapsedHeight: CGFloat = 0
+    @State private var fullHeight: CGFloat = 0
+
+    private var canFold: Bool {
+        fullHeight > collapsedHeight + 0.5
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(text)
+                .font(.body)
+                .foregroundStyle(.primary)
+                .multilineTextAlignment(.leading)
+                .lineLimit(isExpanded ? nil : 6)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+                .onTapGesture(perform: onOpenCard)
+                .background {
+                    FocusDynamicTextMeasurement(text: text)
+                }
+                .onPreferenceChange(FocusCollapsedDynamicTextHeightKey.self) { height in
+                    collapsedHeight = height
+                }
+                .onPreferenceChange(FocusFullDynamicTextHeightKey.self) { height in
+                    fullHeight = height
+                }
+
+            if canFold || isExpanded {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        isExpanded.toggle()
+                    }
+                } label: {
+                    Text(isExpanded ? "收起文本" : "展开全文")
+                        .font(.subheadline.weight(.semibold))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(FocusDesign.primary)
+            }
+        }
+    }
+}
+
+private struct FocusDynamicTextMeasurement: View {
+    let text: String
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            Text(text)
+                .font(.body)
+                .lineLimit(6)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .hidden()
+                .background {
+                    GeometryReader { proxy in
+                        Color.clear.preference(
+                            key: FocusCollapsedDynamicTextHeightKey.self,
+                            value: proxy.size.height
+                        )
+                    }
+                }
+
+            Text(text)
+                .font(.body)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .hidden()
+                .background {
+                    GeometryReader { proxy in
+                        Color.clear.preference(
+                            key: FocusFullDynamicTextHeightKey.self,
+                            value: proxy.size.height
+                        )
+                    }
+                }
+        }
+        .allowsHitTesting(false)
+    }
+}
+
+private struct FocusCollapsedDynamicTextHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+private struct FocusFullDynamicTextHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 private struct FocusDynamicMediaCover: View {
     let url: URL?
     let referer: String
@@ -1161,11 +1328,9 @@ private struct FocusDynamicMediaCover: View {
                         .scaledToFill()
                         .frame(width: proxy.size.width, height: proxy.size.height)
                 case .failure:
-                    FocusRemoteImageWebFallback(
-                        url: url,
-                        referer: referer,
-                        objectFit: "cover"
-                    )
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .fill(Color(uiColor: .secondarySystemFill))
+                        .overlay(Image(systemName: "photo").foregroundStyle(.secondary))
                     .frame(width: proxy.size.width, height: proxy.size.height)
                 case .empty:
                     ZStack {
@@ -1210,30 +1375,6 @@ private struct FocusKindBadge: View {
             .background(FocusDesign.primary.opacity(0.12))
             .foregroundStyle(FocusDesign.primary)
             .clipShape(Capsule())
-    }
-}
-
-private struct FocusStateView: View {
-    let title: String
-    let message: String
-    let buttonTitle: String
-    let action: () -> Void
-
-    var body: some View {
-        VStack(spacing: 12) {
-            Text(title)
-                .font(.headline)
-
-            Text(message)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-
-            Button(buttonTitle, action: action)
-                .buttonStyle(.borderedProminent)
-        }
-        .padding(24)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
@@ -1309,7 +1450,7 @@ private struct FocusSearchResultsView: View {
                     await viewModel.refresh()
                 }
                 .task(id: prefetchSignature(for: sections)) {
-                    prefetchImages(for: sections)
+                    await prefetchImages(for: sections)
                 }
             }
 
@@ -1331,14 +1472,14 @@ private struct FocusSearchResultsView: View {
             .joined(separator: "|")
     }
 
-    private func prefetchImages(for sections: [SearchResultSection]) {
+    private func prefetchImages(for sections: [SearchResultSection]) async {
         for item in sections.flatMap(\.items).prefix(10) {
             let urls = ([item.coverURL, item.avatarURL] + item.previews.prefix(3).map(\.coverURL)).compactMap { $0 }
             guard !urls.isEmpty else {
                 continue
             }
 
-            FocusRemoteImageLoader.prefetch(
+            await FocusRemoteImageLoader.prefetch(
                 urls: urls,
                 referer: item.targetURL.absoluteString
             )
@@ -1643,7 +1784,9 @@ private struct FocusSearchUserCard: View {
                         .resizable()
                         .scaledToFill()
                 case .failure:
-                    FocusRemoteImageWebFallback(url: avatarURL, referer: item.targetURL.absoluteString)
+                    Circle()
+                        .fill(Color(uiColor: .tertiarySystemFill))
+                        .overlay(Image(systemName: "person.fill").foregroundStyle(.secondary))
                 case .empty:
                     Circle()
                         .fill(Color(uiColor: .tertiarySystemFill))
@@ -1745,6 +1888,15 @@ private struct FocusTwoColumnVideoCardContent {
         subtitle = item.authorName
         metadataText = FocusHistoryCardFormatter.metadataText(for: item)
         badgeText = FocusHistoryCardFormatter.durationText(progress: item.progress, duration: item.duration)
+        coverURL = item.coverURL
+        referer = item.videoURL?.absoluteString ?? "https://www.bilibili.com/"
+    }
+
+    init(favorite item: FocusMyFavoriteItem) {
+        title = item.title
+        subtitle = item.authorName
+        metadataText = item.playText
+        badgeText = item.durationText
         coverURL = item.coverURL
         referer = item.videoURL?.absoluteString ?? "https://www.bilibili.com/"
     }
@@ -1922,7 +2074,9 @@ private struct FocusSearchCover: View {
                                 .resizable()
                                 .scaledToFill()
                         case .failure:
-                            FocusRemoteImageWebFallback(url: url, referer: referer)
+                            Rectangle()
+                                .fill(Color(uiColor: .tertiarySystemFill))
+                                .overlay(Image(systemName: "photo").foregroundStyle(.secondary))
                         case .empty:
                             ZStack {
                                 RoundedRectangle(cornerRadius: 0)
@@ -2002,6 +2156,7 @@ private struct FocusMyView: View {
     @ObservedObject var viewModel: FocusMyViewModel
     let onOpenLogin: () -> Void
     let onOpenHistory: () -> Void
+    let onOpenFavoriteFolder: (FocusMyFolder) -> Void
     let onOpenVideo: (URL) -> Void
 
     var body: some View {
@@ -2019,19 +2174,13 @@ private struct FocusMyView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
 
         case .loginRequired:
-            VStack(spacing: 12) {
-                FocusStateView(
-                    title: "需要登录",
-                    message: "登录后即可查看你的播放历史和收藏夹。",
-                    buttonTitle: "重新检测登录态",
-                    action: viewModel.reload
-                )
-
-                Button("去登录") {
-                    onOpenLogin()
-                }
-                .buttonStyle(.borderedProminent)
-            }
+            FocusLoginRequiredView(
+                title: "需要登录",
+                message: "登录后即可查看你的播放历史和收藏夹。",
+                reloadTitle: "重新检测登录态",
+                reloadAction: viewModel.reload,
+                loginAction: onOpenLogin
+            )
 
         case let .failed(message):
             FocusStateView(
@@ -2083,13 +2232,25 @@ private struct FocusMyView: View {
 
                     if !page.folders.isEmpty {
                         VStack(alignment: .leading, spacing: 12) {
-                            Text("收藏夹")
-                                .font(.headline.weight(.semibold))
-                                .padding(.horizontal, 2)
+                            HStack(spacing: 12) {
+                                Text("收藏夹")
+                                    .font(.headline.weight(.semibold))
 
-                            VStack(spacing: 10) {
+                                Spacer(minLength: 0)
+                            }
+                            .padding(.horizontal, 2)
+
+                            VStack(spacing: 12) {
                                 ForEach(page.folders) { folder in
-                                    FocusMyFolderRow(folder: folder)
+                                    FocusMyFolderSection(
+                                        folder: folder,
+                                        onOpenFolder: {
+                                            onOpenFavoriteFolder(folder)
+                                        },
+                                        onOpenVideo: { url in
+                                            onOpenVideo(url)
+                                        }
+                                    )
                                 }
                             }
                         }
@@ -2101,7 +2262,7 @@ private struct FocusMyView: View {
             }
             .background(Color(uiColor: .systemGroupedBackground))
             .task(id: page.history.map(\.id).joined(separator: "|")) {
-                prefetchAssets(for: page)
+                await prefetchAssets(for: page)
             }
             .refreshable {
                 viewModel.reload()
@@ -2109,15 +2270,17 @@ private struct FocusMyView: View {
         }
     }
 
-    private func prefetchAssets(for page: FocusMyPage) {
+    private func prefetchAssets(for page: FocusMyPage) async {
         let historyURLs = page.history.compactMap(\.coverURL)
         if !historyURLs.isEmpty {
-            FocusRemoteImageLoader.prefetch(urls: historyURLs, referer: "https://www.bilibili.com/")
+            await FocusRemoteImageLoader.prefetch(urls: historyURLs, referer: "https://www.bilibili.com/")
         }
 
-        let folderURLs = page.folders.compactMap(\.coverURL)
+        let folderURLs = page.folders.flatMap { folder in
+            folder.previews.compactMap(\.coverURL)
+        }
         if !folderURLs.isEmpty {
-            FocusRemoteImageLoader.prefetch(urls: folderURLs, referer: "https://www.bilibili.com/")
+            await FocusRemoteImageLoader.prefetch(urls: folderURLs, referer: "https://www.bilibili.com/")
         }
     }
 }
@@ -2251,41 +2414,52 @@ private struct FocusMyHistoryCard: View {
     }
 }
 
-private struct FocusMyFolderRow: View {
+private struct FocusMyFolderSection: View {
     let folder: FocusMyFolder
+    let onOpenFolder: () -> Void
+    let onOpenVideo: (URL) -> Void
 
     var body: some View {
-        HStack(spacing: 12) {
-            FocusRemoteImage(url: folder.coverURL, referer: "https://www.bilibili.com/") { phase in
-                switch phase {
-                case let .success(image):
-                    image
-                        .resizable()
-                        .scaledToFill()
-                case .failure:
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .fill(Color(uiColor: .tertiarySystemFill))
-                case .empty:
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .fill(Color(uiColor: .tertiarySystemFill))
-                        .overlay(ProgressView())
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(folder.title)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(2)
+
+                    Text("\(folder.mediaCount) 个内容")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer(minLength: 0)
+
+                Button("更多") {
+                    onOpenFolder()
+                }
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(FocusDesign.primary)
+            }
+
+            if !folder.previews.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 12) {
+                        ForEach(folder.previews) { item in
+                            Button {
+                                guard let url = item.videoURL else {
+                                    return
+                                }
+                                onOpenVideo(url)
+                            } label: {
+                                FocusMyFavoriteCard(item: item)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.vertical, 2)
                 }
             }
-            .frame(width: 58, height: 58)
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text(folder.title)
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.primary)
-                    .lineLimit(2)
-
-                Text("\(folder.mediaCount) 个内容")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Spacer(minLength: 0)
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -2293,6 +2467,15 @@ private struct FocusMyFolderRow: View {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .fill(Color(uiColor: .secondarySystemGroupedBackground))
         )
+    }
+}
+
+private struct FocusMyFavoriteCard: View {
+    let item: FocusMyFavoriteItem
+
+    var body: some View {
+        FocusTwoColumnVideoCard(content: .init(favorite: item))
+            .frame(width: 176)
     }
 }
 
@@ -2374,7 +2557,7 @@ private struct FocusHistoryView: View {
                 }
                 .background(Color(uiColor: .systemGroupedBackground))
                 .task(id: items.map(\.id).joined(separator: "|")) {
-                    prefetchAssets(items)
+                    await prefetchAssets(items)
                 }
                 .refreshable {
                     viewModel.reload()
@@ -2383,12 +2566,12 @@ private struct FocusHistoryView: View {
         }
     }
 
-    private func prefetchAssets(_ items: [FocusMyHistoryItem]) {
+    private func prefetchAssets(_ items: [FocusMyHistoryItem]) async {
         let urls = items.prefix(20).compactMap(\.coverURL)
         guard !urls.isEmpty else {
             return
         }
-        FocusRemoteImageLoader.prefetch(urls: urls, referer: "https://www.bilibili.com/")
+        await FocusRemoteImageLoader.prefetch(urls: urls, referer: "https://www.bilibili.com/")
     }
 }
 
@@ -2397,6 +2580,86 @@ private struct FocusHistoryGridCard: View {
 
     var body: some View {
         FocusTwoColumnVideoCard(content: .init(history: item))
+    }
+}
+
+private struct FocusFavoriteFolderView: View {
+    @ObservedObject var viewModel: FocusFavoriteFolderViewModel
+    let onOpenVideo: (URL) -> Void
+
+    private let columns = [
+        GridItem(.flexible(), spacing: 10),
+        GridItem(.flexible(), spacing: 10),
+    ]
+
+    var body: some View {
+        content
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        switch viewModel.state {
+        case .idle, .loading:
+            ProgressView("加载收藏夹…")
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+        case .loginRequired:
+            FocusStateView(
+                title: "需要登录",
+                message: "登录后即可查看收藏夹内容。",
+                buttonTitle: "重新检测登录态",
+                action: viewModel.reload
+            )
+
+        case let .failed(message):
+            FocusStateView(
+                title: "收藏夹加载失败",
+                message: message,
+                buttonTitle: "重试",
+                action: viewModel.reload
+            )
+
+        case let .loaded(_, items):
+            ScrollView {
+                LazyVGrid(columns: columns, spacing: 10) {
+                    ForEach(items) { item in
+                        Button {
+                            guard let url = item.videoURL else {
+                                return
+                            }
+                            onOpenVideo(url)
+                        } label: {
+                            FocusTwoColumnVideoCard(content: .init(favorite: item))
+                        }
+                        .buttonStyle(.plain)
+                        .onAppear {
+                            viewModel.loadMoreIfNeeded(currentItemID: item.id)
+                        }
+                    }
+
+                    if viewModel.isLoadingMore {
+                        ProgressView()
+                            .frame(maxWidth: .infinity)
+                            .padding(.top, 6)
+                            .gridCellColumns(columns.count)
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 14)
+                .padding(.bottom, 132)
+            }
+            .background(Color(uiColor: .systemGroupedBackground))
+            .task(id: items.map(\.id).joined(separator: "|")) {
+                let urls = items.prefix(24).compactMap(\.coverURL)
+                guard !urls.isEmpty else {
+                    return
+                }
+                await FocusRemoteImageLoader.prefetch(urls: urls, referer: "https://www.bilibili.com/")
+            }
+            .refreshable {
+                viewModel.reload()
+            }
+        }
     }
 }
 
@@ -2520,7 +2783,7 @@ private struct FocusUserSpaceView: View {
             }
             .background(Color(uiColor: .systemGroupedBackground))
             .task(id: page.profile.mid) {
-                prefetchAssets(for: page)
+                await prefetchAssets(for: page)
                 if !sections.contains(selectedSection) {
                     selectedSection = sections.first ?? .videos
                 }
@@ -2551,7 +2814,7 @@ private struct FocusUserSpaceView: View {
             .padding(.horizontal, 2)
     }
 
-    private func prefetchAssets(for page: FocusUserSpacePage) {
+    private func prefetchAssets(for page: FocusUserSpacePage) async {
         let referer = "https://space.bilibili.com/\(page.profile.mid)"
         let urls = (
             [page.profile.avatarURL]
@@ -2563,7 +2826,7 @@ private struct FocusUserSpaceView: View {
         guard !urls.isEmpty else {
             return
         }
-        FocusRemoteImageLoader.prefetch(urls: urls, referer: referer)
+        await FocusRemoteImageLoader.prefetch(urls: urls, referer: referer)
     }
 }
 
@@ -2825,17 +3088,17 @@ private struct FocusUserCollectionView: View {
                 viewModel.reload()
             }
             .task(id: page.collection.id + "-\(page.videos.count)") {
-                prefetchAssets(for: page)
+                await prefetchAssets(for: page)
             }
         }
     }
 
-    private func prefetchAssets(for page: FocusUserCollectionPage) {
+    private func prefetchAssets(for page: FocusUserCollectionPage) async {
         let urls = ([page.collection.coverURL] + page.videos.prefix(10).compactMap(\.coverURL)).compactMap { $0 }
         guard !urls.isEmpty else {
             return
         }
-        FocusRemoteImageLoader.prefetch(urls: urls, referer: "https://space.bilibili.com/\(page.collection.ownerMID)")
+        await FocusRemoteImageLoader.prefetch(urls: urls, referer: "https://space.bilibili.com/\(page.collection.ownerMID)")
     }
 }
 
@@ -2898,6 +3161,8 @@ private struct FocusUserCollectionHeroCard: View {
 private struct FocusArticleView: View {
     @ObservedObject var viewModel: FocusArticleViewModel
     let onOpenUser: (Int64) -> Void
+    let onOpenURL: (URL) -> Void
+    let onOpenWeb: (URL) -> Void
 
     var body: some View {
         content
@@ -2920,6 +3185,7 @@ private struct FocusArticleView: View {
                 buttonTitle: "重新加载",
                 action: viewModel.reload
             )
+            .overlay(alignment: .bottom) { openArticleOnWebButton }
 
         case let .failed(message):
             FocusStateView(
@@ -2928,10 +3194,11 @@ private struct FocusArticleView: View {
                 buttonTitle: "重试",
                 action: viewModel.reload
             )
+            .overlay(alignment: .bottom) { openArticleOnWebButton }
 
         case let .loaded(page):
             ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
+                LazyVStack(alignment: .leading, spacing: 16) {
                     if page.bannerURL != nil {
                         FocusRemoteImage(url: page.bannerURL, referer: "https://www.bilibili.com/read/cv\(page.cvid)") { phase in
                             switch phase {
@@ -2978,15 +3245,124 @@ private struct FocusArticleView: View {
                         }
                     }
 
-                    if !page.htmlContent.isEmpty {
-                        FocusArticleHTMLCard(htmlContent: page.htmlContent)
+                    ForEach(Array(page.blocks.enumerated()), id: \.offset) { _, block in
+                        FocusArticleBlockView(
+                            block: block,
+                            referer: page.originalURL.absoluteString,
+                            onOpenURL: onOpenURL
+                        )
                     }
                 }
                 .padding(.horizontal, 16)
                 .padding(.top, 14)
                 .padding(.bottom, 132)
             }
+            .background(FocusScrollBounceDisabler())
             .background(Color(uiColor: .systemGroupedBackground))
+        }
+    }
+
+    @ViewBuilder
+    private var openArticleOnWebButton: some View {
+        if let url = viewModel.originalURL {
+            Button {
+                onOpenWeb(url)
+            } label: {
+                Label("在网页中打开", systemImage: "safari")
+            }
+            .buttonStyle(.bordered)
+            .padding(.bottom, 32)
+        }
+    }
+}
+
+private struct FocusArticleBlockView: View {
+    let block: FocusArticleBlock
+    let referer: String
+    let onOpenURL: (URL) -> Void
+
+    var body: some View {
+        switch block {
+        case let .paragraph(runs, alignment):
+            FocusInlineRichText(runs: runs, onOpenURL: onOpenURL)
+                .frame(maxWidth: .infinity, alignment: frameAlignment(alignment))
+        case let .heading(runs, level):
+            FocusInlineRichText(
+                runs: runs,
+                font: level <= 1 ? .title2.weight(.bold) : level == 2 ? .title3.weight(.bold) : .headline,
+                onOpenURL: onOpenURL
+            )
+            .padding(.top, 4)
+        case let .image(url, width, height, caption):
+            VStack(alignment: .leading, spacing: 6) {
+                FocusRemoteImage(url: url, referer: referer) { phase in
+                    switch phase {
+                    case let .success(image): image.resizable().scaledToFit()
+                    case .failure:
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(Color(uiColor: .tertiarySystemFill))
+                            .overlay(Image(systemName: "photo").foregroundStyle(.secondary))
+                    case .empty:
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(Color(uiColor: .tertiarySystemFill))
+                            .overlay(ProgressView())
+                    }
+                }
+                .frame(maxWidth: .infinity)
+                .aspectRatio(width > 0 && height > 0 ? CGFloat(width) / CGFloat(height) : 4 / 3, contentMode: .fit)
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                if !caption.isEmpty {
+                    Text(caption).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        case let .quote(runs):
+            FocusInlineRichText(runs: runs, foreground: .secondary, onOpenURL: onOpenURL)
+                .padding(14)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(uiColor: .tertiarySystemFill), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        case let .list(ordered, items):
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(Array(items.enumerated()), id: \.offset) { index, runs in
+                    HStack(alignment: .top, spacing: 8) {
+                        Text(ordered ? "\(index + 1)." : "•")
+                            .frame(width: 24, alignment: .trailing)
+                        FocusInlineRichText(runs: runs, onOpenURL: onOpenURL)
+                    }
+                }
+            }
+        case let .code(language, content):
+            ScrollView(.horizontal, showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 8) {
+                    if !language.isEmpty {
+                        Text(language.uppercased()).font(.caption2.weight(.semibold)).foregroundStyle(FocusDesign.primary)
+                    }
+                    Text(content).font(.system(.footnote, design: .monospaced)).textSelection(.enabled)
+                }
+                .padding(14)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color(uiColor: .tertiarySystemFill), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        case let .resource(title, url):
+            Button { onOpenURL(url) } label: {
+                HStack {
+                    Text(title).font(.headline).foregroundStyle(.primary)
+                    Spacer()
+                    Image(systemName: "arrow.up.right.square").foregroundStyle(FocusDesign.primary)
+                }
+                .padding(14)
+                .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            }
+            .buttonStyle(.plain)
+        case .divider:
+            Divider()
+        }
+    }
+
+    private func frameAlignment(_ alignment: FocusArticleTextAlignment) -> Alignment {
+        switch alignment {
+        case .leading: .leading
+        case .center: .center
+        case .trailing: .trailing
         }
     }
 }
@@ -3102,174 +3478,103 @@ private struct FocusArticleStatItem: View {
 
 private struct FocusArticleHTMLCard: View {
     let htmlContent: String
-    @Environment(\.colorScheme) private var colorScheme
-    @State private var contentHeight: CGFloat = 1
 
     var body: some View {
-        FocusArticleHTMLWebView(
-            html: styledHTML,
-            contentHeight: $contentHeight
+        Text(Self.nativeText(from: htmlContent))
+            .font(.body)
+            .foregroundStyle(.primary)
+            .lineSpacing(7)
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(16)
+            .background(
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(Color(uiColor: .secondarySystemGroupedBackground))
+            )
+    }
+
+    private static func nativeText(from html: String) -> String {
+        var text = html
+        text = text.replacingOccurrences(
+            of: #"(?is)<(script|style)[^>]*>.*?</\1>"#,
+            with: "",
+            options: .regularExpression
         )
-        .frame(height: max(contentHeight, 1))
-        .frame(maxWidth: .infinity)
-        .padding(16)
-        .background(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(Color(uiColor: .secondarySystemGroupedBackground))
+        text = text.replacingOccurrences(
+            of: #"(?i)<img[^>]*alt=[\"']([^\"']+)[\"'][^>]*>"#,
+            with: "\n[图片：$1]\n",
+            options: .regularExpression
         )
+        text = text.replacingOccurrences(
+            of: #"(?i)<img[^>]*>"#,
+            with: "\n[图片]\n",
+            options: .regularExpression
+        )
+        text = text.replacingOccurrences(
+            of: #"(?i)<li[^>]*>"#,
+            with: "\n• ",
+            options: .regularExpression
+        )
+        text = text.replacingOccurrences(
+            of: #"(?i)<br\s*/?>|</(p|div|section|article|li|h[1-6]|blockquote|pre|tr)>"#,
+            with: "\n",
+            options: .regularExpression
+        )
+        text = text.replacingOccurrences(
+            of: #"<[^>]+>"#,
+            with: "",
+            options: .regularExpression
+        )
+        text = decodeHTMLEntities(text)
+        text = text.replacingOccurrences(
+            of: #"[ \t]+\n"#,
+            with: "\n",
+            options: .regularExpression
+        )
+        text = text.replacingOccurrences(
+            of: #"\n{3,}"#,
+            with: "\n\n",
+            options: .regularExpression
+        )
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private var styledHTML: String {
-        let isDark = colorScheme == .dark
-        let background = "transparent"
-        let textColor = isDark ? "#E8ECF2" : "#1F2937"
-        let secondaryColor = isDark ? "#A7B0BE" : "#5B6472"
-        let linkColor = isDark ? "#FF9FBC" : "#FB7299"
-        let codeBackground = isDark ? "#1A2230" : "#F4F6F9"
-        let quoteBackground = isDark ? "#151C27" : "#F8FAFC"
-        let borderColor = isDark ? "rgba(255,255,255,0.08)" : "rgba(15,23,42,0.08)"
+    private static func decodeHTMLEntities(_ value: String) -> String {
+        var result = value
+        let namedEntities = [
+            "&nbsp;": " ",
+            "&amp;": "&",
+            "&lt;": "<",
+            "&gt;": ">",
+            "&quot;": "\"",
+            "&#39;": "'",
+            "&apos;": "'"
+        ]
+        namedEntities.forEach { result = result.replacingOccurrences(of: $0.key, with: $0.value) }
 
-        return """
-        <!doctype html>
-        <html>
-        <head>
-          <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-          <style>
-            :root { color-scheme: \(isDark ? "dark" : "light"); }
-            html, body {
-              margin: 0;
-              padding: 0;
-              background: \(background);
-              color: \(textColor);
-              font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif;
-              font-size: 17px;
-              line-height: 1.72;
-            }
-            body { overflow-x: hidden; }
-            article { width: 100%; box-sizing: border-box; }
-            p, li, blockquote, pre { margin: 0 0 14px 0; }
-            h1, h2, h3, h4 {
-              color: \(textColor);
-              margin: 22px 0 12px 0;
-              line-height: 1.35;
-            }
-            a {
-              color: \(linkColor);
-              text-decoration: none;
-            }
-            img, video, iframe {
-              display: block;
-              width: 100%;
-              max-width: 100%;
-              height: auto;
-              border-radius: 14px;
-              overflow: hidden;
-              margin: 14px 0;
-            }
-            blockquote {
-              padding: 12px 14px;
-              border-radius: 14px;
-              background: \(quoteBackground);
-              border: 1px solid \(borderColor);
-              color: \(secondaryColor);
-            }
-            pre, code {
-              font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-            }
-            pre {
-              padding: 14px;
-              border-radius: 14px;
-              background: \(codeBackground);
-              overflow-x: auto;
-            }
-            table {
-              width: 100%;
-              border-collapse: collapse;
-              margin: 14px 0;
-              font-size: 15px;
-            }
-            th, td {
-              padding: 8px 10px;
-              border: 1px solid \(borderColor);
-            }
-          </style>
-        </head>
-        <body>
-          <article>\(htmlContent)</article>
-        </body>
-        </html>
-        """
-    }
-}
-
-private struct FocusArticleHTMLWebView: UIViewRepresentable {
-    let html: String
-    @Binding var contentHeight: CGFloat
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(contentHeight: $contentHeight)
-    }
-
-    func makeUIView(context: Context) -> WKWebView {
-        let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = .nonPersistent()
-
-        let webView = WKWebView(frame: .zero, configuration: configuration)
-        webView.isOpaque = false
-        webView.backgroundColor = .clear
-        webView.scrollView.backgroundColor = .clear
-        webView.scrollView.isScrollEnabled = false
-        webView.navigationDelegate = context.coordinator
-        return webView
-    }
-
-    func updateUIView(_ webView: WKWebView, context: Context) {
-        guard context.coordinator.lastHTML != html else {
-            context.coordinator.updateHeightIfNeeded(for: webView)
-            return
+        guard let expression = try? NSRegularExpression(pattern: #"&#(x?[0-9A-Fa-f]+);"#) else {
+            return result
         }
-        context.coordinator.lastHTML = html
-        webView.loadHTMLString(html, baseURL: URL(string: "https://www.bilibili.com/"))
-    }
-
-    final class Coordinator: NSObject, WKNavigationDelegate {
-        @Binding var contentHeight: CGFloat
-        var lastHTML = ""
-
-        init(contentHeight: Binding<CGFloat>) {
-            _contentHeight = contentHeight
-        }
-
-        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-            updateHeightIfNeeded(for: webView)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
-                self.updateHeightIfNeeded(for: webView)
+        while let match = expression.firstMatch(
+            in: result,
+            range: NSRange(result.startIndex..., in: result)
+        ), let fullRange = Range(match.range(at: 0), in: result),
+           let valueRange = Range(match.range(at: 1), in: result)
+        {
+            let rawValue = String(result[valueRange])
+            let scalarValue: UInt32?
+            if rawValue.lowercased().hasPrefix("x") {
+                scalarValue = UInt32(rawValue.dropFirst(), radix: 16)
+            } else {
+                scalarValue = UInt32(rawValue, radix: 10)
             }
+            let replacement = scalarValue
+                .flatMap(UnicodeScalar.init)
+                .map(String.init)
+                ?? ""
+            result.replaceSubrange(fullRange, with: replacement)
         }
-
-        func updateHeightIfNeeded(for webView: WKWebView) {
-            let script = "Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);"
-            webView.evaluateJavaScript(script) { [weak self] result, _ in
-                guard let self else {
-                    return
-                }
-                let resolvedHeight: CGFloat?
-                if let value = result as? Double {
-                    resolvedHeight = CGFloat(value)
-                } else if let value = result as? NSNumber {
-                    resolvedHeight = CGFloat(truncating: value)
-                } else {
-                    resolvedHeight = nil
-                }
-
-                guard let resolvedHeight else {
-                    return
-                }
-                DispatchQueue.main.async {
-                    self.contentHeight = resolvedHeight
-                }
-            }
-        }
+        return result
     }
 }
 
@@ -3337,9 +3642,13 @@ private struct FocusUserSpaceArticleRow: View {
 private struct FocusOpusDetailView: View {
     @ObservedObject var viewModel: FocusOpusDetailViewModel
     let onOpenURL: (URL) -> Void
+    @State private var galleryRequest: FocusImageGalleryRequest?
 
     var body: some View {
         content
+            .fullScreenCover(item: $galleryRequest) { request in
+                FocusImageGalleryView(request: request)
+            }
     }
 
     @ViewBuilder
@@ -3366,12 +3675,32 @@ private struct FocusOpusDetailView: View {
             )
 
         case let .loaded(page):
+            let allImages = page.paragraphs.flatMap { paragraph in
+                paragraph.blocks.flatMap { block -> [FocusOpusImage] in
+                    guard case let .image(images) = block else { return [] }
+                    return images
+                }
+            }
+            let validImages = allImages.filter { $0.url != nil }
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     FocusOpusAuthorCard(page: page, onOpenURL: onOpenURL)
 
                     ForEach(page.paragraphs) { paragraph in
-                        FocusOpusParagraphCard(paragraph: paragraph)
+                        FocusOpusParagraphCard(
+                            paragraph: paragraph,
+                            onOpenURL: onOpenURL,
+                            onOpenImage: { selected in
+                                let urls = validImages.compactMap(\.url)
+                                guard !urls.isEmpty else { return }
+                                let index = validImages.firstIndex(where: { $0.id == selected.id }) ?? 0
+                                galleryRequest = FocusImageGalleryRequest(
+                                    urls: urls,
+                                    initialIndex: index,
+                                    referer: "https://www.bilibili.com/opus/\(page.id)"
+                                )
+                            }
+                        )
                     }
 
                     if !page.comments.isEmpty {
@@ -3381,7 +3710,7 @@ private struct FocusOpusDetailView: View {
                                 .padding(.horizontal, 2)
 
                             ForEach(Array(page.comments.enumerated()), id: \.offset) { item in
-                                FocusOpusCommentCard(comment: item.element)
+                                FocusOpusCommentCard(comment: item.element, onOpenURL: onOpenURL)
                             }
                         }
                     }
@@ -3390,6 +3719,7 @@ private struct FocusOpusDetailView: View {
                 .padding(.top, 14)
                 .padding(.bottom, 132)
             }
+            .background(FocusScrollBounceDisabler())
             .background(Color(uiColor: .systemGroupedBackground))
         }
     }
@@ -3454,15 +3784,17 @@ private struct FocusOpusAuthorCard: View {
 
 private struct FocusOpusParagraphCard: View {
     let paragraph: FocusOpusParagraph
+    var onOpenURL: (URL) -> Void = { _ in }
+    var onOpenImage: (FocusOpusImage) -> Void = { _ in }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             ForEach(Array(paragraph.blocks.enumerated()), id: \.offset) { _, block in
                 switch block {
                 case let .text(nodes):
-                    FocusOpusRichText(nodes: nodes)
+                    FocusInlineRichText(runs: nodes, onOpenURL: onOpenURL)
                 case let .image(images):
-                    FocusOpusImageGrid(images: images)
+                    FocusOpusImageGrid(images: images, onOpenImage: onOpenImage)
                 case let .code(lang, content):
                     VStack(alignment: .leading, spacing: 8) {
                         if !lang.isEmpty {
@@ -3492,37 +3824,17 @@ private struct FocusOpusParagraphCard: View {
     }
 }
 
-private struct FocusOpusRichText: View {
-    let nodes: [FocusOpusTextNode]
-
-    var body: some View {
-        combinedText
-            .font(.body)
-            .foregroundStyle(.primary)
-            .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private var combinedText: Text {
-        nodes.reduce(Text("")) { partial, node in
-            let rawText = node.emojiURL != nil && node.text.isEmpty ? "[表情]" : node.text
-            let segment = Text(rawText)
-                .fontWeight(node.bold ? .semibold : .regular)
-                .foregroundColor(node.linkURL == nil ? .primary : FocusDesign.primary)
-            return partial + segment
-        }
-    }
-}
-
 private struct FocusOpusImageGrid: View {
     let images: [FocusOpusImage]
+    let onOpenImage: (FocusOpusImage) -> Void
 
     var body: some View {
         if images.count == 1, let image = images.first {
-            FocusOpusImageTile(image: image)
+            FocusOpusImageTile(image: image, onOpenImage: onOpenImage)
         } else {
             LazyVGrid(columns: columns, spacing: 10) {
                 ForEach(images) { image in
-                    FocusOpusImageTile(image: image)
+                    FocusOpusImageTile(image: image, onOpenImage: onOpenImage)
                 }
             }
         }
@@ -3535,6 +3847,7 @@ private struct FocusOpusImageGrid: View {
 
 private struct FocusOpusImageTile: View {
     let image: FocusOpusImage
+    let onOpenImage: (FocusOpusImage) -> Void
 
     var body: some View {
         FocusRemoteImage(url: image.url, referer: image.url?.absoluteString ?? "https://www.bilibili.com/") { phase in
@@ -3556,11 +3869,14 @@ private struct FocusOpusImageTile: View {
         .aspectRatio(image.aspectRatio ?? 1, contentMode: .fit)
         .background(Color(uiColor: .tertiarySystemFill))
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .contentShape(Rectangle())
+        .onTapGesture { onOpenImage(image) }
     }
 }
 
 private struct FocusOpusCommentCard: View {
     let comment: FocusNativeCommentPayload
+    let onOpenURL: (URL) -> Void
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -3587,10 +3903,22 @@ private struct FocusOpusCommentCard: View {
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(FocusDesign.primary)
 
-                Text(comment.content)
-                    .font(.body)
-                    .foregroundStyle(.primary)
-                    .multilineTextAlignment(.leading)
+                FocusInlineRichText(runs: comment.contentRuns, onOpenURL: onOpenURL)
+
+                ForEach(Array(comment.previewReplies.prefix(2).enumerated()), id: \.offset) { _, reply in
+                    HStack(alignment: .top, spacing: 2) {
+                        Text("\(reply.author)：")
+                            .font(.caption)
+                            .foregroundStyle(FocusDesign.primary)
+                        FocusInlineRichText(
+                            runs: reply.contentRuns,
+                            font: .caption,
+                            foreground: .secondary,
+                            onOpenURL: onOpenURL
+                        )
+                    }
+                    .padding(.leading, 8)
+                }
 
                 let meta = [comment.timeText, comment.likeText, comment.replyText]
                     .filter { !$0.isEmpty }
@@ -3613,34 +3941,94 @@ private struct FocusOpusCommentCard: View {
 
 private struct FocusSettingsView: View {
     @ObservedObject var settingsStore: FocusSettingsStore
+    @StateObject private var viewModel: FocusDynamicAuthorSettingsViewModel
     @Environment(\.dismiss) private var dismiss
+
+    init(settingsStore: FocusSettingsStore, dynamicAuthors: [DynamicCard.Author]) {
+        self._viewModel = StateObject(
+            wrappedValue: FocusDynamicAuthorSettingsViewModel(
+                service: FocusFollowingAuthorsService(cookieProvider: WebViewCookieSnapshotProvider()),
+                fallbackAuthors: dynamicAuthors
+            )
+        )
+        self.settingsStore = settingsStore
+    }
 
     var body: some View {
         NavigationStack {
             Form {
-                Section("入口") {
+                Section {
                     Picker("默认入口", selection: binding(\.defaultEntry)) {
                         ForEach(FocusEntry.allCases, id: \.self) { entry in
                             Text(entry.title).tag(entry)
                         }
                     }
+
+                    Picker("主题", selection: binding(\.themeMode)) {
+                        ForEach(FocusThemeMode.allCases, id: \.self) { mode in
+                            Text(mode.title).tag(mode)
+                        }
+                    }
+
+                    ColorPicker(
+                        "强调色",
+                        selection: accentColorBinding,
+                        supportsOpacity: false
+                    )
+
+                    LabeledContent("颜色值") {
+                        Text(settingsStore.settings.accentColorHex)
+                            .font(.body.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Button("恢复 B 站粉") {
+                        settingsStore.settings.accentColorHex = FocusSettings.defaultAccentColorHex
+                    }
+                    .disabled(
+                        settingsStore.settings.accentColorHex == FocusSettings.defaultAccentColorHex
+                    )
+                } header: {
+                    Text("入口与主题")
                 }
 
-                Section("规则") {
+                Section {
                     Toggle("首页重定向", isOn: binding(\.redirectEnabled))
                     Toggle("动态详情页去干扰", isOn: binding(\.dynamicMaskEnabled))
                     Toggle("搜索结果页去干扰", isOn: binding(\.searchMaskEnabled))
                     Toggle("播放页去干扰", isOn: binding(\.playerMaskEnabled))
+                } header: {
+                    Text("规则")
                 }
 
-                Section("高级") {
+                Section {
+                    Toggle("原生播放器默认显示弹幕", isOn: binding(\.nativeDanmakuEnabled))
+                } header: {
+                    Text("播放")
+                }
+
+                Section {
+                    NavigationLink("关注 UP 主动态配置") {
+                        FocusDynamicAuthorSettingsListView(viewModel: viewModel, settingsStore: settingsStore)
+                    }
+                } header: {
+                    Text("动态分类")
+                }
+
+                Section {
                     Toggle("调试日志", isOn: binding(\.debugMode))
                     Button("恢复默认设置", role: .destructive) {
                         settingsStore.reset()
                     }
+                } header: {
+                    Text("高级")
                 }
             }
             .navigationTitle("设置")
+            .navigationBarTitleDisplayMode(.inline)
+            .task {
+                viewModel.loadIfNeeded()
+            }
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("完成") {
@@ -3657,5 +4045,116 @@ private struct FocusSettingsView: View {
             set: { settingsStore.settings[keyPath: keyPath] = $0 }
         )
     }
+
+    private var accentColorBinding: Binding<Color> {
+        Binding(
+            get: {
+                FocusAccentColor.color(hex: settingsStore.settings.accentColorHex)
+            },
+            set: { color in
+                settingsStore.settings.accentColorHex = FocusAccentColor.hexString(from: color)
+            }
+        )
+    }
 }
+
+private struct FocusDynamicAuthorSettingsListView: View {
+    @ObservedObject var viewModel: FocusDynamicAuthorSettingsViewModel
+    @ObservedObject var settingsStore: FocusSettingsStore
+
+    var body: some View {
+        content
+            .navigationTitle("UP 主动态配置")
+            .navigationBarTitleDisplayMode(.inline)
+            .task {
+                viewModel.loadIfNeeded()
+            }
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        switch viewModel.state {
+        case .idle, .loading:
+            ProgressView("加载关注列表…")
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        case let .failed(message):
+            FocusStateView(
+                title: "关注列表加载失败",
+                message: message,
+                buttonTitle: "重试",
+                action: viewModel.reload
+            )
+        case let .loaded(authors):
+            List(authors, id: \.filterIdentity) { author in
+                NavigationLink(author.name) {
+                    FocusDynamicAuthorFilterView(author: author, settingsStore: settingsStore)
+                }
+            }
+            .listStyle(.insetGrouped)
+        }
+    }
+}
+
+private struct FocusDynamicAuthorFilterView: View {
+    let author: DynamicCard.Author
+    @ObservedObject var settingsStore: FocusSettingsStore
+
+    var body: some View {
+        List {
+            Section {
+                HStack(spacing: 12) {
+                    if let avatarURL = author.avatarURL {
+                        FocusRemoteImage(url: avatarURL, referer: "https://space.bilibili.com/\(author.mid)") { phase in
+                            switch phase {
+                            case let .success(image):
+                                image.resizable().scaledToFill()
+                            default:
+                                Circle().fill(Color(uiColor: .tertiarySystemFill))
+                            }
+                        }
+                        .frame(width: 48, height: 48)
+                        .clipShape(Circle())
+                    }
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(author.name)
+                            .font(.headline.weight(.semibold))
+                        Text("选择要保留的动态类型")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.vertical, 6)
+            }
+
+            Section("显示内容") {
+                ForEach([FocusDynamicFilterKind.video, .articleLike], id: \.self) { kind in
+                    Toggle(kind.title, isOn: binding(for: kind))
+                }
+            }
+        }
+        .listStyle(.insetGrouped)
+        .navigationTitle(author.name)
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private func binding(for kind: FocusDynamicFilterKind) -> Binding<Bool> {
+        Binding(
+            get: { settingsStore.dynamicKinds(for: author).contains(kind) },
+            set: { isEnabled in
+                var kinds = settingsStore.dynamicKinds(for: author)
+                if isEnabled {
+                    kinds.insert(kind)
+                } else {
+                    kinds.remove(kind)
+                }
+                if kinds.isEmpty {
+                    kinds = [kind]
+                }
+                settingsStore.setDynamicKinds(kinds, for: author)
+            }
+        )
+    }
+}
+
 #endif

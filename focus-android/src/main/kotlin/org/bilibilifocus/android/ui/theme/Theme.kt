@@ -5,7 +5,12 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.graphics.luminance
+import org.bilibilifocus.core.model.FocusSettings
+import org.bilibilifocus.core.model.FocusThemeMode
 
 val BiliPink = Color(0xFFFB7299)
 
@@ -72,11 +77,52 @@ val BiliDarkColorScheme = darkColorScheme(
 
 @Composable
 fun BilibiliFocusTheme(
-    darkTheme: Boolean = isSystemInDarkTheme(),
+    themeMode: FocusThemeMode = FocusThemeMode.SYSTEM,
+    accentColorHex: String = FocusSettings.DEFAULT_ACCENT_COLOR_HEX,
     content: @Composable () -> Unit,
 ) {
+    val darkTheme = when (themeMode) {
+        FocusThemeMode.SYSTEM -> isSystemInDarkTheme()
+        FocusThemeMode.LIGHT -> false
+        FocusThemeMode.DARK -> true
+    }
+    val accentColor = remember(accentColorHex) { focusAccentColor(accentColorHex) }
+    val colorScheme = remember(darkTheme, accentColor) {
+        focusColorScheme(darkTheme = darkTheme, accentColor = accentColor)
+    }
     MaterialTheme(
-        colorScheme = if (darkTheme) BiliDarkColorScheme else BiliLightColorScheme,
+        colorScheme = colorScheme,
         content = content,
     )
+}
+
+internal fun focusAccentColor(rawValue: String): Color {
+    val normalized = FocusSettings.normalizedAccentColorHex(rawValue)
+        ?: FocusSettings.DEFAULT_ACCENT_COLOR_HEX
+    val rgb = normalized.drop(1).toLong(16)
+    return Color((0xFF000000L or rgb).toInt())
+}
+
+private fun focusColorScheme(darkTheme: Boolean, accentColor: Color) =
+    (if (darkTheme) BiliDarkColorScheme else BiliLightColorScheme).let { base ->
+        val containerBase = if (darkTheme) base.surface else Color.White
+        val container = lerp(containerBase, accentColor, if (darkTheme) 0.36f else 0.18f)
+        base.copy(
+            primary = accentColor,
+            onPrimary = contrastingContentColor(accentColor),
+            primaryContainer = container,
+            onPrimaryContainer = contrastingContentColor(container),
+            secondary = accentColor,
+            onSecondary = contrastingContentColor(accentColor),
+            secondaryContainer = container,
+            onSecondaryContainer = contrastingContentColor(container),
+            inversePrimary = accentColor,
+        )
+    }
+
+private fun contrastingContentColor(background: Color): Color {
+    val luminance = background.luminance()
+    val blackContrast = (luminance + 0.05f) / 0.05f
+    val whiteContrast = 1.05f / (luminance + 0.05f)
+    return if (blackContrast >= whiteContrast) Color.Black else Color.White
 }
