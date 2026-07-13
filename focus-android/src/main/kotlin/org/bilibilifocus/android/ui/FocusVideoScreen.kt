@@ -96,15 +96,8 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
-import androidx.media3.common.MediaItem
-import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
-import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
-import androidx.media3.datasource.DefaultHttpDataSource
-import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.source.MergingMediaSource
-import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import coil.compose.AsyncImage
@@ -114,10 +107,13 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.bilibilifocus.android.AndroidCookieProvider
 import org.bilibilifocus.android.FocusVideoViewModel
+import org.bilibilifocus.android.FocusPictureInPicturePolicy
 import org.bilibilifocus.android.R
 import org.bilibilifocus.android.VideoDanmakuLoadStatus
 import org.bilibilifocus.android.VideoDanmakuUiState
 import org.bilibilifocus.android.VideoUiState
+import org.bilibilifocus.android.playback.FocusPlaybackConnection
+import org.bilibilifocus.android.playback.FocusPlaybackRequest
 import org.bilibilifocus.core.model.VideoComment
 import org.bilibilifocus.core.model.VideoDanmaku
 import org.bilibilifocus.core.model.VideoDanmakuMode
@@ -127,7 +123,6 @@ import org.bilibilifocus.core.model.VideoInfo
 import org.bilibilifocus.core.model.VideoInteractionState
 import org.bilibilifocus.core.model.VideoPage
 import org.bilibilifocus.core.service.KtorHttpClient
-import org.bilibilifocus.core.service.PlayUrlService
 import org.bilibilifocus.core.service.VideoActionService
 import org.bilibilifocus.core.service.VideoInfoService
 
@@ -147,6 +142,9 @@ fun FocusVideoScreen(
     onNativeDanmakuEnabledChange: (Boolean) -> Unit = {},
     viewModel: FocusVideoViewModel? = null,
     scrollState: ScrollState = rememberScrollState(),
+    playbackConnection: FocusPlaybackConnection,
+    playerSurfaceRevision: Int,
+    isInPictureInPictureMode: Boolean,
 ) {
     val bvid = remember(url) { VideoInfoService.extractBvid(url) }
     val initialPageNumber = remember(url) { parseRequestedPage(url) }
@@ -185,15 +183,13 @@ fun FocusVideoScreen(
     val isPhone = deviceType == FocusVideoDeviceType.Phone
     val isNarrowLayout = configuration.screenWidthDp < 840
 
-    val exoPlayer = remember { ExoPlayer.Builder(context).build() }
-    val playUrlService = remember {
-        PlayUrlService(cookieProvider = AndroidCookieProvider(), httpClient = KtorHttpClient())
-    }
-    var playerError by remember { mutableStateOf<String?>(null) }
-    var isPlaying by remember { mutableStateOf(false) }
-    var playbackSpeed by remember { mutableStateOf(1f) }
+    val player by playbackConnection.controller.collectAsState()
+    val playbackState by playbackConnection.state.collectAsState()
+    val playerError = playbackState.errorMessage
+    val isPlaying = playbackState.isPlaying
+    val playbackSpeed = playbackState.playbackSpeed
     var selectedPageCid by remember(url) { mutableStateOf<Long?>(null) }
-    var videoAspectRatio by remember { mutableStateOf(16f / 9f) }
+    var videoAspectRatio by remember { mutableStateOf(playbackState.videoAspectRatio) }
     var playbackPositionMillis by remember { mutableLongStateOf(0L) }
     var fullscreenLandscapeOrientation by remember {
         mutableStateOf(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE)
@@ -233,40 +229,10 @@ fun FocusVideoScreen(
         requestedPageCid = initialPageCid,
     )
 
-    val reportCurrentWatchHistory by rememberUpdatedState(
-        newValue = { force: Boolean ->
-            val currentInfo = info
-            val currentPage = activePage
-            if (currentInfo != null && currentPage != null) {
-                resolvedViewModel.reportWatchHistory(
-                    aid = currentInfo.aid,
-                    cid = currentPage.cid,
-                    progressSeconds = exoPlayer.currentPosition.coerceAtLeast(0) / 1_000,
-                    force = force,
-                )
-            }
-        },
-    )
-
-    DisposableEffect(info?.aid, activePage?.cid, exoPlayer) {
-        val reportAid = info?.aid
-        val reportCid = activePage?.cid
-        onDispose {
-            if (reportAid != null && reportCid != null) {
-                resolvedViewModel.reportWatchHistory(
-                    aid = reportAid,
-                    cid = reportCid,
-                    progressSeconds = exoPlayer.currentPosition.coerceAtLeast(0) / 1_000,
-                    force = true,
-                )
-            }
-        }
-    }
-
-    LaunchedEffect(exoPlayer) {
+    LaunchedEffect(player) {
         while (true) {
             withFrameNanos { }
-            playbackPositionMillis = exoPlayer.currentPosition.coerceAtLeast(0)
+            playbackPositionMillis = player?.currentPosition?.coerceAtLeast(0) ?: 0
         }
     }
 
@@ -288,85 +254,35 @@ fun FocusVideoScreen(
         }
     }
 
-    LaunchedEffect(info?.aid, activePage?.cid, isPlaying) {
-        val resolvedInfo = info ?: return@LaunchedEffect
-        val resolvedPage = activePage ?: return@LaunchedEffect
-        if (!isPlaying) return@LaunchedEffect
-        while (true) {
-            delay(15_000)
-            resolvedViewModel.reportWatchHistory(
-                aid = resolvedInfo.aid,
-                cid = resolvedPage.cid,
-                progressSeconds = exoPlayer.currentPosition.coerceAtLeast(0) / 1_000,
-                force = false,
-            )
-        }
-    }
-
     LaunchedEffect(info?.bvid, activePage?.cid) {
         val resolvedInfo = info ?: return@LaunchedEffect
         val resolvedPage = activePage ?: return@LaunchedEffect
-        playerError = null
-        try {
-            val result = playUrlService.fetchPlayUrl(resolvedInfo.bvid, resolvedPage.cid)
-            val headers = buildMap {
-                put("Referer", result.referer)
-                if (result.cookie.isNotEmpty()) put("Cookie", result.cookie)
-            }
-            val httpFactory = DefaultHttpDataSource.Factory()
-                .setUserAgent(result.userAgent)
-                .setAllowCrossProtocolRedirects(true)
-                .setDefaultRequestProperties(headers)
-            val videoSource = ProgressiveMediaSource.Factory(httpFactory)
-                .createMediaSource(MediaItem.fromUri(result.videoUrl))
-            val source = result.audioUrl?.let { audioUrl ->
-                val audioSource = ProgressiveMediaSource.Factory(httpFactory)
-                    .createMediaSource(MediaItem.fromUri(audioUrl))
-                MergingMediaSource(videoSource, audioSource)
-            } ?: videoSource
-            exoPlayer.setMediaSource(source)
-            exoPlayer.prepare()
-            exoPlayer.playWhenReady = true
-            exoPlayer.playbackParameters = PlaybackParameters(playbackSpeed)
-            resolvedViewModel.reportWatchHistory(
+        playbackConnection.load(
+            FocusPlaybackRequest(
+                bvid = resolvedInfo.bvid,
                 aid = resolvedInfo.aid,
                 cid = resolvedPage.cid,
-                progressSeconds = 0,
-                force = true,
-            )
-        } catch (e: Exception) {
-            playerError = e.message ?: "视频加载失败"
-        }
+                title = if (resolvedInfo.pages.size > 1 && resolvedPage.title.isNotBlank()) {
+                    "${resolvedInfo.title} · ${resolvedPage.title}"
+                } else {
+                    resolvedInfo.title
+                },
+                author = resolvedInfo.author.name,
+                artworkUrl = resolvedInfo.coverURL,
+                durationSeconds = resolvedPage.duration,
+                startPositionMillis = 0,
+                autoPlay = true,
+            ),
+        )
     }
 
-    DisposableEffect(exoPlayer) {
-        val listener = object : Player.Listener {
-            override fun onIsPlayingChanged(playing: Boolean) {
-                isPlaying = playing
-                if (!playing) reportCurrentWatchHistory(true)
-            }
-
-            override fun onPlaybackParametersChanged(playbackParameters: PlaybackParameters) {
-                playbackSpeed = playbackParameters.speed
-            }
-
-            override fun onVideoSizeChanged(videoSize: VideoSize) {
-                val width = videoSize.width
-                val height = videoSize.height
-                if (width > 0 && height > 0) {
-                    val ratio = (width * videoSize.pixelWidthHeightRatio) / height.toFloat()
-                    if (ratio.isFinite() && ratio > 0f) {
-                        videoAspectRatio = ratio
-                    }
-                }
-            }
-        }
-        exoPlayer.addListener(listener)
-        onDispose {
-            reportCurrentWatchHistory(true)
-            exoPlayer.removeListener(listener)
-            exoPlayer.release()
-        }
+    LaunchedEffect(playbackState.videoAspectRatio, info?.width, info?.height) {
+        videoAspectRatio = playbackState.videoAspectRatio
+            .takeIf { it.isFinite() && it > 0f }
+            ?: FocusVideoFullscreenPolicy.aspectRatio(
+                width = info?.width ?: 0,
+                height = info?.height ?: 0,
+            )
     }
 
     PhoneFullscreenRotationEffect(
@@ -423,6 +339,18 @@ fun FocusVideoScreen(
             }
             setSystemBarsHidden(activity, false)
         }
+    }
+
+    if (!FocusPictureInPicturePolicy.shouldRenderEmbeddedPlayerSurface(isInPictureInPictureMode)) {
+        // MainActivity owns the only PlayerView while in PiP. Keeping the inline
+        // or fullscreen SurfaceView alive here makes large-screen window scaling
+        // display the old page-sized surface in the center of the PiP window.
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black),
+        )
+        return
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
@@ -518,16 +446,18 @@ fun FocusVideoScreen(
                                 if (!isFullscreen) {
                                     if (isPhone) {
                                         PlayerSurface(
-                                            player = exoPlayer,
+                                            player = player,
                                             showController = false,
                                             onToggleFullscreen = requestFullscreen,
+                                            attachmentKey = playerSurfaceRevision,
                                             modifier = Modifier.fillMaxSize(),
                                         )
                                     } else {
                                         PlayerSurface(
-                                            player = exoPlayer,
+                                            player = player,
                                             showController = false,
                                             onToggleFullscreen = requestFullscreen,
+                                            attachmentKey = playerSurfaceRevision,
                                             modifier = Modifier.fillMaxSize(),
                                         )
                                     }
@@ -633,11 +563,11 @@ fun FocusVideoScreen(
                 isPlaying = isPlaying,
                 playbackSpeed = playbackSpeed,
                 onTogglePlay = {
-                    if (exoPlayer.isPlaying) exoPlayer.pause() else exoPlayer.play()
+                    player?.let { if (it.isPlaying) it.pause() else it.play() }
                 },
                 onChangeSpeed = {
                     val next = nextSpeed(playbackSpeed)
-                    exoPlayer.playbackParameters = PlaybackParameters(next)
+                    player?.setPlaybackSpeed(next)
                 },
                 danmakuEnabled = nativeDanmakuEnabled,
                 onToggleDanmaku = {
@@ -674,9 +604,10 @@ fun FocusVideoScreen(
                             .aspectRatio(videoAspectRatio)
                     }
                     PlayerSurface(
-                        player = exoPlayer,
+                        player = player,
                         showController = true,
                         onToggleFullscreen = requestFullscreenExit,
+                        attachmentKey = playerSurfaceRevision,
                         modifier = fullscreenPlayerModifier,
                     )
                     VideoDanmakuOverlay(
@@ -718,9 +649,10 @@ fun FocusVideoScreen(
                         contentAlignment = Alignment.Center,
                     ) {
                         PlayerSurface(
-                            player = exoPlayer,
+                            player = player,
                             showController = true,
                             onToggleFullscreen = requestFullscreenExit,
+                            attachmentKey = playerSurfaceRevision,
                             modifier = Modifier.fillMaxSize(),
                         )
                         VideoDanmakuOverlay(
@@ -1344,9 +1276,10 @@ private fun EpisodeCard(
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
 private fun PlayerSurface(
-    player: ExoPlayer,
+    player: Player?,
     showController: Boolean,
     onToggleFullscreen: () -> Unit,
+    attachmentKey: Int,
     modifier: Modifier = Modifier,
 ) {
     AndroidView(
@@ -1363,7 +1296,11 @@ private fun PlayerSurface(
         update = { view ->
             view.useController = showController
             view.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
-            view.player = player
+            if (view.tag != attachmentKey || view.player !== player) {
+                view.player = null
+                view.player = player
+                view.tag = attachmentKey
+            }
             view.setFullscreenButtonClickListener { onToggleFullscreen() }
         },
         onRelease = { view ->

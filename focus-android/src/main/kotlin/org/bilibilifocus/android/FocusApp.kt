@@ -88,6 +88,7 @@ import org.bilibilifocus.android.ui.FocusUserScreen
 import org.bilibilifocus.android.ui.FocusUserCollectionScreen
 import org.bilibilifocus.android.ui.FocusVideoScreen
 import org.bilibilifocus.android.ui.FocusWebView
+import org.bilibilifocus.android.playback.FocusPlaybackConnection
 import org.bilibilifocus.core.model.FavFolder
 import org.bilibilifocus.core.model.FocusEntry
 import org.bilibilifocus.core.model.FocusDynamicFilterKind
@@ -109,7 +110,12 @@ import org.bilibilifocus.core.service.VideoInfoService
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalHazeMaterialsApi::class)
 @Composable
-fun FocusApp(settingsViewModel: FocusSettingsViewModel) {
+fun FocusApp(
+    settingsViewModel: FocusSettingsViewModel,
+    playbackConnection: FocusPlaybackConnection,
+    playerSurfaceRevision: Int,
+    isInPictureInPictureMode: Boolean,
+) {
     val widthClass = rememberFocusWindowClass()
     val isWideLayout = widthClass == FocusWindowClass.Expanded
     val settings by settingsViewModel.settings.collectAsState()
@@ -169,24 +175,67 @@ fun FocusApp(settingsViewModel: FocusSettingsViewModel) {
     val historyViewModels = remember { mutableStateMapOf<String, FocusHistoryViewModel>() }
     val historyGridStates = remember { mutableStateMapOf<String, LazyGridState>() }
 
+    fun selectTab(tab: Int) {
+        val hidesDynamicVideo = selectedTab == 0 && tab != 0 &&
+            dynamicDetailStack.lastOrNull() is OverlayRoute.Video
+        if (FocusPlaybackRoutePolicy.shouldStop(
+                isLeavingVideoRoute = hidesDynamicVideo,
+                isApplicationBackgrounding = false,
+            )
+        ) {
+            playbackConnection.stop()
+        }
+        selectedTab = tab
+    }
+
     fun pushOverlay(route: OverlayRoute) {
         if (overlayStack.lastOrNull() == route) return
+        if (FocusPlaybackRoutePolicy.shouldStop(
+                isLeavingVideoRoute = overlayStack.lastOrNull() is OverlayRoute.Video &&
+                    route !is OverlayRoute.Video,
+                isApplicationBackgrounding = false,
+            )
+        ) {
+            playbackConnection.stop()
+        }
         overlayStack.add(route)
     }
 
     fun popOverlay() {
         if (overlayStack.isNotEmpty()) {
+            if (FocusPlaybackRoutePolicy.shouldStop(
+                    isLeavingVideoRoute = overlayStack.last() is OverlayRoute.Video,
+                    isApplicationBackgrounding = false,
+                )
+            ) {
+                playbackConnection.stop()
+            }
             overlayStack.removeAt(overlayStack.lastIndex)
         }
     }
 
     fun pushDynamicDetail(route: OverlayRoute) {
         if (dynamicDetailStack.lastOrNull() == route) return
+        if (FocusPlaybackRoutePolicy.shouldStop(
+                isLeavingVideoRoute = dynamicDetailStack.lastOrNull() is OverlayRoute.Video &&
+                    route !is OverlayRoute.Video,
+                isApplicationBackgrounding = false,
+            )
+        ) {
+            playbackConnection.stop()
+        }
         dynamicDetailStack.add(route)
     }
 
     fun popDynamicDetail() {
         if (dynamicDetailStack.isNotEmpty()) {
+            if (FocusPlaybackRoutePolicy.shouldStop(
+                    isLeavingVideoRoute = dynamicDetailStack.last() is OverlayRoute.Video,
+                    isApplicationBackgrounding = false,
+                )
+            ) {
+                playbackConnection.stop()
+            }
             dynamicDetailStack.removeAt(dynamicDetailStack.lastIndex)
         }
     }
@@ -254,6 +303,9 @@ fun FocusApp(settingsViewModel: FocusSettingsViewModel) {
                     },
                     viewModel = viewModel,
                     scrollState = scrollState,
+                    playbackConnection = playbackConnection,
+                    playerSurfaceRevision = playerSurfaceRevision,
+                    isInPictureInPictureMode = isInPictureInPictureMode,
                 )
             }
 
@@ -423,7 +475,7 @@ fun FocusApp(settingsViewModel: FocusSettingsViewModel) {
             FocusDynamicTabletScaffold(
                 widthClass = widthClass,
                 selectedTab = selectedTab,
-                onSelectTab = { selectedTab = it },
+                onSelectTab = ::selectTab,
                 onOpenSettings = { showSettings = true },
                 primaryContent = { contentPadding ->
                     FocusDynamicFeedScreen(
@@ -434,7 +486,7 @@ fun FocusApp(settingsViewModel: FocusSettingsViewModel) {
                         onOpenUser = openDynamicUser,
                         onOpenSearch = { query ->
                             pendingSearchQuery = query
-                            selectedTab = 1
+                            selectTab(1)
                         },
                         onSelectedFilterChange = { filter ->
                             savedFeedFilterName = filter.name
@@ -453,7 +505,7 @@ fun FocusApp(settingsViewModel: FocusSettingsViewModel) {
             FocusTabletScaffold(
                 widthClass = widthClass,
                 selectedTab = selectedTab,
-                onSelectTab = { selectedTab = it },
+                onSelectTab = ::selectTab,
                 onOpenSettings = { showSettings = true },
             ) { contentPadding ->
                 FocusPrimaryTabContent(
@@ -468,7 +520,7 @@ fun FocusApp(settingsViewModel: FocusSettingsViewModel) {
                     onOpenUser = openUser,
                     onSearchQueryFromFeed = { query ->
                         pendingSearchQuery = query
-                        selectedTab = 1
+                        selectTab(1)
                     },
                     onFeedFilterChange = { filter ->
                         savedFeedFilterName = filter.name
@@ -487,7 +539,7 @@ fun FocusApp(settingsViewModel: FocusSettingsViewModel) {
         } else {
             FocusCompactScaffold(
                 selectedTab = selectedTab,
-                onSelectTab = { selectedTab = it },
+                onSelectTab = ::selectTab,
                 onOpenSettings = { showSettings = true },
             ) { contentPadding ->
                 FocusPrimaryTabContent(
@@ -502,7 +554,7 @@ fun FocusApp(settingsViewModel: FocusSettingsViewModel) {
                     onOpenUser = openUser,
                     onSearchQueryFromFeed = { query ->
                         pendingSearchQuery = query
-                        selectedTab = 1
+                        selectTab(1)
                     },
                     onFeedFilterChange = { filter ->
                         savedFeedFilterName = filter.name
@@ -907,6 +959,13 @@ private fun tabletContentWidthFor(widthClass: FocusWindowClass, selectedTab: Int
         FocusWindowClass.Medium -> 660.dp
         FocusWindowClass.Expanded -> 700.dp
     }
+}
+
+internal object FocusPlaybackRoutePolicy {
+    fun shouldStop(
+        isLeavingVideoRoute: Boolean,
+        isApplicationBackgrounding: Boolean,
+    ): Boolean = isLeavingVideoRoute && !isApplicationBackgrounding
 }
 
 private fun dynamicListWidthFor(widthClass: FocusWindowClass): Dp = when (widthClass) {

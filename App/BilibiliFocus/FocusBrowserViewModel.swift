@@ -679,8 +679,8 @@ final class FocusAppViewModel: ObservableObject {
         refreshLoginSensitiveContent(reloadDynamicFeed: false)
     }
 
-    func handleAppWillResignActive() {
-        activeNativeVideoViewModel?.handleAppWillResignActive()
+    func handleAppDidEnterBackground() {
+        activeNativeVideoViewModel?.handleAppDidEnterBackground()
     }
 
     func goBack() {

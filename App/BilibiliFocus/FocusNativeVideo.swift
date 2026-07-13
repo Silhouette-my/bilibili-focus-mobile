@@ -3,6 +3,7 @@ import AVFoundation
 import AVKit
 import Combine
 import FocusCore
+import MediaPlayer
 import SwiftUI
 import UIKit
 
@@ -79,8 +80,17 @@ final class FocusNativeVideoViewModel: ObservableObject {
     private var danmakuContext: DanmakuContext?
     private var danmakuRevision = 0
     private var shouldResumeAfterActivation = false
-    private var shouldResumeAfterBackground = false
+    private var shouldResumeAfterAudioInterruption = false
     private var isReplacingPlayerItem = false
+    private var isPlaybackSessionActive = false
+    nonisolated(unsafe) private var audioInterruptionObserver: NSObjectProtocol?
+    nonisolated(unsafe) private var audioRouteChangeObserver: NSObjectProtocol?
+    nonisolated(unsafe) private var mediaServicesResetObserver: NSObjectProtocol?
+    nonisolated(unsafe) private var remoteCommandTargets: [(command: MPRemoteCommand, target: Any)] = []
+    private var nowPlayingArtworkTask: Task<Void, Never>?
+    private var nowPlayingRevision = 0
+    private var nowPlayingArtwork: MPMediaItemArtwork?
+    private var lastNowPlayingElapsedUpdate: Int64 = -1
     private var lastHandledDeviceOrientation: UIDeviceOrientation = .unknown
     private var fullscreenTransitionRevision = 0
     private let landscapeRequest: LandscapeRequest
@@ -149,6 +159,8 @@ final class FocusNativeVideoViewModel: ObservableObject {
         let player = AVQueuePlayer()
         player.actionAtItemEnd = .advance
         player.automaticallyWaitsToMinimizeStalling = true
+        player.audiovisualBackgroundPlaybackPolicy =
+            FocusNativePlaybackLifecyclePolicy.audiovisualBackgroundPlaybackPolicy
         self.player = player
 
         timeControlObservation = player.observe(\.timeControlStatus, options: [.initial, .new]) { [weak self] player, _ in
@@ -157,6 +169,7 @@ final class FocusNativeVideoViewModel: ObservableObject {
                     return
                 }
                 self.isPlaying = player.timeControlStatus == .playing
+                self.updateNowPlayingInfo()
                 if player.timeControlStatus != .playing, !self.isReplacingPlayerItem {
                     self.queueWatchHistoryReport(force: true)
                 }
@@ -167,7 +180,11 @@ final class FocusNativeVideoViewModel: ObservableObject {
                 return
             }
             Task { @MainActor [weak self] in
-                self?.playbackRate = player.rate
+                guard let self else {
+                    return
+                }
+                self.playbackRate = player.rate
+                self.updateNowPlayingInfo()
             }
         }
         playerStatusObservation = player.observe(\.status, options: [.new]) { [weak self] player, _ in
@@ -188,6 +205,7 @@ final class FocusNativeVideoViewModel: ObservableObject {
                 let milliseconds = Self.milliseconds(from: time)
                 self?.playbackPositionMilliseconds = milliseconds
                 self?.updateDanmakuPosition(milliseconds)
+                self?.updateNowPlayingInfoIfNeeded(milliseconds: milliseconds)
                 if self?.player.timeControlStatus == .playing {
                     self?.queueWatchHistoryReport(force: false)
                 }
@@ -203,6 +221,7 @@ final class FocusNativeVideoViewModel: ObservableObject {
         actionTasks.values.forEach { $0.cancel() }
         orientationDebounceTask?.cancel()
         portraitExitTask?.cancel()
+        nowPlayingArtworkTask?.cancel()
         timeControlObservation?.invalidate()
         rateObservation?.invalidate()
         playerStatusObservation?.invalidate()
@@ -211,12 +230,27 @@ final class FocusNativeVideoViewModel: ObservableObject {
         }
         danmakuViewTask?.cancel()
         danmakuSegmentTasks.values.forEach { $0.cancel() }
+        if let audioInterruptionObserver {
+            NotificationCenter.default.removeObserver(audioInterruptionObserver)
+        }
+        if let audioRouteChangeObserver {
+            NotificationCenter.default.removeObserver(audioRouteChangeObserver)
+        }
+        if let mediaServicesResetObserver {
+            NotificationCenter.default.removeObserver(mediaServicesResetObserver)
+        }
+        for entry in remoteCommandTargets {
+            entry.command.removeTarget(entry.target)
+        }
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         player.pause()
         player.removeAllItems()
     }
 
     func activate(url: URL) {
         open(url)
+        activatePlaybackSession()
         loadIfNeeded()
 
         if let detail {
@@ -255,6 +289,7 @@ final class FocusNativeVideoViewModel: ObservableObject {
         playerErrorMessage = nil
         hasPreparedPlayer = false
         isLoadingPlayback = false
+        resetNowPlayingMetadata()
         player.pause()
         player.removeAllItems()
     }
@@ -305,6 +340,7 @@ final class FocusNativeVideoViewModel: ObservableObject {
                     ?? detail.pages.first(where: { $0.cid == detail.cid })?.cid
                     ?? detail.pages.first?.cid
                     ?? detail.cid
+                configureNowPlayingMetadata(for: detail)
                 configureDanmaku(for: detail, playbackPositionMilliseconds: 0)
                 preparePlayback()
                 loadComments(for: detail)
@@ -323,7 +359,7 @@ final class FocusNativeVideoViewModel: ObservableObject {
     func suspend() {
         queueWatchHistoryReport(force: true)
         shouldResumeAfterActivation = player.timeControlStatus == .playing
-        shouldResumeAfterBackground = false
+        shouldResumeAfterAudioInterruption = false
         loadTask?.cancel()
         loadTask = nil
         commentsTask?.cancel()
@@ -344,25 +380,24 @@ final class FocusNativeVideoViewModel: ObservableObject {
         }
         isFullscreen = false
         player.pause()
+        tearDownPlaybackSession(clearNowPlaying: true)
         if case .loading = state {
             state = .idle
         }
     }
 
-    func handleAppWillResignActive() {
+    func handleAppDidEnterBackground() {
         queueWatchHistoryReport(force: true)
-        shouldResumeAfterBackground = player.timeControlStatus == .playing
-        player.pause()
+        if FocusNativePlaybackLifecyclePolicy.shouldPauseForApplicationBackground(
+            isPlaying: player.timeControlStatus == .playing
+        ) {
+            player.pause()
+        }
+        updateNowPlayingInfo()
     }
 
     func handleAppDidBecomeActive() {
-        guard shouldResumeAfterBackground, player.currentItem != nil else {
-            shouldResumeAfterBackground = false
-            return
-        }
-        shouldResumeAfterBackground = false
-        configureAudioSession()
-        player.playImmediately(atRate: playbackRate)
+        updateNowPlayingInfo()
     }
 
     func selectPage(_ page: FocusVideoPage) {
@@ -371,6 +406,7 @@ final class FocusNativeVideoViewModel: ObservableObject {
         }
         queueWatchHistoryReport(force: true)
         selectedPageCID = page.cid
+        updateNowPlayingInfo()
         if let detail {
             configureDanmaku(for: detail, playbackPositionMilliseconds: 0)
         }
@@ -640,6 +676,7 @@ final class FocusNativeVideoViewModel: ObservableObject {
                 player.defaultRate = playbackRate
                 player.playImmediately(atRate: playbackRate)
                 isReplacingPlayerItem = false
+                updateNowPlayingInfo()
                 queueWatchHistoryReport(force: true)
             } catch is CancellationError {
                 return
@@ -973,6 +1010,316 @@ final class FocusNativeVideoViewModel: ObservableObject {
         state = .loaded(detail.replacing(statistics: transform(detail.statistics)))
     }
 
+    private func activatePlaybackSession() {
+        guard !isPlaybackSessionActive else {
+            return
+        }
+        isPlaybackSessionActive = true
+        installAudioSessionObservers()
+        installRemoteCommands()
+        updateNowPlayingInfo()
+    }
+
+    private func tearDownPlaybackSession(clearNowPlaying: Bool) {
+        if let audioInterruptionObserver {
+            NotificationCenter.default.removeObserver(audioInterruptionObserver)
+            self.audioInterruptionObserver = nil
+        }
+        if let audioRouteChangeObserver {
+            NotificationCenter.default.removeObserver(audioRouteChangeObserver)
+            self.audioRouteChangeObserver = nil
+        }
+        if let mediaServicesResetObserver {
+            NotificationCenter.default.removeObserver(mediaServicesResetObserver)
+            self.mediaServicesResetObserver = nil
+        }
+        removeRemoteCommands()
+        isPlaybackSessionActive = false
+        shouldResumeAfterAudioInterruption = false
+        if clearNowPlaying {
+            resetNowPlayingMetadata()
+        }
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
+
+    private func installAudioSessionObservers() {
+        guard audioInterruptionObserver == nil else {
+            return
+        }
+        let center = NotificationCenter.default
+        let session = AVAudioSession.sharedInstance()
+        audioInterruptionObserver = center.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: session,
+            queue: .main
+        ) { [weak self] notification in
+            let rawType = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+            let rawOptions = notification.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
+            Task { @MainActor [weak self] in
+                self?.handleAudioInterruption(rawType: rawType, rawOptions: rawOptions)
+            }
+        }
+        audioRouteChangeObserver = center.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: session,
+            queue: .main
+        ) { [weak self] notification in
+            let rawReason = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
+            Task { @MainActor [weak self] in
+                self?.handleAudioRouteChange(rawReason: rawReason)
+            }
+        }
+        mediaServicesResetObserver = center.addObserver(
+            forName: AVAudioSession.mediaServicesWereResetNotification,
+            object: session,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.handleMediaServicesReset()
+            }
+        }
+    }
+
+    private func handleAudioInterruption(rawType: UInt?, rawOptions: UInt) {
+        guard
+            isPlaybackSessionActive,
+            let rawType,
+            let type = AVAudioSession.InterruptionType(rawValue: rawType)
+        else {
+            return
+        }
+
+        switch type {
+        case .began:
+            shouldResumeAfterAudioInterruption = player.timeControlStatus == .playing
+            queueWatchHistoryReport(force: true)
+            player.pause()
+            updateNowPlayingInfo()
+
+        case .ended:
+            let options = AVAudioSession.InterruptionOptions(rawValue: rawOptions)
+            let shouldResume = FocusNativePlaybackLifecyclePolicy.shouldResumeAfterInterruption(
+                wasPlaying: shouldResumeAfterAudioInterruption,
+                systemAllowsResume: options.contains(.shouldResume)
+            )
+            shouldResumeAfterAudioInterruption = false
+            guard shouldResume, player.currentItem != nil else {
+                updateNowPlayingInfo()
+                return
+            }
+            configureAudioSession()
+            player.playImmediately(atRate: playbackRate)
+            updateNowPlayingInfo()
+
+        @unknown default:
+            shouldResumeAfterAudioInterruption = false
+        }
+    }
+
+    private func handleAudioRouteChange(rawReason: UInt?) {
+        guard
+            isPlaybackSessionActive,
+            let rawReason,
+            AVAudioSession.RouteChangeReason(rawValue: rawReason) == .oldDeviceUnavailable
+        else {
+            return
+        }
+        guard player.timeControlStatus == .playing else {
+            return
+        }
+        queueWatchHistoryReport(force: true)
+        player.pause()
+        updateNowPlayingInfo()
+    }
+
+    private func handleMediaServicesReset() {
+        guard isPlaybackSessionActive, player.currentItem != nil else {
+            return
+        }
+        let shouldResume = player.timeControlStatus == .playing || isPlaying
+        configureAudioSession()
+        if shouldResume {
+            player.playImmediately(atRate: playbackRate)
+        }
+        updateNowPlayingInfo()
+    }
+
+    private func installRemoteCommands() {
+        removeRemoteCommands()
+        let center = MPRemoteCommandCenter.shared()
+        center.playCommand.isEnabled = true
+        center.pauseCommand.isEnabled = true
+        center.togglePlayPauseCommand.isEnabled = true
+        center.changePlaybackPositionCommand.isEnabled = true
+        center.nextTrackCommand.isEnabled = false
+        center.previousTrackCommand.isEnabled = false
+        center.skipForwardCommand.isEnabled = false
+        center.skipBackwardCommand.isEnabled = false
+
+        let playTarget = center.playCommand.addTarget { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.playFromRemoteCommand()
+            }
+            return .success
+        }
+        remoteCommandTargets.append((center.playCommand, playTarget))
+
+        let pauseTarget = center.pauseCommand.addTarget { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.pauseFromRemoteCommand()
+            }
+            return .success
+        }
+        remoteCommandTargets.append((center.pauseCommand, pauseTarget))
+
+        let toggleTarget = center.togglePlayPauseCommand.addTarget { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.togglePlayback()
+            }
+            return .success
+        }
+        remoteCommandTargets.append((center.togglePlayPauseCommand, toggleTarget))
+
+        let positionTarget = center.changePlaybackPositionCommand.addTarget { [weak self] event in
+            guard let event = event as? MPChangePlaybackPositionCommandEvent else {
+                return .commandFailed
+            }
+            let position = event.positionTime
+            Task { @MainActor [weak self] in
+                self?.seekFromRemoteCommand(to: position)
+            }
+            return .success
+        }
+        remoteCommandTargets.append((center.changePlaybackPositionCommand, positionTarget))
+    }
+
+    private func removeRemoteCommands() {
+        for entry in remoteCommandTargets {
+            entry.command.removeTarget(entry.target)
+        }
+        remoteCommandTargets.removeAll()
+    }
+
+    private func playFromRemoteCommand() {
+        guard isPlaybackSessionActive, player.currentItem != nil else {
+            return
+        }
+        configureAudioSession()
+        player.playImmediately(atRate: playbackRate)
+        updateNowPlayingInfo()
+    }
+
+    private func pauseFromRemoteCommand() {
+        guard isPlaybackSessionActive else {
+            return
+        }
+        queueWatchHistoryReport(force: true)
+        player.pause()
+        updateNowPlayingInfo()
+    }
+
+    private func seekFromRemoteCommand(to seconds: TimeInterval) {
+        guard isPlaybackSessionActive, let item = player.currentItem else {
+            return
+        }
+        let duration = item.duration.seconds
+        let upperBound = duration.isFinite && duration > 0 ? duration : seconds
+        let position = min(max(seconds, 0), max(upperBound, 0))
+        player.seek(to: CMTime(seconds: position, preferredTimescale: 600))
+        playbackPositionMilliseconds = Int64(position * 1_000)
+        updateDanmakuPosition(playbackPositionMilliseconds)
+        queueWatchHistoryReport(force: true)
+        updateNowPlayingInfo()
+    }
+
+    private func configureNowPlayingMetadata(for detail: FocusVideoDetail) {
+        nowPlayingRevision &+= 1
+        let revision = nowPlayingRevision
+        nowPlayingArtworkTask?.cancel()
+        nowPlayingArtwork = nil
+        lastNowPlayingElapsedUpdate = -1
+        updateNowPlayingInfo()
+
+        guard let coverURL = detail.coverURL else {
+            return
+        }
+        let referer = currentURL?.absoluteString ?? "https://www.bilibili.com/"
+        nowPlayingArtworkTask = Task { [weak self] in
+            var request = URLRequest(url: coverURL)
+            request.setValue(referer, forHTTPHeaderField: "Referer")
+            request.setValue(FocusUserAgent.mobileSafari(), forHTTPHeaderField: "User-Agent")
+            guard
+                let (data, response) = try? await URLSession.shared.data(for: request),
+                !Task.isCancelled,
+                (response as? HTTPURLResponse).map({ (200 ..< 300).contains($0.statusCode) }) != false,
+                let image = UIImage(data: data)
+            else {
+                return
+            }
+            guard let self, revision == self.nowPlayingRevision else {
+                return
+            }
+            self.nowPlayingArtwork = makeFocusNowPlayingArtwork(image: image)
+            self.updateNowPlayingInfo()
+        }
+    }
+
+    private func resetNowPlayingMetadata() {
+        nowPlayingRevision &+= 1
+        nowPlayingArtworkTask?.cancel()
+        nowPlayingArtworkTask = nil
+        nowPlayingArtwork = nil
+        lastNowPlayingElapsedUpdate = -1
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+        if #available(iOS 13.0, *) {
+            MPNowPlayingInfoCenter.default().playbackState = .stopped
+        }
+    }
+
+    private func updateNowPlayingInfoIfNeeded(milliseconds: Int64) {
+        let elapsedSeconds = max(milliseconds / 1_000, 0)
+        guard lastNowPlayingElapsedUpdate < 0 || abs(elapsedSeconds - lastNowPlayingElapsedUpdate) >= 15 else {
+            return
+        }
+        updateNowPlayingInfo()
+    }
+
+    private func updateNowPlayingInfo() {
+        guard isPlaybackSessionActive, let detail else {
+            return
+        }
+        let page = activePage
+        let duration = max(page?.duration ?? detail.duration, 0)
+        let elapsed = max(Double(currentPlaybackMilliseconds) / 1_000, 0)
+        let effectiveRate = player.timeControlStatus == .playing ? Double(playbackRate) : 0
+        let title: String
+        if detail.pages.count > 1, let page, !page.title.isEmpty {
+            title = "\(detail.title) · \(page.title)"
+        } else {
+            title = detail.title
+        }
+
+        var info: [String: Any] = [
+            MPMediaItemPropertyTitle: title,
+            MPMediaItemPropertyArtist: detail.owner.name,
+            MPMediaItemPropertyPlaybackDuration: Double(duration),
+            MPNowPlayingInfoPropertyElapsedPlaybackTime: min(elapsed, Double(max(duration, 0))),
+            MPNowPlayingInfoPropertyPlaybackRate: effectiveRate,
+            MPNowPlayingInfoPropertyDefaultPlaybackRate: Double(playbackRate),
+            MPNowPlayingInfoPropertyMediaType: MPNowPlayingInfoMediaType.video.rawValue,
+            MPNowPlayingInfoPropertyExternalContentIdentifier: detail.bvid,
+        ]
+        if let nowPlayingArtwork {
+            info[MPMediaItemPropertyArtwork] = nowPlayingArtwork
+        }
+        let center = MPNowPlayingInfoCenter.default()
+        center.nowPlayingInfo = info
+        if #available(iOS 13.0, *) {
+            center.playbackState = player.timeControlStatus == .playing ? .playing : .paused
+        }
+        lastNowPlayingElapsedUpdate = Int64(elapsed)
+    }
+
     private func configureAudioSession() {
         do {
             let session = AVAudioSession.sharedInstance()
@@ -1148,6 +1495,28 @@ private enum FocusNativePlaybackFactory {
             at: .zero
         )
         return composition
+    }
+}
+
+private func makeFocusNowPlayingArtwork(image: UIImage) -> MPMediaItemArtwork {
+    // MediaPlayer invokes this handler on its own access queue. Keeping the
+    // closure outside the @MainActor view model avoids inheriting MainActor.
+    MPMediaItemArtwork(boundsSize: image.size) { _ in image }
+}
+
+enum FocusNativePlaybackLifecyclePolicy {
+    static let audiovisualBackgroundPlaybackPolicy: AVPlayerAudiovisualBackgroundPlaybackPolicy =
+        .continuesIfPossible
+
+    static func shouldPauseForApplicationBackground(isPlaying _: Bool) -> Bool {
+        false
+    }
+
+    static func shouldResumeAfterInterruption(
+        wasPlaying: Bool,
+        systemAllowsResume: Bool
+    ) -> Bool {
+        wasPlaying && systemAllowsResume
     }
 }
 
@@ -1985,6 +2354,8 @@ private struct FocusNativePlayerSurface: UIViewControllerRepresentable {
         controller.showsPlaybackControls = showsPlaybackControls
         controller.videoGravity = .resizeAspect
         controller.allowsPictureInPicturePlayback = true
+        controller.canStartPictureInPictureAutomaticallyFromInline = true
+        controller.updatesNowPlayingInfoCenter = false
         controller.entersFullScreenWhenPlaybackBegins = false
         controller.exitsFullScreenWhenPlaybackEnds = false
         controller.view.backgroundColor = .black
@@ -1997,6 +2368,9 @@ private struct FocusNativePlayerSurface: UIViewControllerRepresentable {
         }
         controller.showsPlaybackControls = showsPlaybackControls
         controller.videoGravity = .resizeAspect
+        controller.allowsPictureInPicturePlayback = true
+        controller.canStartPictureInPictureAutomaticallyFromInline = true
+        controller.updatesNowPlayingInfoCenter = false
         controller.view.backgroundColor = .black
     }
 

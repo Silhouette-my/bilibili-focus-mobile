@@ -631,6 +631,37 @@ final class BilibiliFocusStabilityTests: XCTestCase {
         viewModel.suspend()
     }
 
+    func testNativePlaybackLifecyclePreservesBackgroundPlaybackAndResumesOnlyAllowedInterruptions() {
+        XCTAssertEqual(
+            FocusNativePlaybackLifecyclePolicy.audiovisualBackgroundPlaybackPolicy,
+            .continuesIfPossible
+        )
+        XCTAssertFalse(
+            FocusNativePlaybackLifecyclePolicy.shouldPauseForApplicationBackground(isPlaying: true)
+        )
+        XCTAssertFalse(
+            FocusNativePlaybackLifecyclePolicy.shouldPauseForApplicationBackground(isPlaying: false)
+        )
+        XCTAssertTrue(
+            FocusNativePlaybackLifecyclePolicy.shouldResumeAfterInterruption(
+                wasPlaying: true,
+                systemAllowsResume: true
+            )
+        )
+        XCTAssertFalse(
+            FocusNativePlaybackLifecyclePolicy.shouldResumeAfterInterruption(
+                wasPlaying: false,
+                systemAllowsResume: true
+            )
+        )
+        XCTAssertFalse(
+            FocusNativePlaybackLifecyclePolicy.shouldResumeAfterInterruption(
+                wasPlaying: true,
+                systemAllowsResume: false
+            )
+        )
+    }
+
     func testNativeVideoSelectsRequestedPageAndFallsBackToDetailCID() async {
         let viewModel = FocusNativeVideoViewModel(
             detailService: FocusVideoDetailService(

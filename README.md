@@ -1,128 +1,117 @@
-# Bilibili Focus
+# Bilibili Focus (Mobile)
 
-自用的 Bilibili 移动端容器项目，当前仓库包含 iOS 和 Android 两条主线。
+一款专为移动端打造的 **Bilibili 极简、清爽型第三方容器客户端**。
 
-当前实现方向：
+本项目是作者因不满官方客户端的臃肿和广告而开发的自用高效刷 B 站神器。它采用 **原生（Native）+ 网页（WebView）混合架构**，核心目标是将 B 站的「动态、搜索、视频、个人中心」全面原生化，提供丝滑、无广告、纯净的观看体验。
 
-- `动态`、`搜索`、`视频`、`我的/历史` 优先走原生页面与 API
-- iOS 使用 AVPlayer，Android 使用 Media3/ExoPlayer 承载原生视频播放
-- WebView 保留给尚未原生化的页面，并负责去干扰、导流拦截和小范围布局修复
-- WebView、原生请求和播放器共用登录 Cookie
+目前仓库已同时支持 **iOS (SwiftUI)** 和 **Android (Jetpack Compose)** 两条主线。
 
-## 当前能力
+---
 
-- 原生关注动态流
-- 原生搜索入口与结果页卡片流
-- 原生我的页、播放历史、关注 UP 主列表、收藏夹与合集页
-- 原生 UP 主空间、专栏页、图文动态详情与富文本内容
-- 原生视频详情、分 P 播放、评论、弹幕与播放历史上报
-- 点赞、投币、收藏等登录态视频互动
-- 跟随系统/浅色/深色主题、强调色、动态过滤与弹幕开关
-- iOS unsigned IPA 与 Android debug APK 本地打包
+## 🌟 核心特性与亮点
 
-## 仓库结构
+* **广告与干扰全面净化**：WebView 区域内置自动化去干扰、导流拦截和布局修复机制，还你一个纯净的浏览界面。
+* **丝滑的原生体验**：
+    * **核心页面原生化**：关注动态流、搜索入口及结果页、个人中心、历史记录、关注列表、收藏夹/合集页、UP主空间等均采用原生组件渲染。
+    * **原生视频播放**：iOS 采用底层 `AVPlayer`，Android 采用 `Media3/ExoPlayer`，支持分 P 播放、弹幕、评论查看、点赞/投币/收藏三连互动，以及播放进度自动上报。
+    * **PiP 与后台播放**：播放中返回桌面会自动进入系统画中画；PiP 不可用或锁屏时继续后台音频，并提供通知、锁屏及控制中心媒体控制。
 
-- `App/BilibiliFocus`
-  - iOS SwiftUI 应用入口、原生页面、WebView 容器
-- `Sources/FocusCore`
-  - iOS 侧共享核心：导航策略、页面规则、视频 API 与注入运行时
-- `focus-core`
-  - Android / Kotlin Multiplatform 共享模型、路由与 API service
-- `focus-android`
-  - Android 应用、Compose UI、ExoPlayer 播放与原生页面
-- `Scripts`
-  - iOS unsigned IPA 打包脚本
-- `Tests/FocusCoreTests`
-  - iOS 规则、路由、配置与 fixture 测试
-- `localonly`
-  - 本地归档或不参与远端主线的文件
 
-## 本地运行
+* **统一登录态**：WebView、原生 API 请求和原生播放器共享一套登录 Cookie，无需反复登录。
+* **个性化定制**：完美支持跟随系统的浅色/深色主题切换、自定义强调色、动态内容过滤以及弹幕开关。
+* **完全掌控**：不以应用商店上架为目的，100% 独立构建，无隐私追踪。
 
-### iOS
+---
 
-1. 打开 `BilibiliFocus.xcodeproj`
-2. 选择 `BilibiliFocus` scheme
-3. 在 `Signing & Capabilities` 中设置个人开发 Team
-4. 选择真机或模拟器运行
+## 🚀 下载与安装 (Direct Download)
 
-命令行构建：
+为了方便无法在本地配置开发环境的读者，本项目在 Release 页面直接提供编译好的成品包：
 
-```bash
-xcodebuild -project BilibiliFocus.xcodeproj \
-  -scheme BilibiliFocus \
-  -destination 'generic/platform=iOS' \
-  -derivedDataPath .tmp-derived \
-  CODE_SIGNING_ALLOWED=NO build
+当前版本：**1.0.1**
+
+👉 **[前往 Releases 页面下载 1.0.1](https://github.com/Silhouette-my/bilibili-focus-mobile/releases/tag/1.0.1)**
+
+### 1.0.1 更新内容
+
+* iOS 与 Android 支持播放中自动进入 PiP，并在 PiP 不可用时继续后台音频。
+* 增加锁屏、控制中心和 Android 媒体通知的播放控制及媒体信息。
+* 补齐来电、音频焦点、耳机拔出和媒体服务重置处理。
+* 修复 iOS `MPMediaItemArtwork` 跨执行队列崩溃，以及 Android 平板 PiP 画面缩放异常。
+
+### 📱 iOS 安装指引
+
+* **分发格式**：Unsigned (免签) `BilibiliFocus-unsigned.ipa`
+* **安装方式**：由于该包不包含企业或 App Store 签名，下载后你需要使用 **AltStore、SideStore、TrollStore** 或其他签名/侧载工具，签名后方可安装至手机。
+
+### 🤖 Android 安装指引
+
+* **分发格式**：Debug `focus-android-debug.apk`
+* **安装方式**：下载后直接传输到手机上，在系统设置中允许“安装未知来源应用”即可直接安装运行（或通过 `adb install` 调试安装）。
+
+---
+
+## 🛠️ 仓库架构
+
+项目采用模块化设计，尽可能在 iOS 和 Android 之间复用逻辑：
+
+```text
+├── App/BilibiliFocus     # iOS SwiftUI 应用入口、原生页面与 WebView 容器
+├── Sources/FocusCore     # iOS 侧共享核心：导航策略、页面规则、视频 API 与注入运行时
+├── focus-core            # Android / Kotlin Multiplatform 共享模型、路由与 API 服务
+├── focus-android         # Android 应用：Jetpack Compose UI、ExoPlayer 播放器
+├── Scripts               # iOS unsigned IPA 一键打包脚本
+├── Tests/                # 各平台核心逻辑与路由规则测试集
+└── localonly             # 本地归档或不参与远端主线的文件
+
 ```
 
-### Android
+---
 
-使用 JDK 21（推荐 Android Studio 自带的 JBR）。当前 Gradle/Kotlin 工具链无法使用 JDK 25 初始化构建。
+## 💻 本地源码运行与编译
 
-macOS 使用 Android Studio 内置 JDK 的示例：
+如果你希望自己修改代码并编译，可以参考以下指南：
 
-```bash
-export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
-```
+### iOS 运行
 
-```bash
-./gradlew :focus-android:assembleDebug
-```
+1. 使用 Xcode 打开 `BilibiliFocus.xcodeproj`。
+2. 选择 `BilibiliFocus` scheme。
+3. 在 `Signing & Capabilities` 中配置你自己的个人开发 Team（Personal Team）。
+4. 连接真机或选择模拟器，点击 **Run** 即可。
 
-## 打包
-
-### iOS unsigned IPA
+*命令行源码构建：*
 
 ```bash
 ./Scripts/build_unsigned_ipa.sh
+
 ```
 
-输出：
+### Android 运行
 
-```text
-Build/BilibiliFocus-unsigned.ipa
-```
+> ⚠️ **注意**：请务必使用 **JDK 21**（推荐使用 Android Studio 自带的 JBR）。当前 Gradle/Kotlin 工具链暂不支持 JDK 25 初始化构建。
 
-该 IPA 不包含代码签名，需要通过开发者证书、AltStore、SideStore 或其他侧载工具签名后安装。
-
-### Android debug APK
+*macOS 环境下使用 Android Studio 内置 JDK 编译：*
 
 ```bash
+export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
 ./gradlew :focus-android:assembleDebug
+
 ```
 
-输出：
+---
 
-```text
-focus-android/build/outputs/apk/debug/focus-android-debug.apk
-```
+## 🧪 自动化测试
 
-debug APK 使用本地 Android debug keystore 签名，可直接安装到允许调试应用的设备。
+项目包含完善的测试集，确保 B 站接口或网页结构变动时能快速定位问题。
 
-## 测试
+* **iOS 核心测试**：`FOCUS_INCLUDE_TESTS=1 swift test`
+* **Web 注入规则验证**：`swift run FocusVerifier`
+* **Android 单元测试**：`./gradlew :focus-android:testDebugUnitTest :focus-core:testDebugUnitTest`
 
-### iOS 核心测试
+---
 
-```bash
-FOCUS_INCLUDE_TESTS=1 swift test
-```
+## 📝 说明与免责声明
 
-### Web 注入验证
-
-```bash
-swift run FocusVerifier
-```
-
-### Android 单元测试
-
-```bash
-./gradlew :focus-android:testDebugUnitTest :focus-core:testDebugUnitTest
-```
-
-## 说明
-
-- 默认按自用侧载方案设计，不以 App Store / 应用商店审核兼容为目标
-- 播放页与部分详情页仍依赖 Bilibili 当前网页结构，网页改动后需要继续维护规则
-- `Build/`、`*.ipa`、`*.apk` 与各平台构建目录默认不进入 Git
-- `localonly` 下的内容不属于当前远端主线分发物
+* **非商业/不考虑上架**：本项目默认按自用侧载方案设计，不以 App Store 或主流 Android 应用商店的审核兼容为目标。
+* **维护依赖度高**：部分页面与数据接口依赖 Bilibili 当前的网页结构和 API，一旦上游发生重大改动，需要及时维护并更新相关规则。
+* **忽略文件说明**：`Build/` 目录、`*.ipa`、`*.apk` 以及各平台的构建缓存默认不会进入 Git 追踪，发布用成品请关注 Releases 页面。
+* `localonly/` 目录下的内容仅供本地调试，不属于远端主线的分发物资。

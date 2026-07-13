@@ -119,8 +119,8 @@ struct FocusBrowserView: View {
             .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
                 viewModel.handleAppDidBecomeActive()
             }
-            .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
-                viewModel.handleAppWillResignActive()
+            .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
+                viewModel.handleAppDidEnterBackground()
             }
             .onChange(of: settingsStore.settings.nativeDanmakuEnabled) { enabled in
                 viewModel.applyNativeDanmakuPreference(enabled)
@@ -892,11 +892,10 @@ private struct FocusDynamicFeedScrollBridge: UIViewRepresentable {
                 detach()
                 scrollView = resolvedScrollView
                 appliedRestorationRevision = nil
-                observation = resolvedScrollView.observe(\.contentOffset, options: [.new]) { [weak self] scrollView, change in
-                    // UIScrollView can only mutate its geometry on the main thread, so
-                    // its synchronous KVO callback is safe to handle on MainActor.
-                    MainActor.assumeIsolated {
-                        guard let self else {
+                observation = resolvedScrollView.observe(\.contentOffset, options: [.new]) { [weak self] _, change in
+                    let observedOffsetY = change.newValue?.y
+                    Task { @MainActor [weak self] in
+                        guard let self, let scrollView = self.scrollView else {
                             return
                         }
                         guard self.isActive else {
@@ -915,7 +914,7 @@ private struct FocusDynamicFeedScrollBridge: UIViewRepresentable {
                         guard isUserDriven else {
                             return
                         }
-                        let contentOffsetY = change.newValue?.y ?? scrollView.contentOffset.y
+                        let contentOffsetY = observedOffsetY ?? scrollView.contentOffset.y
                         let minimumY = -scrollView.adjustedContentInset.top
                         let normalizedOffsetY = FocusDynamicFeedScrollRestorationPolicy.normalizedOffset(
                             contentOffsetY: contentOffsetY,
