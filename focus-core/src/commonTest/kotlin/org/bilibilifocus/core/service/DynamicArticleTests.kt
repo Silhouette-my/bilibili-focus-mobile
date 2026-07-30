@@ -17,6 +17,13 @@ class DynamicArticleTests {
     }
 
     @Test
+    fun `feed endpoint preserves opaque cursor bytes`() {
+        val endpoint = service().buildEndpoint(offset = "seed+/= 中文")
+
+        assertTrue("offset=seed%2B%2F%3D%20%E4%B8%AD%E6%96%87" in endpoint)
+    }
+
+    @Test
     fun `article dynamic prefers cvid over opus fallback`() {
         val service = DynamicFeedService(
             cookieProvider = object : CookieProvider {

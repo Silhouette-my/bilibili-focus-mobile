@@ -8,6 +8,10 @@ android {
     namespace = "org.bilibilifocus.android"
     compileSdk = 35
 
+    buildFeatures {
+        buildConfig = true
+    }
+
     defaultConfig {
         applicationId = "org.bilibilifocus.android"
         minSdk = 26
@@ -42,6 +46,7 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended")
     implementation(libs.compose.ui.tooling.preview)
     implementation(libs.androidx.activity.compose)
+    implementation(libs.androidx.work.runtime.ktx)
     implementation(libs.coil.compose)
     implementation("io.coil-kt:coil-gif:2.7.0")
     implementation("dev.chrisbanes.haze:haze:1.5.4")
@@ -50,5 +55,6 @@ dependencies {
     implementation("androidx.media3:media3-session:1.5.1")
     implementation(libs.media3.ui)
     testImplementation(kotlin("test"))
+    testImplementation(libs.kotlinx.coroutines.test)
     debugImplementation(libs.compose.ui.tooling)
 }

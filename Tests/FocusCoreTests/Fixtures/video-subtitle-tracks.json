@@ -1,0 +1,35 @@
+{
+  "code": 0,
+  "message": "0",
+  "ttl": 1,
+  "data": {
+    "subtitle": {
+      "allow_submit": false,
+      "lan": "",
+      "lan_doc": "",
+      "subtitles": [
+        {
+          "id": 9223372036854775000,
+          "id_str": "9223372036854775000",
+          "lan": "ai-zh",
+          "lan_doc": "中文（自动生成）",
+          "subtitle_url": "//aisubtitle.hdslb.com/bfs/ai_subtitle/fixture-ai.json",
+          "type": 1,
+          "ai_type": 0,
+          "ai_status": 2,
+          "is_lock": false
+        },
+        {
+          "id": 42,
+          "lan": "en-US",
+          "lan_doc": "English",
+          "subtitle_url": "https://i0.hdslb.com/bfs/subtitle/fixture-en.json",
+          "type": 0,
+          "ai_type": 1,
+          "ai_status": 0,
+          "is_lock": true
+        }
+      ]
+    }
+  }
+}

@@ -1,6 +1,12 @@
 import Foundation
 
 public struct DynamicFeedService: Sendable {
+    private struct FeedCacheKey: Hashable, Sendable {
+        let sessionFingerprint: Int
+        let timezoneOffsetMinutes: Int
+        let offset: String
+    }
+
     public struct FeedPage: Equatable, Sendable {
         public let cards: [DynamicCard]
         public let nextOffset: String?
@@ -33,17 +39,19 @@ public struct DynamicFeedService: Sendable {
     private let cookieProvider: any CookieSnapshotProvider
     private let requestLoader: RequestLoader
     private let timezoneOffsetMinutes: Int
+    private let pageCache: AsyncExpiringCache<FeedCacheKey, FeedPage>
 
     public init(
         cookieProvider: any CookieSnapshotProvider,
         timezoneOffsetMinutes: Int = -(TimeZone.current.secondsFromGMT() / 60),
         requestLoader: @escaping RequestLoader = { request in
-            try await URLSession.shared.data(for: request)
+            try await BiliAPINetwork.data(for: request)
         }
     ) {
         self.cookieProvider = cookieProvider
         self.timezoneOffsetMinutes = timezoneOffsetMinutes
         self.requestLoader = requestLoader
+        pageCache = AsyncExpiringCache(maximumEntries: 32)
     }
 
     public func fetchFollowingFeed() async throws -> [DynamicCard] {
@@ -51,11 +59,49 @@ public struct DynamicFeedService: Sendable {
     }
 
     public func fetchFollowingFeedPage(offset: String? = nil) async throws -> FeedPage {
+        try await fetchFollowingFeedPage(offset: offset, forceRefresh: false)
+    }
+
+    public func refreshFollowingFeedPage(offset: String? = nil) async throws -> FeedPage {
+        try await fetchFollowingFeedPage(offset: offset, forceRefresh: true)
+    }
+
+    private func fetchFollowingFeedPage(
+        offset: String?,
+        forceRefresh: Bool
+    ) async throws -> FeedPage {
         let cookies = await cookieProvider.loadCookies()
         guard !cookies.isEmpty else {
             throw ServiceError.loginRequired
         }
 
+        let key = FeedCacheKey(
+            sessionFingerprint: Self.sessionFingerprint(for: cookies),
+            timezoneOffsetMinutes: timezoneOffsetMinutes,
+            offset: offset ?? ""
+        )
+        if forceRefresh {
+            await pageCache.invalidate(key)
+        }
+        return try await pageCache.value(
+            for: key,
+            policy: FocusCachePolicy(freshFor: 20, staleIfErrorFor: 180)
+        ) {
+            try await Self.loadFollowingFeedPage(
+                offset: offset,
+                timezoneOffsetMinutes: timezoneOffsetMinutes,
+                cookies: cookies,
+                requestLoader: requestLoader
+            )
+        }
+    }
+
+    private static func loadFollowingFeedPage(
+        offset: String?,
+        timezoneOffsetMinutes: Int,
+        cookies: [HTTPCookie],
+        requestLoader: RequestLoader
+    ) async throws -> FeedPage {
         var request = URLRequest(url: Self.endpoint(timezoneOffsetMinutes: timezoneOffsetMinutes, offset: offset))
         request.httpMethod = "GET"
         request.setValue("https://t.bilibili.com/", forHTTPHeaderField: "Referer")
@@ -72,6 +118,23 @@ public struct DynamicFeedService: Sendable {
         }
 
         return try Self.decodeFeedPage(from: data)
+    }
+
+    private static func sessionFingerprint(for cookies: [HTTPCookie]) -> Int {
+        let identityNames = Set(["SESSDATA", "DedeUserID", "DedeUserID__ckMd5"])
+        let identityCookies = cookies.filter { identityNames.contains($0.name) }
+        let scopedCookies = identityCookies.isEmpty ? cookies : identityCookies
+        var hasher = Hasher()
+        for cookie in scopedCookies.sorted(by: {
+            ($0.domain, $0.path, $0.name, $0.value)
+                < ($1.domain, $1.path, $1.name, $1.value)
+        }) {
+            hasher.combine(cookie.domain)
+            hasher.combine(cookie.path)
+            hasher.combine(cookie.name)
+            hasher.combine(cookie.value)
+        }
+        return hasher.finalize()
     }
 
     public static func decodeCards(from data: Data) throws -> [DynamicCard] {
@@ -110,20 +173,16 @@ public struct DynamicFeedService: Sendable {
     }
 
     public static func attach(cookies: [HTTPCookie], to request: URLRequest) -> URLRequest {
-        guard !cookies.isEmpty else {
-            return request
-        }
-
-        var updatedRequest = request
-        let headerFields = HTTPCookie.requestHeaderFields(with: cookies)
-        for (name, value) in headerFields {
-            updatedRequest.setValue(value, forHTTPHeaderField: name)
-        }
-        return updatedRequest
+        CookieRequestPolicy.attach(cookies: cookies, to: request)
     }
 
     private static func endpoint(timezoneOffsetMinutes: Int, offset: String?) -> URL {
-        var components = URLComponents(string: "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all")!
+        var components = URLComponents(
+            url: BiliAPIContractCatalog.require(
+                "dynamic.info.dynamic_page_info"
+            ).url,
+            resolvingAgainstBaseURL: false
+        )!
         var queryItems = [
             URLQueryItem(name: "type", value: "all"),
             URLQueryItem(name: "timezone_offset", value: String(timezoneOffsetMinutes)),

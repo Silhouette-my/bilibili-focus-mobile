@@ -8,6 +8,8 @@ import kotlinx.serialization.json.jsonPrimitive
 import org.bilibilifocus.core.cookie.Cookie
 import org.bilibilifocus.core.cookie.CookieProvider
 import org.bilibilifocus.core.model.DynamicCard
+import org.bilibilifocus.core.repository.AsyncExpiringCache
+import org.bilibilifocus.core.repository.CachePolicy
 import org.bilibilifocus.core.routing.ArticleURL
 
 class DynamicFeedService(
@@ -29,43 +31,86 @@ class DynamicFeedService(
     }
 
     private val json = Json { ignoreUnknownKeys = true }
+    private val pageCache = AsyncExpiringCache<FeedCacheKey, FeedPage>(maximumEntries = 32)
 
     suspend fun fetchFollowingFeed(): List<DynamicCard> =
         fetchFollowingFeedPage().cards
 
-    suspend fun fetchFollowingFeedPage(offset: String? = null): FeedPage {
+    suspend fun fetchFollowingFeedPage(offset: String? = null): FeedPage =
+        fetchFollowingFeedPage(offset, forceRefresh = false)
+
+    suspend fun refreshFollowingFeedPage(offset: String? = null): FeedPage =
+        fetchFollowingFeedPage(offset, forceRefresh = true)
+
+    private suspend fun fetchFollowingFeedPage(
+        offset: String?,
+        forceRefresh: Boolean,
+    ): FeedPage {
         val cookies = cookieProvider.loadCookies()
         if (cookies.isEmpty()) throw ServiceError.LoginRequired
 
-        val url = buildEndpoint(offset)
-        val headers = buildHeaders(cookies)
-        val response = httpClient.get(url, headers)
+        // Cache only decoded domain pages. Cookie and header objects remain
+        // request-local; the compact fingerprint only separates login sessions.
+        val cacheKey = FeedCacheKey(
+            sessionFingerprint = sessionFingerprint(cookies),
+            timezoneOffsetMinutes = timezoneOffsetMinutes,
+            offset = offset.orEmpty(),
+        )
+        return pageCache.value(
+            key = cacheKey,
+            policy = FEED_CACHE_POLICY,
+            forceRefresh = forceRefresh,
+        ) {
+            val url = buildEndpoint(offset)
+            val response = httpClient.get(url, buildHeaders(url, cookies))
 
-        if (response.statusCode !in 200..299) {
-            throw ServiceError.InvalidResponse
+            if (response.statusCode !in 200..299) {
+                throw ServiceError.InvalidResponse
+            }
+
+            decodeFeedPage(response.body)
         }
-
-        return decodeFeedPage(response.body)
     }
 
     internal fun buildEndpoint(offset: String?): String {
-        val sb = StringBuilder("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all")
+        val sb = StringBuilder(
+            BiliApiContractCatalog.require("dynamic.info.dynamic_page_info").url,
+        )
         sb.append("?type=all")
         sb.append("&timezone_offset=$timezoneOffsetMinutes")
         sb.append("&features=itemOpusStyle")
         if (!offset.isNullOrEmpty()) {
-            sb.append("&offset=$offset")
+            sb.append("&offset=${rfc3986Encode(offset)}")
         }
         return sb.toString()
     }
 
-    private fun buildHeaders(cookies: List<Cookie>): Map<String, String> {
-        return mapOf(
-            "Referer" to "https://t.bilibili.com/",
-            "Accept" to "application/json, text/plain, */*",
-            "User-Agent" to userAgent,
-        ).let { cookieProvider.attachCookies(it, cookies) }
+    private fun buildHeaders(
+        targetUrl: String,
+        cookies: List<Cookie>,
+    ): Map<String, String> {
+        return cookieProvider.attachCookies(
+            mapOf(
+                "Referer" to "https://t.bilibili.com/",
+                "Accept" to "application/json, text/plain, */*",
+                "User-Agent" to userAgent,
+            ),
+            cookies,
+            targetUrl,
+        )
     }
+
+    private fun sessionFingerprint(cookies: List<Cookie>): Int =
+        cookies
+            .sortedWith(compareBy(Cookie::domain, Cookie::path, Cookie::name, Cookie::value))
+            .fold(1) { fingerprint, cookie ->
+                var result = fingerprint
+                result = 31 * result + cookie.domain.hashCode()
+                result = 31 * result + cookie.path.hashCode()
+                result = 31 * result + cookie.name.hashCode()
+                result = 31 * result + cookie.value.hashCode()
+                result
+            }
 
     fun decodeFeedPage(rawJson: String): FeedPage {
         val payload = try {
@@ -103,11 +148,11 @@ class DynamicFeedService(
         val id = item.stringValueAt("id_str")
             ?: basic.stringValueAt("comment_id_str")
             ?: basic.stringValueAt("rid_str")
-            ?: basic.intValueAt("comment_id")?.toString()
+            ?: basic.longValueAt("comment_id")?.toString()
             ?: return null
 
         val authorName = author.stringValueAt("name") ?: "Bilibili"
-        val authorMid = author.intValueAt("mid")?.toLong() ?: 0L
+        val authorMid = author.longValueAt("mid") ?: 0L
         val authorAvatar = normalizedURL(author.stringValueAt("face"))
         val publishTime = author.stringValueAt("pub_time")
             ?: author.stringValueAt("pub_action")
@@ -137,7 +182,7 @@ class DynamicFeedService(
         val articleCvid = major.stringValueAt("article", "id")?.toLongOrNull()
             ?: major.stringValueAt("article", "id_str")?.toLongOrNull()
             ?: major.stringValueAt("article", "cvid")?.toLongOrNull()
-            ?: major.intValueAt("article", "id")?.toLong()
+            ?: major.longValueAt("article", "id")
             ?: jumpCandidates.firstNotNullOfOrNull(ArticleURL::extractCvid)
         val articleURL = if (kind == DynamicCard.Kind.ARTICLE_LIKE) {
             jumpCandidates.firstOrNull { ArticleURL.extractCvid(it) != null }
@@ -425,7 +470,17 @@ class DynamicFeedService(
         else -> "https://www.bilibili.com/opus/$id"
     }
 
+    private data class FeedCacheKey(
+        val sessionFingerprint: Int,
+        val timezoneOffsetMinutes: Int,
+        val offset: String,
+    )
+
     companion object {
+        private val FEED_CACHE_POLICY = CachePolicy(
+            freshForMillis = 20_000,
+            staleIfErrorForMillis = 180_000,
+        )
         private val opusSchemePattern = Regex(
             """^bilibili://(?:following/detail|opus/detail|dynamic)/(\d+)(?:[/?#].*)?$""",
             RegexOption.IGNORE_CASE,

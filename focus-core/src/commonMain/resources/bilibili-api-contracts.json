@@ -1,0 +1,346 @@
+{
+  "schemaVersion": 1,
+  "source": {
+    "repository": "https://github.com/Nemo2011/bilibili-api",
+    "validatedCommit": "87110fe2db7af77425057e163f064700087a3c35",
+    "strategy": "Independently maintained facts-only subset; validated against the sibling repository without redistributing its API catalog."
+  },
+  "endpoints": {
+    "article.info.detail": {
+      "url": "https://api.bilibili.com/x/article/view",
+      "method": "GET",
+      "verify": false,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "common.comment.like": {
+      "url": "https://api.bilibili.com/x/v2/reply/action",
+      "method": "POST",
+      "verify": true,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "common.comment.reply_by_session_id": {
+      "url": "https://api.bilibili.com/x/v2/reply/wbi/main",
+      "method": "GET",
+      "verify": false,
+      "wbi": true,
+      "noCsrf": false
+    },
+    "common.comment.sub_reply": {
+      "url": "https://api.bilibili.com/x/v2/reply/reply",
+      "method": "GET",
+      "verify": false,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "credential.info.valid": {
+      "url": "https://api.bilibili.com/x/web-interface/nav",
+      "method": "GET",
+      "verify": false,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "dynamic.info.detail": {
+      "url": "https://api.bilibili.com/x/polymer/web-dynamic/v1/detail",
+      "method": "GET",
+      "verify": false,
+      "wbi": true,
+      "noCsrf": false
+    },
+    "dynamic.info.dynamic_page_info": {
+      "url": "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all",
+      "method": "GET",
+      "verify": true,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "favorite-list.info.info": {
+      "url": "https://api.bilibili.com/x/v3/fav/folder/info",
+      "method": "GET",
+      "verify": false,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "favorite-list.info.list_content": {
+      "url": "https://api.bilibili.com/x/v3/fav/resource/list",
+      "method": "GET",
+      "verify": false,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "favorite-list.info.list_list": {
+      "url": "https://api.bilibili.com/x/v3/fav/folder/created/list-all",
+      "method": "GET",
+      "verify": false,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "homepage.info.videos": {
+      "url": "https://api.bilibili.com/x/web-interface/wbi/index/top/feed/rcmd",
+      "method": "GET",
+      "verify": false,
+      "wbi": true,
+      "noCsrf": false
+    },
+    "opus.info.detail": {
+      "url": "https://api.bilibili.com/x/polymer/web-dynamic/v1/opus/detail",
+      "method": "GET",
+      "verify": false,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "search.search.default_search_keyword": {
+      "url": "https://api.bilibili.com/x/web-interface/wbi/search/default",
+      "method": "GET",
+      "verify": false,
+      "wbi": true,
+      "noCsrf": false
+    },
+    "search.search.hot_search_keywords": {
+      "url": "https://s.search.bilibili.com/main/hotword",
+      "method": "GET",
+      "verify": false,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "search.search.suggest": {
+      "url": "https://s.search.bilibili.com/main/suggest",
+      "method": "GET",
+      "verify": false,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "search.search.web_search": {
+      "url": "https://api.bilibili.com/x/web-interface/wbi/search/all/v2",
+      "method": "GET",
+      "verify": false,
+      "wbi": true,
+      "noCsrf": false
+    },
+    "search.search.web_search_by_type": {
+      "url": "https://api.bilibili.com/x/web-interface/wbi/search/type",
+      "method": "GET",
+      "verify": false,
+      "wbi": true,
+      "noCsrf": false
+    },
+    "toview.info.list": {
+      "url": "https://api.bilibili.com/x/v2/history/toview",
+      "method": "GET",
+      "verify": true,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "toview.operate.add": {
+      "url": "https://api.bilibili.com/x/v2/history/toview/add",
+      "method": "POST",
+      "verify": true,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "toview.operate.clear": {
+      "url": "https://api.bilibili.com/x/v2/history/toview/clear",
+      "method": "POST",
+      "verify": true,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "toview.operate.del": {
+      "url": "https://api.bilibili.com/x/v2/history/toview/del",
+      "method": "POST",
+      "verify": true,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "user.info.all_followings": {
+      "url": "https://api.bilibili.com/x/web-interface/attentions",
+      "method": "GET",
+      "verify": true,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "user.info.article": {
+      "url": "https://api.bilibili.com/x/space/wbi/article",
+      "method": "GET",
+      "verify": false,
+      "wbi": true,
+      "noCsrf": false
+    },
+    "user.info.channel_list": {
+      "url": "https://api.bilibili.com/x/polymer/web-space/seasons_series_list",
+      "method": "GET",
+      "verify": false,
+      "wbi": true,
+      "noCsrf": false
+    },
+    "user.info.channel_video_season": {
+      "url": "https://api.bilibili.com/x/polymer/web-space/seasons_archives_list",
+      "method": "GET",
+      "verify": false,
+      "wbi": true,
+      "noCsrf": false
+    },
+    "user.info.channel_video_series": {
+      "url": "https://api.bilibili.com/x/series/archives",
+      "method": "GET",
+      "verify": false,
+      "wbi": true,
+      "noCsrf": false
+    },
+    "user.info.followings": {
+      "url": "https://api.bilibili.com/x/relation/followings",
+      "method": "GET",
+      "verify": true,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "user.info.history_new": {
+      "url": "https://api.bilibili.com/x/web-interface/history/cursor",
+      "method": "GET",
+      "verify": true,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "user.info.info": {
+      "url": "https://api.bilibili.com/x/space/wbi/acc/info",
+      "method": "GET",
+      "verify": false,
+      "wbi": true,
+      "noCsrf": false
+    },
+    "user.info.opus": {
+      "url": "https://api.bilibili.com/x/polymer/web-dynamic/v1/opus/feed/space",
+      "method": "GET",
+      "verify": false,
+      "wbi": true,
+      "noCsrf": false
+    },
+    "user.info.relation": {
+      "url": "https://api.bilibili.com/x/space/wbi/acc/relation",
+      "method": "GET",
+      "verify": true,
+      "wbi": true,
+      "noCsrf": false
+    },
+    "user.info.relation_stat": {
+      "url": "https://api.bilibili.com/x/relation/stat",
+      "method": "GET",
+      "verify": false,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "user.info.video": {
+      "url": "https://api.bilibili.com/x/space/wbi/arc/search",
+      "method": "GET",
+      "verify": false,
+      "wbi": true,
+      "noCsrf": false
+    },
+    "user.operate.modify": {
+      "url": "https://api.bilibili.com/x/relation/modify",
+      "method": "POST",
+      "verify": true,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "video.danmaku.get_danmaku": {
+      "url": "https://api.bilibili.com/x/v2/dm/wbi/web/seg.so",
+      "method": "GET",
+      "verify": false,
+      "wbi": true,
+      "noCsrf": false
+    },
+    "video.info.get_pay_coins": {
+      "url": "https://api.bilibili.com/x/web-interface/archive/coins",
+      "method": "GET",
+      "verify": true,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "video.info.get_player_info": {
+      "url": "https://api.bilibili.com/x/player/wbi/v2",
+      "method": "GET",
+      "verify": true,
+      "wbi": true,
+      "noCsrf": false
+    },
+    "video.info.has_favoured": {
+      "url": "https://api.bilibili.com/x/v2/fav/video/favoured",
+      "method": "GET",
+      "verify": true,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "video.info.has_liked": {
+      "url": "https://api.bilibili.com/x/web-interface/archive/has/like",
+      "method": "GET",
+      "verify": true,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "video.info.info": {
+      "url": "https://api.bilibili.com/x/web-interface/view",
+      "method": "GET",
+      "verify": false,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "video.info.media_list": {
+      "url": "https://api.bilibili.com/x/v3/fav/folder/created/list-all",
+      "method": "GET",
+      "verify": true,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "video.info.playurl": {
+      "url": "https://api.bilibili.com/x/player/wbi/playurl",
+      "method": "GET",
+      "verify": false,
+      "wbi": true,
+      "noCsrf": false
+    },
+    "video.info.related": {
+      "url": "https://api.bilibili.com/x/web-interface/archive/related",
+      "method": "GET",
+      "verify": false,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "video.info.relation": {
+      "url": "https://api.bilibili.com/x/web-interface/archive/relation",
+      "method": "GET",
+      "verify": true,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "video.operate.coin": {
+      "url": "https://api.bilibili.com/x/web-interface/coin/add",
+      "method": "POST",
+      "verify": true,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "video.operate.favorite": {
+      "url": "https://api.bilibili.com/x/v3/fav/resource/deal",
+      "method": "POST",
+      "verify": true,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "video.operate.like": {
+      "url": "https://api.bilibili.com/x/web-interface/archive/like",
+      "method": "POST",
+      "verify": true,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "video.operate.report_history": {
+      "url": "https://api.bilibili.com/x/v2/history/report",
+      "method": "POST",
+      "verify": true,
+      "wbi": false,
+      "noCsrf": false
+    }
+  }
+}

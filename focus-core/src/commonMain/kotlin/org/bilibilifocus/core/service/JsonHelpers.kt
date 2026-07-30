@@ -28,6 +28,13 @@ fun JsonObject.intValueAt(vararg path: String): Int? {
     return content.toIntOrNull()
 }
 
+fun JsonObject.longValueAt(vararg path: String): Long? {
+    val element = valueAt(*path) ?: return null
+    if (element is JsonNull) return null
+    val content = element.jsonPrimitive.content
+    return content.toLongOrNull()
+}
+
 fun JsonObject.arrayValueAt(vararg path: String): List<JsonElement>? {
     val element = valueAt(*path) ?: return null
     return (element as? JsonArray)?.toList()

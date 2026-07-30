@@ -31,12 +31,12 @@ class HistoryService(
         val params = buildString {
             append("ps=20")
             if (max > 0) append("&max=$max")
-            if (business.isNotEmpty()) append("&business=$business")
+            if (business.isNotEmpty()) append("&business=${rfc3986Encode(business)}")
             if (viewAt > 0) append("&view_at=$viewAt")
         }
-        val url = "https://api.bilibili.com/x/web-interface/history/cursor?$params"
+        val url = BiliApiContractCatalog.require("user.info.history_new").url + "?$params"
 
-        val response = httpClient.get(url, buildHeaders())
+        val response = httpClient.get(url, buildHeaders(url))
         if (response.statusCode !in 200..299) throw ServiceError.InvalidResponse
 
         val payload = json.parseToJsonElement(response.body) as? JsonObject
@@ -58,27 +58,26 @@ class HistoryService(
                 coverURL = cover,
                 bvid = history?.stringValueAt("bvid") ?: "",
                 authorName = dict.stringValueAt("author_name") ?: "",
-                viewAt = dict.intValueAt("view_at")?.toLong() ?: 0L,
-                progress = dict.intValueAt("progress")?.toLong() ?: 0L,
-                duration = dict.intValueAt("duration")?.toLong() ?: 0L,
+                viewAt = dict.longValueAt("view_at") ?: 0L,
+                progress = dict.longValueAt("progress") ?: 0L,
+                duration = dict.longValueAt("duration") ?: 0L,
             )
         }
 
         return HistoryPage(
             items = items,
-            nextMax = data.intValueAt("cursor", "max")?.toLong() ?: 0L,
-            nextViewAt = data.intValueAt("cursor", "view_at")?.toLong() ?: 0L,
+            nextMax = data.longValueAt("cursor", "max") ?: 0L,
+            nextViewAt = data.longValueAt("cursor", "view_at") ?: 0L,
             nextBusiness = data.stringValueAt("cursor", "business") ?: "",
         )
     }
 
-    private suspend fun buildHeaders(): Map<String, String> {
-        val cookies = cookieProvider.loadCookies()
+    private suspend fun buildHeaders(targetUrl: String): Map<String, String> {
         val headers = mutableMapOf(
             "User-Agent" to userAgent,
             "Referer" to "https://www.bilibili.com/",
             "Accept" to "application/json, text/plain, */*",
         )
-        return cookieProvider.attachCookies(headers, cookies)
+        return cookieProvider.attachCookies(headers, targetUrl)
     }
 }

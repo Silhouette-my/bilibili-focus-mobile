@@ -63,6 +63,7 @@ import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import org.bilibilifocus.android.AndroidCookieProvider
+import org.bilibilifocus.android.BuildConfig
 import org.bilibilifocus.android.FocusFollowingAuthorsViewModel
 import org.bilibilifocus.android.FocusSettingsViewModel
 import org.bilibilifocus.android.FollowingAuthorsUiState
@@ -72,7 +73,9 @@ import org.bilibilifocus.core.model.FocusEntry
 import org.bilibilifocus.core.model.FocusSettings
 import org.bilibilifocus.core.model.FocusThemeMode
 import org.bilibilifocus.core.service.FollowingAuthorsService
+import org.bilibilifocus.core.service.InMemoryNetworkEventSink
 import org.bilibilifocus.core.service.KtorHttpClient
+import org.bilibilifocus.core.service.LoginHealthService
 import org.bilibilifocus.android.ui.theme.focusAccentColor
 
 private val AccentColorPresets = listOf(
@@ -88,6 +91,8 @@ private val AccentColorPresets = listOf(
 fun FocusSettingsScreen(
     settings: FocusSettings,
     knownAuthors: List<DynamicCard.Author>,
+    loginHealthService: LoginHealthService,
+    networkEvents: InMemoryNetworkEventSink,
     onBack: () -> Unit,
     onUpdate: ((FocusSettings) -> FocusSettings) -> Unit,
     onSetAuthorKind: (DynamicCard.Author, FocusDynamicFilterKind, Boolean) -> Unit,
@@ -95,6 +100,7 @@ fun FocusSettingsScreen(
     onReset: () -> Unit,
 ) {
     var showAuthorSettings by remember { mutableStateOf(false) }
+    var showDiagnostics by remember { mutableStateOf(false) }
     val authorsViewModel = remember {
         FocusFollowingAuthorsViewModel(
             service = FollowingAuthorsService(
@@ -107,9 +113,18 @@ fun FocusSettingsScreen(
     DisposableEffect(authorsViewModel) {
         onDispose { authorsViewModel.onCleared() }
     }
-    BackHandler(enabled = showAuthorSettings) { showAuthorSettings = false }
+    BackHandler(enabled = showAuthorSettings || showDiagnostics) {
+        showAuthorSettings = false
+        showDiagnostics = false
+    }
 
-    if (showAuthorSettings) {
+    if (BuildConfig.DEBUG && showDiagnostics) {
+        FocusDiagnosticsScreen(
+            loginHealthService = loginHealthService,
+            networkEvents = networkEvents,
+            onBack = { showDiagnostics = false },
+        )
+    } else if (showAuthorSettings) {
         DynamicAuthorSettingsScreen(
             viewModel = authorsViewModel,
             onBack = { showAuthorSettings = false },
@@ -122,6 +137,9 @@ fun FocusSettingsScreen(
             onBack = onBack,
             onUpdate = onUpdate,
             onOpenAuthorSettings = { showAuthorSettings = true },
+            onOpenDiagnostics = {
+                if (BuildConfig.DEBUG) showDiagnostics = true
+            },
             onReset = onReset,
         )
     }
@@ -134,6 +152,7 @@ private fun SettingsHomeScreen(
     onBack: () -> Unit,
     onUpdate: ((FocusSettings) -> FocusSettings) -> Unit,
     onOpenAuthorSettings: () -> Unit,
+    onOpenDiagnostics: () -> Unit,
     onReset: () -> Unit,
 ) {
     Scaffold(
@@ -244,6 +263,14 @@ private fun SettingsHomeScreen(
                         checked = settings.debugMode,
                         onCheckedChange = { enabled -> onUpdate { it.copy(debugMode = enabled) } },
                     )
+                    if (BuildConfig.DEBUG) {
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                        SettingsNavigationRow(
+                            title = "登录与网络诊断",
+                            subtitle = "查看有限登录状态和脱敏网络事件",
+                            onClick = onOpenDiagnostics,
+                        )
+                    }
                     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                     TextButton(
                         onClick = onReset,

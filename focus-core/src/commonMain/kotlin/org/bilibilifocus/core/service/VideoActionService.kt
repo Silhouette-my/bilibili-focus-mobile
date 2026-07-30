@@ -4,7 +4,9 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import org.bilibilifocus.core.cookie.Cookie
 import org.bilibilifocus.core.cookie.CookieProvider
+import org.bilibilifocus.core.cookie.CookieRequestPolicy
 import org.bilibilifocus.core.model.VideoInteractionState
 
 class VideoActionService(
@@ -24,11 +26,9 @@ class VideoActionService(
     private val json = Json { ignoreUnknownKeys = true }
 
     suspend fun fetchInteractionState(aid: Long): VideoInteractionState {
-        val headers = buildHeaders()
         val liked = runCatching {
             val raw = getDataElement(
-                "https://api.bilibili.com/x/web-interface/archive/has/like?aid=$aid",
-                headers,
+                BiliApiContractCatalog.require("video.info.has_liked").url + "?aid=$aid",
             )
             when (raw) {
                 is JsonObject -> raw.intValueAt("liked") == 1 || raw.intValueAt("like") == 1
@@ -38,8 +38,7 @@ class VideoActionService(
 
         val coined = runCatching {
             val raw = getDataElement(
-                "https://api.bilibili.com/x/web-interface/archive/coins?aid=$aid",
-                headers,
+                BiliApiContractCatalog.require("video.info.get_pay_coins").url + "?aid=$aid",
             )
             when (raw) {
                 is JsonObject -> (raw.intValueAt("multiply") ?: raw.intValueAt("coin"))?.let { it > 0 } ?: false
@@ -49,8 +48,7 @@ class VideoActionService(
 
         val favorited = runCatching {
             val raw = getDataElement(
-                "https://api.bilibili.com/x/v2/fav/video/favoured?aid=$aid",
-                headers,
+                BiliApiContractCatalog.require("video.info.has_favoured").url + "?aid=$aid",
             )
             when (raw) {
                 is JsonObject -> {
@@ -79,7 +77,7 @@ class VideoActionService(
     suspend fun toggleLike(aid: Long, liked: Boolean) {
         val csrf = csrfToken()
         postForm(
-            url = "https://api.bilibili.com/x/web-interface/archive/like",
+            url = BiliApiContractCatalog.require("video.operate.like").url,
             body = "aid=$aid&like=${if (liked) 1 else 2}&csrf=$csrf&csrf_token=$csrf",
         )
     }
@@ -87,17 +85,40 @@ class VideoActionService(
     suspend fun coin(aid: Long, likeAlso: Boolean = false) {
         val csrf = csrfToken()
         postForm(
-            url = "https://api.bilibili.com/x/web-interface/coin/add",
+            url = BiliApiContractCatalog.require("video.operate.coin").url,
             body = "aid=$aid&multiply=1&select_like=${if (likeAlso) 1 else 0}&csrf=$csrf&csrf_token=$csrf",
         )
     }
 
     /** Mirrors bilibili-api's Video.report_watch_history request. */
     suspend fun reportWatchHistory(aid: Long, cid: Long, progressSeconds: Long) {
-        val csrf = csrfToken()
+        reportWatchHistory(
+            aid = aid,
+            cid = cid,
+            progressSeconds = progressSeconds,
+            cookies = cookieProvider.loadCookies(),
+        )
+    }
+
+    /**
+     * Submits history with exactly the supplied cookie snapshot.
+     *
+     * Playback persistence derives its expected account scope from this same
+     * list before calling the method. No second CookieProvider read occurs
+     * between that check and construction of the Cookie header.
+     */
+    suspend fun reportWatchHistory(
+        aid: Long,
+        cid: Long,
+        progressSeconds: Long,
+        cookies: List<Cookie>,
+    ) {
+        val url = BiliApiContractCatalog.require("video.operate.report_history").url
+        val csrf = csrfToken(cookies, url)
         postForm(
-            url = "https://api.bilibili.com/x/v2/history/report",
+            url = url,
             body = "aid=$aid&cid=$cid&progress=${progressSeconds.coerceAtLeast(0)}&csrf=$csrf",
+            cookies = cookies,
         )
     }
 
@@ -107,7 +128,7 @@ class VideoActionService(
         val addMediaIds = if (favorited) targetFolderId.toString() else ""
         val delMediaIds = if (favorited) "" else targetFolderId.toString()
         postForm(
-            url = "https://api.bilibili.com/x/v3/fav/resource/deal",
+            url = BiliApiContractCatalog.require("video.operate.favorite").url,
             body = "rid=$aid&type=2&add_media_ids=$addMediaIds&del_media_ids=$delMediaIds&csrf=$csrf&csrf_token=$csrf",
         )
         return targetFolderId
@@ -120,8 +141,8 @@ class VideoActionService(
         return folders.firstOrNull()?.id ?: throw ServiceError.NoFavoriteFolder
     }
 
-    private suspend fun getDataElement(url: String, headers: Map<String, String>): JsonElement {
-        val response = httpClient.get(url, headers)
+    private suspend fun getDataElement(url: String): JsonElement {
+        val response = httpClient.get(url, buildHeaders(url))
         if (response.statusCode !in 200..299) throw ServiceError.InvalidResponse
         val payload = json.parseToJsonElement(response.body) as? JsonObject
             ?: throw ServiceError.InvalidResponse
@@ -131,8 +152,12 @@ class VideoActionService(
         return payload.valueAt("data") ?: JsonObject(emptyMap())
     }
 
-    private suspend fun postForm(url: String, body: String) {
-        val response = httpClient.post(url, body, buildPostHeaders())
+    private suspend fun postForm(
+        url: String,
+        body: String,
+        cookies: List<Cookie>? = null,
+    ) {
+        val response = httpClient.post(url, body, buildPostHeaders(url, cookies))
         if (response.statusCode !in 200..299) throw ServiceError.InvalidResponse
         val payload = json.parseToJsonElement(response.body) as? JsonObject
             ?: throw ServiceError.InvalidResponse
@@ -147,18 +172,41 @@ class VideoActionService(
         return csrf
     }
 
-    private suspend fun buildHeaders(): Map<String, String> {
-        val cookies = cookieProvider.loadCookies()
+    private fun csrfToken(cookies: List<Cookie>, targetUrl: String): String {
+        val csrf = CookieRequestPolicy.matchingCookies(cookies, targetUrl)
+            .firstOrNull { it.name == "bili_jct" }
+            ?.value
+        if (csrf.isNullOrBlank()) throw ServiceError.LoginRequired
+        return csrf
+    }
+
+    private suspend fun buildHeaders(targetUrl: String): Map<String, String> {
         val headers = mutableMapOf(
             "User-Agent" to userAgent,
             "Referer" to "https://www.bilibili.com/",
             "Accept" to "application/json, text/plain, */*",
         )
-        return cookieProvider.attachCookies(headers, cookies)
+        return cookieProvider.attachCookies(headers, targetUrl)
     }
 
-    private suspend fun buildPostHeaders(): Map<String, String> {
-        return buildHeaders() + mapOf(
+    private suspend fun buildPostHeaders(
+        targetUrl: String,
+        cookies: List<Cookie>? = null,
+    ): Map<String, String> {
+        val baseHeaders = if (cookies == null) {
+            buildHeaders(targetUrl)
+        } else {
+            cookieProvider.attachCookies(
+                requestHeaders = mapOf(
+                    "User-Agent" to userAgent,
+                    "Referer" to "https://www.bilibili.com/",
+                    "Accept" to "application/json, text/plain, */*",
+                ),
+                cookies = cookies,
+                targetUrl = targetUrl,
+            )
+        }
+        return baseHeaders + mapOf(
             "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
             "Origin" to "https://www.bilibili.com",
         )

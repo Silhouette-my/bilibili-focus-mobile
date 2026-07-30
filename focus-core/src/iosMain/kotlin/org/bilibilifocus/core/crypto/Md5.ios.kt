@@ -1,19 +1,32 @@
 package org.bilibilifocus.core.crypto
 
 import kotlinx.cinterop.ExperimentalForeignApi
-import kotlinx.cinterop.addressOf
-import kotlinx.cinterop.usePinned
+import kotlinx.cinterop.UByteVar
+import kotlinx.cinterop.allocArray
+import kotlinx.cinterop.get
+import kotlinx.cinterop.memScoped
+import kotlinx.cinterop.set
 import platform.CoreCrypto.CC_MD5
 import platform.CoreCrypto.CC_MD5_DIGEST_LENGTH
 
 @OptIn(ExperimentalForeignApi::class)
-actual fun md5Hex(input: String): String {
+actual fun md5Hex(input: String): String = memScoped {
     val bytes = input.encodeToByteArray()
-    val digest = ByteArray(CC_MD5_DIGEST_LENGTH.toInt())
-    bytes.usePinned { pinned ->
-        digest.usePinned { digestPinned ->
-            CC_MD5(pinned.addressOf(0), bytes.size.toUInt(), digestPinned.addressOf(0))
+    val inputBuffer = allocArray<UByteVar>(bytes.size.coerceAtLeast(1))
+    bytes.forEachIndexed { index, byte ->
+        inputBuffer[index] = byte.toUByte()
+    }
+    val digestLength = CC_MD5_DIGEST_LENGTH.toInt()
+    val digestBuffer = allocArray<UByteVar>(digestLength)
+    CC_MD5(inputBuffer, bytes.size.toUInt(), digestBuffer)
+
+    buildString(digestLength * 2) {
+        repeat(digestLength) { index ->
+            val byte = digestBuffer[index].toInt()
+            append(HEX_DIGITS[byte ushr 4])
+            append(HEX_DIGITS[byte and 0x0F])
         }
     }
-    return digest.joinToString("") { "%02x".format(it) }
 }
+
+private const val HEX_DIGITS = "0123456789abcdef"

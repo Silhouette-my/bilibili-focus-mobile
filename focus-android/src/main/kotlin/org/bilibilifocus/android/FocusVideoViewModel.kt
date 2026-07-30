@@ -9,8 +9,6 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import org.bilibilifocus.core.model.VideoComment
 import org.bilibilifocus.core.model.VideoDanmaku
 import org.bilibilifocus.core.model.VideoDanmakuSegmentScheduler
@@ -43,8 +41,6 @@ class FocusVideoViewModel(
     val danmakuState: StateFlow<VideoDanmakuUiState> = _danmakuState.asStateFlow()
     private var loadedBvid: String? = null
     private var loadedInfo: VideoInfo? = null
-    private val watchHistoryMutex = Mutex()
-    private var lastQueuedWatchHistoryReport: WatchHistoryReport? = null
     private var danmakuContext: DanmakuContext? = null
     private var danmakuView: VideoDanmakuView? = null
     private var danmakuEnabled = true
@@ -324,40 +320,6 @@ class FocusVideoViewModel(
         }
     }
 
-    fun reportWatchHistory(
-        aid: Long,
-        cid: Long,
-        progressSeconds: Long,
-        force: Boolean,
-    ) {
-        val report = WatchHistoryReport(
-            aid = aid,
-            cid = cid,
-            progressSeconds = progressSeconds.coerceAtLeast(0),
-        )
-        val previous = lastQueuedWatchHistoryReport
-        if (previous?.aid == report.aid && previous.cid == report.cid) {
-            if (previous.progressSeconds == report.progressSeconds) return
-            if (!force && kotlin.math.abs(previous.progressSeconds - report.progressSeconds) < 15) return
-        }
-
-        lastQueuedWatchHistoryReport = report
-        scope.launch {
-            watchHistoryMutex.withLock {
-                try {
-                    actionService.reportWatchHistory(
-                        aid = report.aid,
-                        cid = report.cid,
-                        progressSeconds = report.progressSeconds,
-                    )
-                } catch (_: Exception) {
-                    // Playback must remain uninterrupted when the account is signed out
-                    // or the optional history endpoint is temporarily unavailable.
-                }
-            }
-        }
-    }
-
     private fun loadComments(oid: Long) {
         scope.launch {
             try {
@@ -395,12 +357,6 @@ class FocusVideoViewModel(
         val aid: Long,
         val cid: Long,
         val durationMillis: Long,
-    )
-
-    private data class WatchHistoryReport(
-        val aid: Long,
-        val cid: Long,
-        val progressSeconds: Long,
     )
 
     companion object {

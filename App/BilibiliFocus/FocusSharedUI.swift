@@ -1,7 +1,6 @@
 #if canImport(UIKit)
 import SwiftUI
 import UIKit
-import WebKit
 import ImageIO
 import FocusCore
 
@@ -324,6 +323,7 @@ private struct FocusAnimatedRemoteImage: UIViewRepresentable {
         uiView.stopAnimating()
     }
 
+    @MainActor
     final class Coordinator {
         private var task: Task<Void, Never>?
         private var currentURL: URL?
@@ -711,7 +711,6 @@ actor FocusImageRepository {
             return cached
         }
 
-        let cookieHeader = await Self.cookieHeaderValue()
         if let cached = cache.object(forKey: key.cacheKey) {
             return cached
         }
@@ -728,7 +727,6 @@ actor FocusImageRepository {
                 try await Self.fetchImage(
                     from: canonicalURL,
                     preferredReferer: preferredReferer,
-                    cookieHeader: cookieHeader,
                     session: session,
                     quality: quality
                 )
@@ -772,7 +770,6 @@ actor FocusImageRepository {
     private static func fetchImage(
         from url: URL,
         preferredReferer: String,
-        cookieHeader: String?,
         session: URLSession,
         quality: FocusImageLoadQuality
     ) async throws -> UIImage {
@@ -791,9 +788,6 @@ actor FocusImageRepository {
                     request.timeoutInterval = 20
                     if !referer.isEmpty {
                         request.setValue(referer, forHTTPHeaderField: "Referer")
-                    }
-                    if let cookieHeader, !cookieHeader.isEmpty {
-                        request.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
                     }
                     request.httpShouldHandleCookies = true
                     request.setValue(
@@ -910,17 +904,6 @@ actor FocusImageRepository {
         return image.bytesPerRow * image.height
     }
 
-    @MainActor
-    private static func cookieHeaderValue() async -> String? {
-        let store = WKWebsiteDataStore.default().httpCookieStore
-        let cookies = await withCheckedContinuation { continuation in
-            store.getAllCookies { continuation.resume(returning: $0) }
-        }
-        guard !cookies.isEmpty else {
-            return nil
-        }
-        return HTTPCookie.requestHeaderFields(with: cookies)["Cookie"]
-    }
 }
 
 @MainActor

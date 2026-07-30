@@ -1,4 +1,4 @@
-import FocusCore
+@testable import FocusCore
 import Foundation
 import Testing
 
@@ -81,6 +81,92 @@ struct FocusVideoDetailServiceTests {
     }
 
     @Test
+    func commentPageDecoderKeepsOpaqueNextOffsetAndTotalCount() throws {
+        let payload = #"""
+        {"code":0,"data":{
+          "cursor":{
+            "all_count":9223372036854775000,
+            "pagination_reply":{"next_offset":"opaque:next/42?session=abc"}
+          },
+          "replies":[]
+        }}
+        """#
+
+        let page = try FocusVideoDetailService.decodeCommentsPageResponse(
+            Data(payload.utf8)
+        )
+
+        #expect(page.comments.isEmpty)
+        #expect(page.totalCount == 9_223_372_036_854_775_000)
+        #expect(page.nextCursor?.nextOffset == "opaque:next/42?session=abc")
+    }
+
+    @Test
+    func commentPagingSendsReturnedOpaqueOffsetAndNeverNumericPageParameters() async throws {
+        let recorder = CommentPageRequestRecorder()
+        let service = FocusVideoDetailService(
+            cookieProvider: VideoActionCookieProvider(),
+            wbiSigner: WBISigner(),
+            requestLoader: { request in
+                try await recorder.response(for: request)
+            }
+        )
+
+        let firstPage = try await service.fetchCommentsPage(aid: 42)
+        let cursor = try #require(firstPage.nextCursor)
+        let secondPage = try await service.fetchCommentsPage(aid: 42, cursor: cursor)
+        let requests = await recorder.requests.filter {
+            $0.url?.path == "/x/v2/reply/wbi/main"
+        }
+
+        #expect(firstPage.totalCount == 21)
+        #expect(cursor.nextOffset == "opaque:next/42?session=abc")
+        #expect(secondPage.nextCursor == nil)
+        #expect(requests.count == 2)
+
+        let firstURL = try #require(requests.first?.url)
+        let secondURL = try #require(requests.last?.url)
+        let firstQuery = try #require(URLComponents(
+            url: firstURL,
+            resolvingAgainstBaseURL: false
+        )?.queryItems)
+        let secondQuery = try #require(URLComponents(
+            url: secondURL,
+            resolvingAgainstBaseURL: false
+        )?.queryItems)
+        let firstPagination = try #require(
+            firstQuery.first(where: { $0.name == "pagination_str" })?.value
+        )
+        let secondPagination = try #require(
+            secondQuery.first(where: { $0.name == "pagination_str" })?.value
+        )
+        let firstObject = try #require(
+            JSONSerialization.jsonObject(with: Data(firstPagination.utf8))
+                as? [String: String]
+        )
+        let secondObject = try #require(
+            JSONSerialization.jsonObject(with: Data(secondPagination.utf8))
+                as? [String: String]
+        )
+
+        #expect(firstObject["offset"] == "")
+        #expect(secondObject["offset"] == cursor.nextOffset)
+        #expect(secondQuery.first(where: { $0.name == "mode" })?.value == "3")
+        #expect(
+            secondQuery.first(where: { $0.name == "web_location" })?.value
+                == "1315875"
+        )
+        #expect(requests.allSatisfy { request in
+            let names = Set(
+                URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?
+                    .queryItems?
+                    .map(\.name) ?? []
+            )
+            return names.isDisjoint(with: ["pn", "ps", "sort", "next"])
+        })
+    }
+
+    @Test
     func playbackDecoderPrefersProgressiveNonPCDNBackup() throws {
         let source = try FocusVideoDetailService.decodePlaybackResponse(
             Data(progressivePayload.utf8),
@@ -109,6 +195,146 @@ struct FocusVideoDetailServiceTests {
         }
         #expect(videoURL.absoluteString.contains("avc-high.m4s"))
         #expect(audioURL?.absoluteString.contains("audio-high.m4s") == true)
+    }
+
+    @Test
+    func playbackResumeDecoderKeepsServerMilliseconds() throws {
+        let progress = try FocusVideoDetailService.decodePlaybackResumeResponse(
+            Data(#"{"code":0,"data":{"last_play_cid":4203,"last_play_time":87000}}"#.utf8)
+        )
+
+        #expect(progress.cid == 4203)
+        #expect(progress.positionMilliseconds == 87_000)
+    }
+
+    @Test
+    func playbackResumePolicyRequiresMatchingCIDAndSkipsTheTail() {
+        let resumable = FocusVideoPlaybackResume(
+            cid: 4203,
+            positionMilliseconds: 87_000
+        )
+
+        #expect(
+            FocusVideoPlaybackResumePolicy.initialPositionMilliseconds(
+                resume: resumable,
+                selectedCID: 4203,
+                durationSeconds: 120
+            ) == 87_000
+        )
+        #expect(
+            FocusVideoPlaybackResumePolicy.initialPositionMilliseconds(
+                resume: resumable,
+                selectedCID: 4202,
+                durationSeconds: 120
+            ) == 0
+        )
+        #expect(
+            FocusVideoPlaybackResumePolicy.initialPositionMilliseconds(
+                resume: FocusVideoPlaybackResume(
+                    cid: 4203,
+                    positionMilliseconds: 4_999
+                ),
+                selectedCID: 4203,
+                durationSeconds: 120
+            ) == 0
+        )
+        #expect(
+            FocusVideoPlaybackResumePolicy.initialPositionMilliseconds(
+                resume: FocusVideoPlaybackResume(
+                    cid: 4203,
+                    positionMilliseconds: 119_000
+                ),
+                selectedCID: 4203,
+                durationSeconds: 120
+            ) == 0
+        )
+    }
+
+    @Test
+    func playbackResumeRequestUsesAidAndSelectedCID() async throws {
+        let recorder = PlaybackResumeRequestRecorder()
+        let signer = WBISigner()
+        let service = FocusVideoDetailService(
+            cookieProvider: VideoActionCookieProvider(),
+            wbiSigner: signer,
+            requestLoader: { request in
+                try await recorder.response(for: request)
+            }
+        )
+
+        let progress = try await service.fetchPlaybackResume(aid: 42, cid: 4203)
+        let requests = await recorder.requests
+        let request = try #require(
+            requests.first(where: { $0.url?.path == "/x/player/wbi/v2" })
+        )
+        let queryItems = URLComponents(
+            url: try #require(request.url),
+            resolvingAgainstBaseURL: false
+        )?.queryItems ?? []
+
+        #expect(progress == FocusVideoPlaybackResume(cid: 4203, positionMilliseconds: 87_000))
+        #expect(requests.filter { $0.url?.path == "/x/web-interface/nav" }.count == 1)
+        #expect(queryItems.first(where: { $0.name == "aid" })?.value == "42")
+        #expect(queryItems.first(where: { $0.name == "cid" })?.value == "4203")
+        #expect(queryItems.first(where: { $0.name == "isGaiaAvoided" })?.value == "false")
+        #expect(queryItems.first(where: { $0.name == "web_location" })?.value == "1315873")
+        #expect(queryItems.first(where: { $0.name == "wts" }) != nil)
+        #expect(queryItems.first(where: { $0.name == "w_rid" })?.value?.count == 32)
+        #expect(request.value(forHTTPHeaderField: "Cookie")?.contains("SESSDATA=session-token") == true)
+    }
+
+    @Test
+    func playbackDoesNotForwardBilibiliSessionCookiesToCrossOriginMedia() async throws {
+        let recorder = PlaybackMediaRequestRecorder(payload: progressivePayload)
+        let service = FocusVideoDetailService(
+            cookieProvider: VideoActionCookieProvider(),
+            requestLoader: { request in
+                try await recorder.response(for: request)
+            }
+        )
+
+        let source = try await service.fetchPlayback(bvid: "BV1xx411c7mD", cid: 4201)
+        let apiRequest = try #require(await recorder.requests.first)
+
+        guard case let .progressive(urls) = source.stream else {
+            Issue.record("Expected progressive playback source")
+            return
+        }
+        #expect(urls.first?.host == "upos-sz-mirrorcos.bilivideo.com")
+        #expect(source.headers["Cookie"] == nil)
+        #expect(source.headers["Referer"] == "https://www.bilibili.com/video/BV1xx411c7mD/")
+        #expect(apiRequest.url?.host == "api.bilibili.com")
+        #expect(apiRequest.value(forHTTPHeaderField: "Cookie")?.contains("SESSDATA=session-token") == true)
+    }
+
+    @Test
+    func playbackOmitsLoginCookiesEvenForSameDomainMediaToCloseRedirectInheritance() async throws {
+        let sameDomainPayload = progressivePayload.replacingOccurrences(
+            of: "https://upos-sz-mirrorcos.bilivideo.com/progressive.mp4",
+            with: "https://api.bilibili.com/media/progressive.mp4"
+        )
+        let service = FocusVideoDetailService(
+            cookieProvider: VideoActionCookieProvider(),
+            requestLoader: { request in
+                let url = try #require(request.url)
+                let response = HTTPURLResponse(
+                    url: url,
+                    statusCode: 200,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: ["Content-Type": "application/json"]
+                )!
+                return (Data(sameDomainPayload.utf8), response)
+            }
+        )
+
+        let source = try await service.fetchPlayback(bvid: "BV1xx411c7mD", cid: 4201)
+
+        guard case let .progressive(urls) = source.stream else {
+            Issue.record("Expected progressive playback source")
+            return
+        }
+        #expect(urls.first?.host == "api.bilibili.com")
+        #expect(source.headers["Cookie"] == nil)
     }
 
     @Test
@@ -178,8 +404,10 @@ struct FocusVideoDetailServiceTests {
     @Test
     func danmakuServiceSignsSegmentsAndRefreshesRejectedWBI() async throws {
         let recorder = DanmakuRequestRecorder()
+        let signer = WBISigner()
         let service = FocusVideoDetailService(
             cookieProvider: VideoActionCookieProvider(),
+            wbiSigner: signer,
             requestLoader: { request in
                 try await recorder.response(for: request)
             }
@@ -251,6 +479,96 @@ private actor VideoActionRequestRecorder {
     }
 }
 
+private actor PlaybackResumeRequestRecorder {
+    private(set) var requests: [URLRequest] = []
+
+    func response(for request: URLRequest) throws -> (Data, URLResponse) {
+        requests.append(request)
+        let payload: String
+        switch request.url?.path {
+        case "/x/web-interface/nav":
+            payload = wbiNavigationPayload
+        case "/x/player/wbi/v2":
+            payload = #"{"code":0,"data":{"last_play_cid":4203,"last_play_time":87000}}"#
+        default:
+            payload = #"{"code":-404,"message":"unexpected"}"#
+        }
+        let response = HTTPURLResponse(
+            url: request.url ?? URL(string: "https://api.bilibili.com/")!,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        return (Data(payload.utf8), response)
+    }
+}
+
+private actor CommentPageRequestRecorder {
+    private(set) var requests: [URLRequest] = []
+    private var commentRequestCount = 0
+
+    func response(for request: URLRequest) throws -> (Data, URLResponse) {
+        requests.append(request)
+        let payload: String
+        switch request.url?.path {
+        case "/x/web-interface/nav":
+            payload = wbiNavigationPayload
+        case "/x/v2/reply/wbi/main":
+            commentRequestCount += 1
+            if commentRequestCount == 1 {
+                payload = #"""
+                {"code":0,"data":{
+                  "cursor":{
+                    "all_count":21,
+                    "pagination_reply":{"next_offset":"opaque:next/42?session=abc"}
+                  },
+                  "replies":[]
+                }}
+                """#
+            } else {
+                payload = #"""
+                {"code":0,"data":{
+                  "cursor":{"all_count":21,"pagination_reply":{"next_offset":""}},
+                  "replies":[]
+                }}
+                """#
+            }
+        default:
+            payload = #"{"code":-404,"message":"unexpected"}"#
+        }
+        let response = HTTPURLResponse(
+            url: request.url ?? URL(string: "https://api.bilibili.com/")!,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        return (Data(payload.utf8), response)
+    }
+}
+
+private actor PlaybackMediaRequestRecorder {
+    private let payload: String
+    private(set) var requests: [URLRequest] = []
+
+    init(payload: String) {
+        self.payload = payload
+    }
+
+    func response(for request: URLRequest) throws -> (Data, URLResponse) {
+        requests.append(request)
+        let response = HTTPURLResponse(
+            url: request.url ?? URL(string: "https://api.bilibili.com/")!,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        return (Data(payload.utf8), response)
+    }
+}
+
+private let wbiNavigationPayload =
+    #"{"code":0,"data":{"wbi_img":{"img_url":"https://i0.hdslb.com/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png","sub_url":"https://i0.hdslb.com/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.png"}}}"#
+
 private actor DanmakuRequestRecorder {
     private(set) var requests: [URLRequest] = []
     private var segmentRequestCount = 0
@@ -262,7 +580,7 @@ private actor DanmakuRequestRecorder {
         let contentType: String
         switch path {
         case "/x/web-interface/nav":
-            data = Data(#"{"code":0,"data":{"wbi_img":{"img_url":"https://i0.hdslb.com/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png","sub_url":"https://i0.hdslb.com/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.png"}}}"#.utf8)
+            data = Data(wbiNavigationPayload.utf8)
             contentType = "application/json"
         case "/x/v2/dm/web/view":
             data = danmakuViewFixture()

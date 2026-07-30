@@ -47,8 +47,31 @@
 		000000000000000000000354 /* FocusNativeVideo.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000350 /* FocusNativeVideo.swift */; };
 		000000000000000000000355 /* FocusVideoDetailService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000351 /* FocusVideoDetailService.swift */; };
 		000000000000000000000356 /* FocusVideoActionService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000352 /* FocusVideoActionService.swift */; };
+		D20000000000000000000001 /* FocusVideoSubtitleService.swift in Sources */ = {isa = PBXBuildFile; fileRef = D10000000000000000000001 /* FocusVideoSubtitleService.swift */; };
 		000000000000000000000357 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000325 /* Assets.xcassets */; };
 		000000000000000000000701 /* BilibiliFocusStabilityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000703 /* BilibiliFocusStabilityTests.swift */; };
+		000000000000000000000801 /* AsyncExpiringCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000811 /* AsyncExpiringCache.swift */; };
+		000000000000000000000802 /* BiliAPIContract.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000812 /* BiliAPIContract.swift */; };
+		000000000000000000000803 /* BiliAPITransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000813 /* BiliAPITransport.swift */; };
+		000000000000000000000804 /* CursorPager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000814 /* CursorPager.swift */; };
+		000000000000000000000805 /* FocusWatchLaterService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000815 /* FocusWatchLaterService.swift */; };
+		000000000000000000000806 /* WBISigner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000816 /* WBISigner.swift */; };
+		000000000000000000000807 /* bilibili-api-contracts.json in Resources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000817 /* bilibili-api-contracts.json */; };
+		000000000000000000000808 /* FocusPlaybackProgressStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000818 /* FocusPlaybackProgressStore.swift */; };
+		A20000000000000000000001 /* FocusDynamicFeature.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000001 /* FocusDynamicFeature.swift */; };
+		A20000000000000000000002 /* FocusSearchFeature.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000002 /* FocusSearchFeature.swift */; };
+		A20000000000000000000003 /* FocusMyFeature.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000003 /* FocusMyFeature.swift */; };
+		A20000000000000000000004 /* FocusNativeVideoViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000004 /* FocusNativeVideoViews.swift */; };
+		A20000000000000000000005 /* FocusBrowserSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000005 /* FocusBrowserSupport.swift */; };
+		A20000000000000000000006 /* FocusNativePageAugmentService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000006 /* FocusNativePageAugmentService.swift */; };
+		A20000000000000000000007 /* FocusAppGraph.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000007 /* FocusAppGraph.swift */; };
+		A20000000000000000000008 /* FocusAppViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000008 /* FocusAppViewModel.swift */; };
+		A20000000000000000000009 /* FocusSettingsViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000009 /* FocusSettingsViews.swift */; };
+		A20000000000000000000010 /* FocusHistoryBackgroundScheduler.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000010 /* FocusHistoryBackgroundScheduler.swift */; };
+		A20000000000000000000011 /* LoginHealth.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000011 /* LoginHealth.swift */; };
+		A20000000000000000000012 /* BiliDiagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000012 /* BiliDiagnostics.swift */; };
+		A20000000000000000000013 /* FocusDiagnosticsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000013 /* FocusDiagnosticsView.swift */; };
+		C20000000000000000000001 /* FocusVideoCommentService.swift in Sources */ = {isa = PBXBuildFile; fileRef = C10000000000000000000001 /* FocusVideoCommentService.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -125,8 +148,31 @@
 		000000000000000000000350 /* FocusNativeVideo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusNativeVideo.swift; sourceTree = "<group>"; };
 		000000000000000000000351 /* FocusVideoDetailService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusVideoDetailService.swift; sourceTree = "<group>"; };
 		000000000000000000000352 /* FocusVideoActionService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusVideoActionService.swift; sourceTree = "<group>"; };
+		D10000000000000000000001 /* FocusVideoSubtitleService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusVideoSubtitleService.swift; sourceTree = "<group>"; };
 		000000000000000000000703 /* BilibiliFocusStabilityTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BilibiliFocusStabilityTests.swift; sourceTree = "<group>"; };
 		000000000000000000000704 /* BilibiliFocusTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = BilibiliFocusTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		000000000000000000000811 /* AsyncExpiringCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AsyncExpiringCache.swift; sourceTree = "<group>"; };
+		000000000000000000000812 /* BiliAPIContract.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BiliAPIContract.swift; sourceTree = "<group>"; };
+		000000000000000000000813 /* BiliAPITransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BiliAPITransport.swift; sourceTree = "<group>"; };
+		000000000000000000000814 /* CursorPager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CursorPager.swift; sourceTree = "<group>"; };
+		000000000000000000000815 /* FocusWatchLaterService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusWatchLaterService.swift; sourceTree = "<group>"; };
+		000000000000000000000816 /* WBISigner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WBISigner.swift; sourceTree = "<group>"; };
+		000000000000000000000817 /* bilibili-api-contracts.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "bilibili-api-contracts.json"; sourceTree = "<group>"; };
+		000000000000000000000818 /* FocusPlaybackProgressStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusPlaybackProgressStore.swift; sourceTree = "<group>"; };
+		A10000000000000000000001 /* FocusDynamicFeature.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusDynamicFeature.swift; sourceTree = "<group>"; };
+		A10000000000000000000002 /* FocusSearchFeature.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusSearchFeature.swift; sourceTree = "<group>"; };
+		A10000000000000000000003 /* FocusMyFeature.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusMyFeature.swift; sourceTree = "<group>"; };
+		A10000000000000000000004 /* FocusNativeVideoViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusNativeVideoViews.swift; sourceTree = "<group>"; };
+		A10000000000000000000005 /* FocusBrowserSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusBrowserSupport.swift; sourceTree = "<group>"; };
+		A10000000000000000000006 /* FocusNativePageAugmentService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusNativePageAugmentService.swift; sourceTree = "<group>"; };
+		A10000000000000000000007 /* FocusAppGraph.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusAppGraph.swift; sourceTree = "<group>"; };
+		A10000000000000000000008 /* FocusAppViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusAppViewModel.swift; sourceTree = "<group>"; };
+		A10000000000000000000009 /* FocusSettingsViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusSettingsViews.swift; sourceTree = "<group>"; };
+		A10000000000000000000010 /* FocusHistoryBackgroundScheduler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusHistoryBackgroundScheduler.swift; sourceTree = "<group>"; };
+		A10000000000000000000011 /* LoginHealth.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LoginHealth.swift; sourceTree = "<group>"; };
+		A10000000000000000000012 /* BiliDiagnostics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BiliDiagnostics.swift; sourceTree = "<group>"; };
+		A10000000000000000000013 /* FocusDiagnosticsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusDiagnosticsView.swift; sourceTree = "<group>"; };
+		C10000000000000000000001 /* FocusVideoCommentService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusVideoCommentService.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -181,7 +227,9 @@
 				000000000000000000000325 /* Assets.xcassets */,
 				000000000000000000000338 /* Info.plist */,
 				000000000000000000000404 /* Icons */,
+				A30000000000000000000000 /* Features */,
 				000000000000000000000301 /* BilibiliFocusApp.swift */,
+				A10000000000000000000010 /* FocusHistoryBackgroundScheduler.swift */,
 				000000000000000000000302 /* FocusBrowserView.swift */,
 				000000000000000000000303 /* FocusBrowserViewModel.swift */,
 				000000000000000000000350 /* FocusNativeVideo.swift */,
@@ -197,13 +245,23 @@
 		000000000000000000000402 /* Sources/FocusCore */ = {
 			isa = PBXGroup;
 			children = (
+				000000000000000000000811 /* AsyncExpiringCache.swift */,
+				A10000000000000000000012 /* BiliDiagnostics.swift */,
 				000000000000000000000320 /* AppRoute.swift */,
+				000000000000000000000812 /* BiliAPIContract.swift */,
+				000000000000000000000813 /* BiliAPITransport.swift */,
 				000000000000000000000321 /* SearchQuery.swift */,
 				000000000000000000000322 /* CookieSnapshotProvider.swift */,
+				000000000000000000000814 /* CursorPager.swift */,
 				000000000000000000000323 /* DynamicCard.swift */,
 				000000000000000000000324 /* DynamicFeedService.swift */,
 				000000000000000000000352 /* FocusVideoActionService.swift */,
+				C10000000000000000000001 /* FocusVideoCommentService.swift */,
 				000000000000000000000351 /* FocusVideoDetailService.swift */,
+				D10000000000000000000001 /* FocusVideoSubtitleService.swift */,
+				000000000000000000000818 /* FocusPlaybackProgressStore.swift */,
+				000000000000000000000815 /* FocusWatchLaterService.swift */,
+				A10000000000000000000011 /* LoginHealth.swift */,
 				000000000000000000000306 /* FocusBundle.swift */,
 				000000000000000000000307 /* FocusEntry.swift */,
 				000000000000000000000308 /* FocusFeature.swift */,
@@ -214,6 +272,7 @@
 				000000000000000000000312 /* FocusScriptBuilder.swift */,
 				000000000000000000000313 /* FocusScriptSource.swift */,
 				000000000000000000000314 /* FocusSettings.swift */,
+				000000000000000000000816 /* WBISigner.swift */,
 				000000000000000000000403 /* Resources */,
 			);
 			path = Sources/FocusCore;
@@ -222,6 +281,7 @@
 		000000000000000000000403 /* Resources */ = {
 			isa = PBXGroup;
 			children = (
+				000000000000000000000817 /* bilibili-api-contracts.json */,
 				000000000000000000000315 /* focus-runtime.js */,
 			);
 			path = Resources;
@@ -251,6 +311,71 @@
 				000000000000000000000703 /* BilibiliFocusStabilityTests.swift */,
 			);
 			path = Tests/BilibiliFocusTests;
+			sourceTree = "<group>";
+		};
+		A30000000000000000000000 /* Features */ = {
+			isa = PBXGroup;
+			children = (
+				A30000000000000000000001 /* Dynamic */,
+				A30000000000000000000002 /* Search */,
+				A30000000000000000000003 /* My */,
+				A30000000000000000000004 /* Player */,
+				A30000000000000000000005 /* WebBridge */,
+				A30000000000000000000006 /* Shared */,
+			);
+			path = Features;
+			sourceTree = "<group>";
+		};
+		A30000000000000000000001 /* Dynamic */ = {
+			isa = PBXGroup;
+			children = (
+				A10000000000000000000001 /* FocusDynamicFeature.swift */,
+			);
+			path = Dynamic;
+			sourceTree = "<group>";
+		};
+		A30000000000000000000002 /* Search */ = {
+			isa = PBXGroup;
+			children = (
+				A10000000000000000000002 /* FocusSearchFeature.swift */,
+			);
+			path = Search;
+			sourceTree = "<group>";
+		};
+		A30000000000000000000003 /* My */ = {
+			isa = PBXGroup;
+			children = (
+				A10000000000000000000003 /* FocusMyFeature.swift */,
+			);
+			path = My;
+			sourceTree = "<group>";
+		};
+		A30000000000000000000004 /* Player */ = {
+			isa = PBXGroup;
+			children = (
+				A10000000000000000000004 /* FocusNativeVideoViews.swift */,
+			);
+			path = Player;
+			sourceTree = "<group>";
+		};
+		A30000000000000000000005 /* WebBridge */ = {
+			isa = PBXGroup;
+			children = (
+				A10000000000000000000005 /* FocusBrowserSupport.swift */,
+				A10000000000000000000006 /* FocusNativePageAugmentService.swift */,
+			);
+			path = WebBridge;
+			sourceTree = "<group>";
+		};
+		A30000000000000000000006 /* Shared */ = {
+			isa = PBXGroup;
+			children = (
+				A10000000000000000000007 /* FocusAppGraph.swift */,
+				A10000000000000000000008 /* FocusAppViewModel.swift */,
+				A10000000000000000000013 /* FocusDiagnosticsView.swift */,
+				A10000000000000000000009 /* FocusSettingsViews.swift */,
+			);
+			path = Shared;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -376,6 +501,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				000000000000000000000807 /* bilibili-api-contracts.json in Resources */,
 				000000000000000000000217 /* focus-runtime.js in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -395,6 +521,17 @@
 			buildActionMask = 2147483647;
 			files = (
 				000000000000000000000203 /* BilibiliFocusApp.swift in Sources */,
+				A20000000000000000000001 /* FocusDynamicFeature.swift in Sources */,
+				A20000000000000000000002 /* FocusSearchFeature.swift in Sources */,
+				A20000000000000000000003 /* FocusMyFeature.swift in Sources */,
+				A20000000000000000000004 /* FocusNativeVideoViews.swift in Sources */,
+				A20000000000000000000005 /* FocusBrowserSupport.swift in Sources */,
+				A20000000000000000000006 /* FocusNativePageAugmentService.swift in Sources */,
+				A20000000000000000000007 /* FocusAppGraph.swift in Sources */,
+				A20000000000000000000008 /* FocusAppViewModel.swift in Sources */,
+				A20000000000000000000013 /* FocusDiagnosticsView.swift in Sources */,
+				A20000000000000000000009 /* FocusSettingsViews.swift in Sources */,
+				A20000000000000000000010 /* FocusHistoryBackgroundScheduler.swift in Sources */,
 				000000000000000000000204 /* FocusBrowserView.swift in Sources */,
 				000000000000000000000205 /* FocusBrowserViewModel.swift in Sources */,
 				000000000000000000000354 /* FocusNativeVideo.swift in Sources */,
@@ -410,13 +547,23 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				000000000000000000000801 /* AsyncExpiringCache.swift in Sources */,
+				A20000000000000000000012 /* BiliDiagnostics.swift in Sources */,
 				000000000000000000000220 /* AppRoute.swift in Sources */,
+				000000000000000000000802 /* BiliAPIContract.swift in Sources */,
+				000000000000000000000803 /* BiliAPITransport.swift in Sources */,
 				000000000000000000000221 /* SearchQuery.swift in Sources */,
 				000000000000000000000222 /* CookieSnapshotProvider.swift in Sources */,
+				000000000000000000000804 /* CursorPager.swift in Sources */,
 				000000000000000000000223 /* DynamicCard.swift in Sources */,
 				000000000000000000000224 /* DynamicFeedService.swift in Sources */,
 				000000000000000000000356 /* FocusVideoActionService.swift in Sources */,
+				C20000000000000000000001 /* FocusVideoCommentService.swift in Sources */,
 				000000000000000000000355 /* FocusVideoDetailService.swift in Sources */,
+				D20000000000000000000001 /* FocusVideoSubtitleService.swift in Sources */,
+				000000000000000000000808 /* FocusPlaybackProgressStore.swift in Sources */,
+				000000000000000000000805 /* FocusWatchLaterService.swift in Sources */,
+				A20000000000000000000011 /* LoginHealth.swift in Sources */,
 				000000000000000000000208 /* FocusBundle.swift in Sources */,
 				000000000000000000000209 /* FocusEntry.swift in Sources */,
 				000000000000000000000210 /* FocusFeature.swift in Sources */,
@@ -427,6 +574,7 @@
 				000000000000000000000214 /* FocusScriptBuilder.swift in Sources */,
 				000000000000000000000215 /* FocusScriptSource.swift in Sources */,
 				000000000000000000000216 /* FocusSettings.swift in Sources */,
+				000000000000000000000806 /* WBISigner.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -473,6 +621,7 @@
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				ONLY_ACTIVE_ARCH = YES;
 				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 			};
 			name = Debug;

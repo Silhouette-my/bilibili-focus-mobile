@@ -17,6 +17,8 @@ data class VideoInfo(
     val playerURL: String? = null,
     val width: Int = 0,
     val height: Int = 0,
+    val lastPlaybackCid: Long? = null,
+    val lastPlaybackPositionMillis: Long = 0,
 )
 
 data class VideoPage(

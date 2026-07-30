@@ -96,6 +96,39 @@ struct DynamicFeedServiceTests {
     }
 
     @Test
+    func feedChainCachesIdenticalPagesAndExplicitRefreshBypassesCache() async throws {
+        let recorder = DynamicFeedRequestRecorder()
+        let responseData = Data(
+            #"{"code":0,"data":{"items":[],"offset":"opaque-next"}}"#.utf8
+        )
+        let service = DynamicFeedService(
+            cookieProvider: LoggedInCookieProvider(),
+            requestLoader: { request in
+                await recorder.record(request.url)
+                let url = request.url ?? URL(string: "https://api.bilibili.com")!
+                return (
+                    responseData,
+                    HTTPURLResponse(
+                        url: url,
+                        statusCode: 200,
+                        httpVersion: nil,
+                        headerFields: nil
+                    )!
+                )
+            }
+        )
+
+        let first = try await service.fetchFollowingFeedPage()
+        let cached = try await service.fetchFollowingFeedPage()
+        #expect(first == cached)
+        #expect(await recorder.requestCount() == 1)
+
+        let refreshed = try await service.refreshFollowingFeedPage()
+        #expect(refreshed == first)
+        #expect(await recorder.requestCount() == 2)
+    }
+
+    @Test
     func decodeCardsFallsBackToGenericMajorExtraction() throws {
         let data = Data(genericMajorPayload.utf8)
         let cards = try DynamicFeedService.decodeCards(from: data)
@@ -218,13 +251,19 @@ private struct LoggedInCookieProvider: CookieSnapshotProvider {
 
 private actor DynamicFeedRequestRecorder {
     private var url: URL?
+    private var count = 0
 
     func record(_ url: URL?) {
         self.url = url
+        count += 1
     }
 
     func requestedURL() -> URL? {
         url
+    }
+
+    func requestCount() -> Int {
+        count
     }
 }
 

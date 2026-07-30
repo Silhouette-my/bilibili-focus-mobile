@@ -34,6 +34,16 @@ struct FocusNavigationPolicyTests {
     }
 
     @Test
+    func redirectsNonCanonicalVideoURLAndAllowsFinalShape() {
+        let policy = FocusNavigationPolicy()
+        let nonCanonicalURL = URL(string: "https://www.bilibili.com/video/BV1xx411c7mD")!
+        let canonicalURL = URL(string: "https://www.bilibili.com/video/BV1xx411c7mD/")!
+
+        #expect(policy.decision(for: nonCanonicalURL) == .redirect(canonicalURL))
+        #expect(policy.decision(for: canonicalURL) == .allow)
+    }
+
+    @Test
     func canonicalizesBlackboardVideoPageToFinalDesktopShape() {
         let url = URL(string: "https://www.bilibili.com/blackboard/html5player.html?bvid=BV1xx411c7mD&cid=3000000088&start_progress=123&foo=bar")!
 

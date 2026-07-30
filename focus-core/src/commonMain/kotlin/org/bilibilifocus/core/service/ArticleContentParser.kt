@@ -290,7 +290,8 @@ object ArticleContentParser {
             result[match.groupValues[1].lowercase()] = decodeEntities(match.groupValues[3])
         }
         Regex("([A-Za-z0-9_:-]+)\\s*=\\s*([^\\s>\"']+)").findAll(tag).forEach { match ->
-            result.putIfAbsent(match.groupValues[1].lowercase(), decodeEntities(match.groupValues[2]))
+            val key = match.groupValues[1].lowercase()
+            result.getOrPut(key) { decodeEntities(match.groupValues[2]) }
         }
         return result
     }
@@ -336,23 +337,23 @@ object ArticleContentParser {
         val bvid = resource.stringValueAt("bvid") ?: resource.stringValueAt("bv_id")
         if (bvid != null || "video" in type || "archive" in type) {
             if (bvid != null) return "https://www.bilibili.com/video/$bvid"
-            val aid = resource.stringValueAt("aid") ?: resource.stringValueAt("id") ?: resource.intValueAt("aid")?.toString()
+            val aid = resource.stringValueAt("aid") ?: resource.stringValueAt("id") ?: resource.longValueAt("aid")?.toString()
             if (aid != null) return "https://www.bilibili.com/video/av${aid.removePrefix("av")}"
         }
         if ("article" in type) {
-            val cvid = resource.stringValueAt("cvid") ?: resource.stringValueAt("id") ?: resource.intValueAt("id")?.toString()
+            val cvid = resource.stringValueAt("cvid") ?: resource.stringValueAt("id") ?: resource.longValueAt("id")?.toString()
             if (cvid != null) return "https://www.bilibili.com/read/cv${cvid.removePrefix("cv")}"
         }
         if ("bangumi" in type || "pgc" in type || "episode" in type) {
-            val episode = resource.stringValueAt("ep_id") ?: resource.stringValueAt("id") ?: resource.intValueAt("ep_id")?.toString()
+            val episode = resource.stringValueAt("ep_id") ?: resource.stringValueAt("id") ?: resource.longValueAt("ep_id")?.toString()
             if (episode != null) return "https://www.bilibili.com/bangumi/play/ep${episode.removePrefix("ep")}"
         }
         if ("live" in type) {
-            val room = resource.stringValueAt("room_id") ?: resource.stringValueAt("id") ?: resource.intValueAt("room_id")?.toString()
+            val room = resource.stringValueAt("room_id") ?: resource.stringValueAt("id") ?: resource.longValueAt("room_id")?.toString()
             if (room != null) return "https://live.bilibili.com/$room"
         }
         if ("audio" in type || "music" in type) {
-            val audio = resource.stringValueAt("auid") ?: resource.stringValueAt("id") ?: resource.intValueAt("id")?.toString()
+            val audio = resource.stringValueAt("auid") ?: resource.stringValueAt("id") ?: resource.longValueAt("id")?.toString()
             if (audio != null) return "https://www.bilibili.com/audio/au${audio.removePrefix("au")}"
         }
         return null

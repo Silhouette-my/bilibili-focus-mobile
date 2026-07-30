@@ -1,10 +1,12 @@
 package org.bilibilifocus.core.injection
 
+import kotlinx.cinterop.ExperimentalForeignApi
 import platform.Foundation.NSBundle
 import platform.Foundation.NSString
 import platform.Foundation.NSUTF8StringEncoding
 import platform.Foundation.stringWithContentsOfFile
 
+@OptIn(ExperimentalForeignApi::class)
 actual fun readBundleResource(name: String): String {
     val parts = name.split(".")
     val fileName = parts.dropLast(1).joinToString(".")

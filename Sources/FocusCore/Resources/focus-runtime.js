@@ -6,7 +6,7 @@
   const configKey = "__FOCUS_CONFIG__";
   const stylePrefix = "bili-focus-style-";
   const scriptStateKey = "__FOCUS_FEATURE_SCRIPT_STATE__";
-  const runtimeVersion = "2026-06-24-runtime-trace-d-app";
+  const runtimeVersion = "2026-06-24-runtime-trace-d-shared";
 
   function makeStyleId(ruleId, featureId) {
     return (stylePrefix + ruleId + "-" + featureId).replace(/[^a-zA-Z0-9_-]/g, "-");
@@ -36,11 +36,11 @@
       }
 
       try {
-        if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.logDebug) {
-          window.webkit.messageHandlers.logDebug.postMessage({
+        const debugSink = window.__FOCUS_DEBUG_SINK__;
+        if (typeof debugSink === "function") {
+          debugSink({
             message,
-            extra: extra || null,
-            url: location.href
+            extra: extra || null
           });
         }
       } catch (_) {}

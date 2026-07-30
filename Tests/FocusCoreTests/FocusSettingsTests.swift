@@ -10,6 +10,8 @@ struct FocusSettingsTests {
         #expect(settings.redirectEnabled)
         #expect(settings.playerMaskEnabled)
         #expect(settings.nativeDanmakuEnabled)
+        #expect(settings.nativeSubtitleEnabled)
+        #expect(settings.nativeSubtitleLanguageCode.isEmpty)
         #expect(settings.searchMaskEnabled)
         #expect(settings.dynamicMaskEnabled)
         #expect(!settings.debugMode)
@@ -27,6 +29,8 @@ struct FocusSettingsTests {
             redirectEnabled: false,
             playerMaskEnabled: false,
             nativeDanmakuEnabled: false,
+            nativeSubtitleEnabled: false,
+            nativeSubtitleLanguageCode: "zh-CN",
             searchMaskEnabled: true,
             dynamicMaskEnabled: false,
             debugMode: true,
@@ -40,13 +44,15 @@ struct FocusSettingsTests {
     }
 
     @Test
-    func legacySettingsKeepValuesAndEnableNativeDanmakuByDefault() throws {
+    func legacySettingsKeepValuesAndEnableNativeMediaOverlaysByDefault() throws {
         let legacy = Data(#"{"redirectEnabled":false,"defaultEntry":"search"}"#.utf8)
         let settings = try JSONDecoder().decode(FocusSettings.self, from: legacy)
 
         #expect(!settings.redirectEnabled)
         #expect(settings.defaultEntry == .search)
         #expect(settings.nativeDanmakuEnabled)
+        #expect(settings.nativeSubtitleEnabled)
+        #expect(settings.nativeSubtitleLanguageCode.isEmpty)
         #expect(settings.accentColorHex == "#FB7299")
     }
 

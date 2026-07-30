@@ -1,0 +1,43 @@
+{
+  "font_size": 0.4,
+  "font_color": "#FFFFFF",
+  "background_alpha": 0.5,
+  "body": [
+    {
+      "from": 2.86,
+      "to": 4.0004,
+      "location": 2,
+      "content": "第二行\n保留换行"
+    },
+    {
+      "from": 0.125,
+      "to": 2.86,
+      "location": 1,
+      "content": "你好，字幕 🌏"
+    },
+    {
+      "from": -1,
+      "to": 1,
+      "location": 2,
+      "content": "负数时间应被忽略"
+    },
+    {
+      "from": 3,
+      "to": 3,
+      "location": 2,
+      "content": "零时长应被忽略"
+    },
+    {
+      "from": 1e20,
+      "to": 1.1e20,
+      "location": 2,
+      "content": "溢出时间应被忽略"
+    },
+    {
+      "from": 4.1,
+      "to": 5.2,
+      "location": 2,
+      "content": "   "
+    }
+  ]
+}

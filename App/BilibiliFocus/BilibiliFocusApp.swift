@@ -6,6 +6,18 @@ import UIKit
 class AppDelegate: NSObject, UIApplicationDelegate {
     static var orientationLock = UIInterfaceOrientationMask.portrait
 
+    func application(
+        _ application: UIApplication,
+        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
+    ) -> Bool {
+        _ = FocusHistoryBackgroundScheduler.shared.register()
+        return true
+    }
+
+    func applicationDidEnterBackground(_ application: UIApplication) {
+        FocusHistoryBackgroundScheduler.shared.schedule()
+    }
+
     func application(_ application: UIApplication, supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
         return AppDelegate.orientationLock
     }
@@ -15,15 +27,28 @@ class AppDelegate: NSObject, UIApplicationDelegate {
 struct BilibiliFocusApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @StateObject private var settingsStore = FocusSettingsStore()
+    let appGraph: FocusAppGraph
 
     init() {
+        let settingsStore = FocusSettingsStore()
+        _settingsStore = StateObject(wrappedValue: settingsStore)
+        let appGraph = FocusAppGraph(settingsStore: settingsStore)
+        self.appGraph = appGraph
+        FocusHistoryBackgroundScheduler.shared.configure(
+            hasWork: {
+                await appGraph.hasAuthenticatedPendingPlaybackHistory()
+            },
+            drain: {
+                await appGraph.drainPlaybackHistoryOutbox()
+            }
+        )
         configureNavigationBarAppearance()
     }
 
     var body: some Scene {
         WindowGroup {
             let accentColor = FocusAccentColor.color(hex: settingsStore.settings.accentColorHex)
-            FocusBrowserView(settingsStore: settingsStore)
+            FocusBrowserView(appGraph: appGraph)
                 .accentColor(accentColor)
                 .tint(accentColor)
                 .preferredColorScheme(preferredColorScheme)

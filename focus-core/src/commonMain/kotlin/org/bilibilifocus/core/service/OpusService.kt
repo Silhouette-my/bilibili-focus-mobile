@@ -14,6 +14,7 @@ class OpusService(
     private val cookieProvider: CookieProvider,
     private val httpClient: HttpClient,
     private val userAgent: String = "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+    private val wbiSigner: WbiSigner = WbiSigner(cookieProvider, httpClient, userAgent),
 ) {
     sealed class ServiceError(message: String) : Exception(message) {
         data object LoginRequired : ServiceError("需要登录")
@@ -22,20 +23,13 @@ class OpusService(
     }
 
     private val json = Json { ignoreUnknownKeys = true }
-    private var wbiMixedKey: String? = null
-    private val wbiMixinTable = intArrayOf(
-        46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49,
-        33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40,
-        61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11,
-        36, 20, 52, 34, 44,
-    )
 
     suspend fun fetchOpusDetail(id: String): OpusDetail {
-        val url = "https://api.bilibili.com/x/polymer/web-dynamic/v1/opus/detail" +
+        val url = BiliApiContractCatalog.require("opus.info.detail").url +
             "?id=$id&timezone_offset=-480" +
             "&features=onlyfansVote,onlyfansAssetsV2,decorationCard,htmlNewStyle,ugcDelete,editable,opusPrivateVisible"
 
-        val response = httpClient.get(url, buildHeaders())
+        val response = httpClient.get(url, buildHeaders(url))
         if (response.statusCode !in 200..299) throw ServiceError.InvalidResponse
 
         val payload = try {
@@ -77,18 +71,18 @@ class OpusService(
         val opusId = basic.stringValueAt("comment_id_str")
             ?: basic.stringValueAt("rid_str")
             ?: id
-        val commentId = basic.intValueAt("comment_id")?.toLong()
+        val commentId = basic.longValueAt("comment_id")
             ?: basic.stringValueAt("comment_id_str")?.toLongOrNull()
             ?: id.toLongOrNull()
             ?: 0L
 
         val authorModule = modules.dictionaryValueAt("module_author")
         val authorName = authorModule?.stringValueAt("name")?.ifEmpty { null } ?: "用户"
-        val authorMid = authorModule?.intValueAt("mid")?.toLong() ?: 0L
+        val authorMid = authorModule?.longValueAt("mid") ?: 0L
         val authorAvatar = authorModule?.stringValueAt("face") ?: ""
         val publishTime = authorModule?.stringValueAt("pub_time")
             ?: authorModule?.stringValueAt("pub_time_text")
-            ?: authorModule?.intValueAt("pub_ts")?.toString()
+            ?: authorModule?.longValueAt("pub_ts")?.toString()
             ?: ""
 
         val paragraphs = parseParagraphs(modules)
@@ -123,20 +117,27 @@ class OpusService(
      * 回退到动态详情接口，按 feed 相同的 module_dynamic 结构解析文本 + 图片。
      */
     private suspend fun fetchFromDynamicDetail(id: String): OpusDetail? {
-        val url = "https://api.bilibili.com/x/polymer/web-dynamic/v1/detail" +
-            "?id=$id&features=itemOpusStyle&timezone_offset=-480"
-        val response = try {
-            httpClient.get(url, buildHeaders())
+        val endpoint = BiliApiContractCatalog.require("dynamic.info.detail").url
+        val result = try {
+            wbiSigner.execute(
+                mapOf(
+                    "id" to id,
+                    "features" to "itemOpusStyle",
+                    "timezone_offset" to "-480",
+                ),
+            ) { signedQuery ->
+                val url = "$endpoint?$signedQuery"
+                val response = httpClient.get(url, buildHeaders(url))
+                val payload = runCatching {
+                    json.parseToJsonElement(response.body) as? JsonObject
+                }.getOrNull()
+                WbiRequestResult(payload, response.statusCode, payload?.intValueAt("code"))
+            }
         } catch (_: Exception) {
             return null
         }
-        if (response.statusCode !in 200..299) return null
-
-        val payload = try {
-            json.parseToJsonElement(response.body) as? JsonObject
-        } catch (_: Exception) {
-            null
-        } ?: return null
+        if (result.httpStatusCode !in 200..299) return null
+        val payload = result.value ?: return null
         if (payload.intValueAt("code") != 0) return null
 
         val item = payload.dictionaryValueAt("data", "item") ?: return null
@@ -178,7 +179,7 @@ class OpusService(
             commentId = id.toLongOrNull() ?: 0L,
             author = OpusAuthor(
                 name = author?.stringValueAt("name")?.ifEmpty { null } ?: "用户",
-                mid = author?.intValueAt("mid")?.toLong() ?: 0L,
+                mid = author?.longValueAt("mid") ?: 0L,
                 avatarURL = author?.stringValueAt("face") ?: "",
             ),
             publishTime = author?.stringValueAt("pub_time")
@@ -189,6 +190,7 @@ class OpusService(
     }
 
     suspend fun fetchComments(commentId: Long, fallbackId: String, page: Int = 1): Pair<List<VideoComment>, Int> {
+        if (page < 1) return emptyList<VideoComment>() to 0
         val oidCandidates = buildList {
             if (commentId > 0) add(commentId.toString())
             if (fallbackId.isNotBlank() && fallbackId !in this) add(fallbackId)
@@ -197,65 +199,48 @@ class OpusService(
 
         for (oid in oidCandidates) {
             for (type in typeCandidates) {
-                val result = runCatching { fetchCommentsByType(oid, type, page) }.getOrNull()
+                val result = runCatching { fetchCommentsByType(oid, type) }.getOrNull()
                 if (result != null && (result.first.isNotEmpty() || result.second > 0)) return result
             }
         }
         return emptyList<VideoComment>() to 0
     }
 
-    private suspend fun fetchCommentsByType(oid: String, type: Int, page: Int): Pair<List<VideoComment>, Int> {
-        val signed = signWbi(
-            "type" to type.toString(),
-            "oid" to oid,
-            "pn" to page.toString(),
-            "ps" to "20",
-            "sort" to "2",
-        )
-        val response = httpClient.get(
-            "https://api.bilibili.com/x/v2/reply/wbi/main?$signed",
-            buildHeaders(),
-        )
-        val payload = json.parseToJsonElement(response.body) as? JsonObject ?: throw ServiceError.InvalidResponse
+    private suspend fun fetchCommentsByType(oid: String, type: Int): Pair<List<VideoComment>, Int> {
+        val endpoint = BiliApiContractCatalog.require("common.comment.reply_by_session_id").url
+        val result = try {
+            wbiSigner.execute(
+                mapOf(
+                    "type" to type.toString(),
+                    "oid" to oid,
+                    "mode" to "3",
+                    "pagination_str" to """{"offset":""}""",
+                    "web_location" to "1315875",
+                ),
+            ) { signedQuery ->
+                val url = "$endpoint?$signedQuery"
+                val response = httpClient.get(url, buildHeaders(url))
+                val payload = runCatching {
+                    json.parseToJsonElement(response.body) as? JsonObject
+                }.getOrNull()
+                WbiRequestResult(payload, response.statusCode, payload?.intValueAt("code"))
+            }
+        } catch (_: WbiSigner.SigningUnavailable) {
+            throw ServiceError.InvalidResponse
+        }
+        if (result.httpStatusCode !in 200..299) throw ServiceError.InvalidResponse
+        val payload = result.value ?: throw ServiceError.InvalidResponse
         val code = payload.intValueAt("code") ?: -1
         if (code != 0) throw ServiceError.Api(code, payload.stringValueAt("message") ?: "未知错误")
         val data = payload.dictionaryValueAt("data") ?: throw ServiceError.InvalidResponse
         val replies = data.arrayValueAt("replies") ?: emptyList()
         val comments = replies.mapNotNull { parseComment(it as? JsonObject) }
-        val total = data.intValueAt("cursor", "all_count")
-            ?: data.intValueAt("page", "count")
-            ?: 0
+        val total = (
+            data.longValueAt("cursor", "all_count")
+                ?: data.longValueAt("page", "count")
+                ?: 0L
+            ).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
         return comments to total
-    }
-
-    private suspend fun ensureWbiKey() {
-        if (wbiMixedKey != null) return
-        val response = httpClient.get("https://api.bilibili.com/x/web-interface/nav", buildHeaders())
-        val root = json.parseToJsonElement(response.body) as? JsonObject ?: throw ServiceError.InvalidResponse
-        val data = root.dictionaryValueAt("data") ?: throw ServiceError.InvalidResponse
-        val wbiImg = data.dictionaryValueAt("wbi_img") ?: throw ServiceError.InvalidResponse
-        val imgUrl = wbiImg.stringValueAt("img_url") ?: throw ServiceError.InvalidResponse
-        val subUrl = wbiImg.stringValueAt("sub_url") ?: throw ServiceError.InvalidResponse
-        val imgKey = imgUrl.substringAfterLast("/").substringBefore(".")
-        val subKey = subUrl.substringAfterLast("/").substringBefore(".")
-        val combined = imgKey + subKey
-        wbiMixedKey = buildString {
-            for (idx in wbiMixinTable) {
-                if (idx < combined.length) append(combined[idx])
-            }
-        }.take(32)
-    }
-
-    private suspend fun signWbi(vararg params: Pair<String, String>): String {
-        ensureWbiKey()
-        val key = wbiMixedKey ?: throw ServiceError.InvalidResponse
-        val wts = currentEpochSeconds().toString()
-        val all = params.toMutableList()
-        all.add("wts" to wts)
-        all.sortBy { it.first }
-        val raw = all.joinToString("&") { "${it.first}=${it.second}" } + key
-        val wrid = org.bilibilifocus.core.crypto.md5Hex(raw)
-        return all.joinToString("&") { "${it.first}=${it.second}" } + "&w_rid=$wrid"
     }
 
     private fun parseComment(obj: JsonObject?): VideoComment? {
@@ -264,15 +249,15 @@ class OpusService(
         val content = obj.dictionaryValueAt("content") ?: return null
         val subReplies = obj.arrayValueAt("replies") ?: emptyList()
         return VideoComment(
-            rpid = obj.intValueAt("rpid")?.toLong() ?: 0L,
-            mid = obj.intValueAt("mid")?.toLong() ?: 0L,
+            rpid = obj.longValueAt("rpid") ?: 0L,
+            mid = obj.longValueAt("mid") ?: 0L,
             authorName = member.stringValueAt("uname") ?: "",
             avatarURL = member.stringValueAt("avatar") ?: "",
             content = content.stringValueAt("message") ?: "",
             contentRuns = CommentRichTextParser.parse(content),
-            likeCount = obj.intValueAt("like")?.toLong() ?: 0L,
-            replyCount = obj.intValueAt("rcount")?.toLong() ?: 0L,
-            publishTime = obj.intValueAt("ctime")?.toLong() ?: 0L,
+            likeCount = obj.longValueAt("like") ?: 0L,
+            replyCount = obj.longValueAt("rcount") ?: 0L,
+            publishTime = obj.longValueAt("ctime") ?: 0L,
             replies = subReplies.mapNotNull { parseComment(it as? JsonObject) },
         )
     }
@@ -400,13 +385,12 @@ class OpusService(
         }
     }
 
-    private suspend fun buildHeaders(): Map<String, String> {
-        val cookies = cookieProvider.loadCookies()
+    private suspend fun buildHeaders(targetUrl: String): Map<String, String> {
         val headers = mutableMapOf(
             "User-Agent" to userAgent,
             "Referer" to "https://www.bilibili.com/",
             "Accept" to "application/json, text/plain, */*",
         )
-        return cookieProvider.attachCookies(headers, cookies)
+        return cookieProvider.attachCookies(headers, targetUrl)
     }
 }

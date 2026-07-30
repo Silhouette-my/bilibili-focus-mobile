@@ -18,6 +18,7 @@ import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import androidx.media3.session.SessionCommand
+import androidx.media3.session.SessionError
 import androidx.media3.session.SessionResult
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
@@ -30,11 +31,9 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import org.bilibilifocus.android.AndroidCookieProvider
+import org.bilibilifocus.android.FocusApplication
 import org.bilibilifocus.android.MainActivity
-import org.bilibilifocus.core.service.KtorHttpClient
 import org.bilibilifocus.core.service.PlayUrlService
-import org.bilibilifocus.core.service.VideoActionService
 
 @OptIn(UnstableApi::class)
 class FocusPlaybackService : MediaSessionService() {
@@ -42,10 +41,12 @@ class FocusPlaybackService : MediaSessionService() {
     private lateinit var player: ExoPlayer
     private lateinit var mediaSession: MediaSession
     private lateinit var playUrlService: PlayUrlService
-    private lateinit var actionService: VideoActionService
+    private lateinit var playbackProgressStore: FocusPlaybackProgressStore
+    private lateinit var playbackHistoryOutbox: FocusPlaybackHistoryOutbox
     private var loadJob: Job? = null
     private var historyJob: Job? = null
     private var historySubmissionJob: Job? = null
+    private var outboxFlushJob: Job? = null
     private var pendingServiceStopJob: Job? = null
     private var currentRequest: FocusPlaybackRequest? = null
     private var lastReportedPositionSeconds: Long = -1
@@ -53,9 +54,16 @@ class FocusPlaybackService : MediaSessionService() {
 
     override fun onCreate() {
         super.onCreate()
-        val cookieProvider = AndroidCookieProvider()
-        playUrlService = PlayUrlService(cookieProvider, KtorHttpClient())
-        actionService = VideoActionService(cookieProvider, KtorHttpClient())
+        val appGraph = (application as FocusApplication).appGraph
+        playUrlService = appGraph.playUrlService
+        playbackProgressStore = appGraph.playbackProgressStore
+        playbackHistoryOutbox = appGraph.playbackHistoryOutbox
+        outboxFlushJob = serviceScope.launch {
+            val result = playbackHistoryOutbox.drainCurrentAccount()
+            if (result == FocusPlaybackHistoryDrainResult.RETRYABLE_FAILURE) {
+                FocusPlaybackHistoryWorkScheduler.enqueue(this@FocusPlaybackService)
+            }
+        }
         player = ExoPlayer.Builder(this).build().apply {
             setAudioAttributes(
                 AudioAttributes.Builder()
@@ -88,6 +96,7 @@ class FocusPlaybackService : MediaSessionService() {
         loadJob?.cancel()
         historyJob?.cancel()
         historySubmissionJob?.cancel()
+        outboxFlushJob?.cancel()
         pendingServiceStopJob?.cancel()
         player.removeListener(playerListener)
         mediaSession.release()
@@ -120,14 +129,14 @@ class FocusPlaybackService : MediaSessionService() {
         ): ListenableFuture<SessionResult> {
             if (!isApplicationController(controller)) {
                 return Futures.immediateFuture(
-                    SessionResult(SessionResult.RESULT_ERROR_PERMISSION_DENIED),
+                    SessionResult(SessionError.ERROR_PERMISSION_DENIED),
                 )
             }
             return when (customCommand.customAction) {
                 FocusPlaybackContract.COMMAND_LOAD -> {
                     val request = FocusPlaybackRequest.fromBundle(args)
                         ?: return Futures.immediateFuture(
-                            SessionResult(SessionResult.RESULT_ERROR_BAD_VALUE),
+                            SessionResult(SessionError.ERROR_BAD_VALUE),
                         )
                     load(request)
                 }
@@ -165,13 +174,9 @@ class FocusPlaybackService : MediaSessionService() {
         loadJob = serviceScope.launch {
             try {
                 val result = playUrlService.fetchPlayUrl(request.bvid, request.cid)
-                val requestHeaders = buildMap {
-                    put("Referer", result.referer)
-                    if (result.cookie.isNotEmpty()) put("Cookie", result.cookie)
-                }
+                val requestHeaders = FocusPlaybackMediaRequestPolicy.headers(result.referer)
                 val dataSourceFactory = DefaultHttpDataSource.Factory()
                     .setUserAgent(result.userAgent)
-                    .setAllowCrossProtocolRedirects(true)
                     .setDefaultRequestProperties(requestHeaders)
                 val metadata = MediaMetadata.Builder()
                     .setTitle(request.title)
@@ -219,7 +224,7 @@ class FocusPlaybackService : MediaSessionService() {
                 val extras = Bundle().apply {
                     putString("message", error.message ?: "视频加载失败")
                 }
-                resultFuture.set(SessionResult(SessionResult.RESULT_ERROR_UNKNOWN, extras))
+                resultFuture.set(SessionResult(SessionError.ERROR_UNKNOWN, extras))
             }
         }
         return resultFuture
@@ -290,28 +295,41 @@ class FocusPlaybackService : MediaSessionService() {
 
     private fun captureCurrentPosition(force: Boolean): FocusPlaybackHistoryReport? {
         val request = currentRequest ?: return null
+        val positionMillis = player.currentPosition.coerceAtLeast(0)
+        request.accountScope?.let { accountScope ->
+            playbackProgressStore.record(
+                accountScope = accountScope,
+                bvid = request.bvid,
+                cid = request.cid,
+                positionMillis = positionMillis,
+            )
+        }
         if (request.aid <= 0 || request.cid <= 0) return null
-        val seconds = player.currentPosition.coerceAtLeast(0) / 1_000
+        val seconds = positionMillis / 1_000
         if (!FocusPlaybackHistoryPolicy.shouldReport(seconds, lastReportedPositionSeconds, force)) return null
         lastReportedPositionSeconds = seconds
         return FocusPlaybackHistoryReport(
             aid = request.aid,
             cid = request.cid,
             progressSeconds = seconds,
+            accountScope = request.accountScope,
         )
     }
 
     private suspend fun submitHistoryReport(report: FocusPlaybackHistoryReport) {
-        try {
-            actionService.reportWatchHistory(
-                aid = report.aid,
-                cid = report.cid,
-                progressSeconds = report.progressSeconds,
-            )
-        } catch (error: CancellationException) {
-            throw error
-        } catch (_: Exception) {
-            // History reporting must never interrupt media playback or service shutdown.
+        val accountScope = report.accountScope ?: return
+        val pending = playbackHistoryOutbox.enqueue(
+            accountScope = accountScope,
+            aid = report.aid,
+            cid = report.cid,
+            progressSeconds = report.progressSeconds,
+        ) ?: return
+        // WorkManager persists the retry intent before the opportunistic
+        // foreground POST, covering service/process teardown after enqueue.
+        FocusPlaybackHistoryWorkScheduler.enqueue(this)
+        val result = playbackHistoryOutbox.submitPending(accountScope, pending)
+        if (result == FocusPlaybackHistorySubmissionOutcome.RETRYABLE_FAILURE) {
+            FocusPlaybackHistoryWorkScheduler.enqueue(this)
         }
     }
 }
@@ -320,6 +338,7 @@ private data class FocusPlaybackHistoryReport(
     val aid: Long,
     val cid: Long,
     val progressSeconds: Long,
+    val accountScope: String?,
 )
 
 internal object FocusPlaybackHistoryPolicy {
@@ -337,4 +356,9 @@ internal object FocusPlaybackLoadPolicy {
         requestMediaId: String,
         activeMediaId: String?,
     ): Boolean = requestGeneration == activeGeneration && requestMediaId == activeMediaId
+}
+
+internal object FocusPlaybackMediaRequestPolicy {
+    fun headers(referer: String): Map<String, String> =
+        mapOf("Referer" to referer)
 }

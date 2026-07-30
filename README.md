@@ -13,7 +13,7 @@
 * **广告与干扰全面净化**：WebView 区域内置自动化去干扰、导流拦截和布局修复机制，还你一个纯净的浏览界面。
 * **丝滑的原生体验**：
     * **核心页面原生化**：关注动态流、搜索入口及结果页、个人中心、历史记录、关注列表、收藏夹/合集页、UP主空间等均采用原生组件渲染。
-    * **原生视频播放**：iOS 采用底层 `AVPlayer`，Android 采用 `Media3/ExoPlayer`，支持分 P 播放、弹幕、评论查看、点赞/投币/收藏三连互动，以及播放进度自动上报。
+    * **原生视频播放**：iOS 采用底层 `AVPlayer`，Android 采用 `Media3/ExoPlayer`，支持分 P 播放、弹幕、评论查看、点赞/投币/收藏三连互动，以及播放进度自动上报。iOS 还支持原生字幕轨道发现、语言选择与开关偏好，并已支持评论楼中楼分页和评论点赞。
     * **PiP 与后台播放**：播放中返回桌面会自动进入系统画中画；PiP 不可用或锁屏时继续后台音频，并提供通知、锁屏及控制中心媒体控制。
 
 
@@ -55,15 +55,22 @@
 项目采用模块化设计，尽可能在 iOS 和 Android 之间复用逻辑：
 
 ```text
-├── App/BilibiliFocus     # iOS SwiftUI 应用入口、原生页面与 WebView 容器
-├── Sources/FocusCore     # iOS 侧共享核心：导航策略、页面规则、视频 API 与注入运行时
-├── focus-core            # Android / Kotlin Multiplatform 共享模型、路由与 API 服务
-├── focus-android         # Android 应用：Jetpack Compose UI、ExoPlayer 播放器
-├── Scripts               # iOS unsigned IPA 一键打包脚本
-├── Tests/                # 各平台核心逻辑与路由规则测试集
-└── localonly             # 本地归档或不参与远端主线的文件
-
+├── App/BilibiliFocus
+│   ├── Features          # iOS Dynamic/Search/My/Player/WebBridge/Shared features
+│   └── …                 # SwiftUI 入口、WebView 与平台适配
+├── Sources/FocusCore     # Swift API/WBI、缓存分页、诊断、续播与 durable outbox
+├── focus-core            # KMP 模型、路由、API、缓存分页与跨平台服务
+├── focus-android
+│   ├── playback          # Media3 service、播放状态、outbox 与 WorkManager
+│   └── ui/video          # 拆分后的播放器、控件、弹幕、详情与评论 UI
+├── Scripts               # 构建、运行时/契约同步与 opt-in 在线 smoke
+├── Tests                 # Swift Core 与 iOS 应用层测试
+└── docs                  # 升级路线、在线 smoke 与维护说明
 ```
+
+iOS 生产代码当前仍使用 Swift `FocusCore`。KMP 的 iOS framework 已进入编译/链接
+门禁，但尚未接入 App 运行路径；计划先将其 framework 改名为 `FocusKMP`，通过
+Router adapter 完成首个共存切片，再逐项迁移网络服务。具体边界见升级路线图。
 
 ---
 
@@ -103,9 +110,44 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
 
 项目包含完善的测试集，确保 B 站接口或网页结构变动时能快速定位问题。
 
-* **iOS 核心测试**：`FOCUS_INCLUDE_TESTS=1 swift test`
+* **iOS 核心测试**：`FOCUS_INCLUDE_TESTS=1 swift test --disable-sandbox`
+* **iOS Release 边界测试**：`FOCUS_INCLUDE_TESTS=1 swift test -c release --disable-sandbox`
 * **Web 注入规则验证**：`swift run FocusVerifier`
 * **Android 单元测试**：`./gradlew :focus-android:testDebugUnitTest :focus-core:testDebugUnitTest`
+* **KMP iOS 编译/链接门禁**：`./gradlew :focus-core:compileKotlinIosSimulatorArm64 :focus-core:linkDebugFrameworkIosSimulatorArm64`
+* **跨平台运行时一致性**：`./Scripts/sync_focus_runtime.sh --check`
+* **Bilibili API 契约一致性**：`./Scripts/sync_bilibili_api_contracts.mjs --check`
+* **在线 API smoke（默认跳过）**：`node ./Scripts/run_online_smoke.mjs`
+
+GitHub Actions 会在 Pull Request 和 `main` 分支更新时运行上述检查，并额外执行
+Xcode 单元测试、Android Lint 与 Debug APK 构建。
+
+### Web 注入运行时同步
+
+`Sources/FocusCore/Resources/focus-runtime.js` 是 Web 注入运行时的唯一编辑源；
+`focus-core/src/commonMain/resources/focus-runtime.js` 是供 Kotlin Multiplatform
+打包的提交内镜像。修改运行时后执行：
+
+```bash
+./Scripts/sync_focus_runtime.sh --sync
+./Scripts/sync_focus_runtime.sh --check
+```
+
+Gradle 的测试与 assemble 任务也依赖同一份一致性门禁，未同步时会直接失败。
+
+### API 契约与升级路线
+
+Swift 与 KMP 共享一份 independently maintained、facts-only 的 Bilibili API
+端点子集。开发时可以用同级 `bilibili-api` 仓库校验当前 48 个端点：
+
+```bash
+./Scripts/sync_bilibili_api_contracts.mjs --validate-source ../bilibili-api
+```
+
+完整的 4–12 周改造成果、许可边界和后续功能顺序见
+[升级路线图](docs/UPGRADE_ROADMAP.md)。
+真实账号的只读在线检查使用显式 opt-in，详见
+[在线 Smoke 说明](docs/ONLINE_SMOKE.md)。
 
 ---
 

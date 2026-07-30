@@ -51,6 +51,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.VerticalDivider
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -66,6 +67,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -87,6 +89,7 @@ import org.bilibilifocus.android.ui.FocusSettingsScreen
 import org.bilibilifocus.android.ui.FocusUserScreen
 import org.bilibilifocus.android.ui.FocusUserCollectionScreen
 import org.bilibilifocus.android.ui.FocusVideoScreen
+import org.bilibilifocus.android.ui.FocusWatchLaterScreen
 import org.bilibilifocus.android.ui.FocusWebView
 import org.bilibilifocus.android.playback.FocusPlaybackConnection
 import org.bilibilifocus.core.model.FavFolder
@@ -95,28 +98,20 @@ import org.bilibilifocus.core.model.FocusDynamicFilterKind
 import org.bilibilifocus.core.model.FocusSettings
 import org.bilibilifocus.core.model.SearchResultItem
 import org.bilibilifocus.core.model.UserContentCollection
-import org.bilibilifocus.core.service.AccountService
-import org.bilibilifocus.core.service.ArticleService
 import org.bilibilifocus.core.routing.ArticleURL
-import org.bilibilifocus.core.service.DynamicFeedService
-import org.bilibilifocus.core.service.FavoriteService
-import org.bilibilifocus.core.service.HistoryService
-import org.bilibilifocus.core.service.KtorHttpClient
-import org.bilibilifocus.core.service.OpusService
-import org.bilibilifocus.core.service.SearchResultService
-import org.bilibilifocus.core.service.UserService
-import org.bilibilifocus.core.service.VideoActionService
 import org.bilibilifocus.core.service.VideoInfoService
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalHazeMaterialsApi::class)
 @Composable
 fun FocusApp(
     settingsViewModel: FocusSettingsViewModel,
+    appGraph: FocusAppGraph,
     playbackConnection: FocusPlaybackConnection,
     playerSurfaceRevision: Int,
     isInPictureInPictureMode: Boolean,
 ) {
     val widthClass = rememberFocusWindowClass()
+    val uriHandler = LocalUriHandler.current
     val isWideLayout = widthClass == FocusWindowClass.Expanded
     val settings by settingsViewModel.settings.collectAsState()
 
@@ -138,7 +133,7 @@ fun FocusApp(
     } ?: FocusDynamicFilterKind.ALL
     val feedViewModel = remember {
         FocusFeedViewModel(
-            service = DynamicFeedService(AndroidCookieProvider(), KtorHttpClient()),
+            service = appGraph.dynamicFeedService,
             initialSelectedFilter = restoredFeedFilter,
         )
     }
@@ -150,14 +145,19 @@ fun FocusApp(
             .distinctBy(FocusSettingsViewModel::authorFilterKey)
             .sortedBy { it.name.lowercase() }
     }
-    val searchViewModel = remember { FocusSearchViewModel(SearchResultService(AndroidCookieProvider(), KtorHttpClient())) }
+    val searchViewModel = remember {
+        FocusSearchViewModel(appGraph.searchResultService)
+    }
     val myViewModel = remember {
         FocusMyViewModel(
-            accountService = AccountService(AndroidCookieProvider(), KtorHttpClient()),
-            userService = UserService(AndroidCookieProvider(), KtorHttpClient()),
-            historyService = HistoryService(AndroidCookieProvider(), KtorHttpClient()),
-            favoriteService = FavoriteService(AndroidCookieProvider(), KtorHttpClient()),
+            accountService = appGraph.accountService,
+            userService = appGraph.userService,
+            historyService = appGraph.historyService,
+            favoriteService = appGraph.favoriteService,
         )
+    }
+    val watchLaterViewModel = remember {
+        FocusWatchLaterViewModel(appGraph.watchLaterService)
     }
     val feedListState = rememberSaveable(saver = LazyListState.Saver) { LazyListState() }
     val myListState = rememberLazyListState()
@@ -174,6 +174,59 @@ fun FocusApp(
     val favFolderGridStates = remember { mutableStateMapOf<Long, LazyGridState>() }
     val historyViewModels = remember { mutableStateMapOf<String, FocusHistoryViewModel>() }
     val historyGridStates = remember { mutableStateMapOf<String, LazyGridState>() }
+    val watchLaterGridState = remember { LazyGridState() }
+
+    fun releaseRouteIfUnused(route: OverlayRoute) {
+        val isStillRetained = overlayStack.any { it.key == route.key } ||
+            dynamicDetailStack.any { it.key == route.key }
+        if (isStillRetained) return
+
+        when (route) {
+            is OverlayRoute.Video -> {
+                videoViewModels.remove(route.key)?.onCleared()
+                videoScrollStates.remove(route.key)
+            }
+            is OverlayRoute.Opus -> {
+                opusViewModels.remove(route.id)?.onCleared()
+                opusListStates.remove(route.id)
+            }
+            is OverlayRoute.Article -> articleViewModels.remove(route.cvid)?.onCleared()
+            is OverlayRoute.User -> {
+                userViewModels.remove(route.mid)?.onCleared()
+                userGridStates.remove(route.mid)
+            }
+            is OverlayRoute.UserCollection -> {
+                userCollectionViewModels.remove(route.collection.id)?.onCleared()
+                userCollectionGridStates.remove(route.collection.id)
+            }
+            is OverlayRoute.Folder -> {
+                favFolderViewModels.remove(route.mediaId)?.onCleared()
+                favFolderGridStates.remove(route.mediaId)
+            }
+            is OverlayRoute.History -> {
+                historyViewModels.remove(route.key)?.onCleared()
+                historyGridStates.remove(route.key)
+            }
+            OverlayRoute.WatchLater -> Unit
+            is OverlayRoute.Web -> Unit
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            feedViewModel.onCleared()
+            searchViewModel.onCleared()
+            myViewModel.onCleared()
+            watchLaterViewModel.onCleared()
+            videoViewModels.values.forEach(FocusVideoViewModel::onCleared)
+            opusViewModels.values.forEach(FocusOpusViewModel::onCleared)
+            articleViewModels.values.forEach(FocusArticleViewModel::onCleared)
+            userViewModels.values.forEach(FocusUserViewModel::onCleared)
+            userCollectionViewModels.values.forEach(FocusUserCollectionViewModel::onCleared)
+            favFolderViewModels.values.forEach(FocusFavFolderViewModel::onCleared)
+            historyViewModels.values.forEach(FocusHistoryViewModel::onCleared)
+        }
+    }
 
     fun selectTab(tab: Int) {
         val hidesDynamicVideo = selectedTab == 0 && tab != 0 &&
@@ -203,14 +256,16 @@ fun FocusApp(
 
     fun popOverlay() {
         if (overlayStack.isNotEmpty()) {
+            val route = overlayStack.last()
             if (FocusPlaybackRoutePolicy.shouldStop(
-                    isLeavingVideoRoute = overlayStack.last() is OverlayRoute.Video,
+                    isLeavingVideoRoute = route is OverlayRoute.Video,
                     isApplicationBackgrounding = false,
                 )
             ) {
                 playbackConnection.stop()
             }
             overlayStack.removeAt(overlayStack.lastIndex)
+            releaseRouteIfUnused(route)
         }
     }
 
@@ -229,14 +284,16 @@ fun FocusApp(
 
     fun popDynamicDetail() {
         if (dynamicDetailStack.isNotEmpty()) {
+            val route = dynamicDetailStack.last()
             if (FocusPlaybackRoutePolicy.shouldStop(
-                    isLeavingVideoRoute = dynamicDetailStack.last() is OverlayRoute.Video,
+                    isLeavingVideoRoute = route is OverlayRoute.Video,
                     isApplicationBackgrounding = false,
                 )
             ) {
                 playbackConnection.stop()
             }
             dynamicDetailStack.removeAt(dynamicDetailStack.lastIndex)
+            releaseRouteIfUnused(route)
         }
     }
 
@@ -280,14 +337,8 @@ fun FocusApp(
                 val routeKey = route.key
                 val viewModel = videoViewModels.getOrPut(routeKey) {
                     FocusVideoViewModel(
-                        service = VideoInfoService(
-                            cookieProvider = AndroidCookieProvider(),
-                            httpClient = KtorHttpClient(),
-                        ),
-                        actionService = VideoActionService(
-                            cookieProvider = AndroidCookieProvider(),
-                            httpClient = KtorHttpClient(),
-                        ),
+                        service = appGraph.videoInfoService,
+                        actionService = appGraph.videoActionService,
                     )
                 }
                 val scrollState = videoScrollStates.getOrPut(routeKey) { ScrollState(0) }
@@ -304,6 +355,8 @@ fun FocusApp(
                     viewModel = viewModel,
                     scrollState = scrollState,
                     playbackConnection = playbackConnection,
+                    playbackAccountScopeProvider = appGraph.playbackAccountScopeProvider,
+                    playbackProgressStore = appGraph.playbackProgressStore,
                     playerSurfaceRevision = playerSurfaceRevision,
                     isInPictureInPictureMode = isInPictureInPictureMode,
                 )
@@ -311,12 +364,7 @@ fun FocusApp(
 
             is OverlayRoute.Opus -> {
                 val viewModel = opusViewModels.getOrPut(route.id) {
-                    FocusOpusViewModel(
-                        service = OpusService(
-                            cookieProvider = AndroidCookieProvider(),
-                            httpClient = KtorHttpClient(),
-                        )
-                    )
+                    FocusOpusViewModel(service = appGraph.opusService)
                 }
                 val listState = opusListStates.getOrPut(route.id) { LazyListState() }
                 FocusOpusScreen(
@@ -332,12 +380,7 @@ fun FocusApp(
 
             is OverlayRoute.Article -> {
                 val viewModel = articleViewModels.getOrPut(route.cvid) {
-                    FocusArticleViewModel(
-                        service = ArticleService(
-                            cookieProvider = AndroidCookieProvider(),
-                            httpClient = KtorHttpClient(),
-                        )
-                    )
+                    FocusArticleViewModel(service = appGraph.articleService)
                 }
                 FocusArticleScreen(
                     cvid = route.cvid,
@@ -351,12 +394,7 @@ fun FocusApp(
 
             is OverlayRoute.User -> {
                 val viewModel = userViewModels.getOrPut(route.mid) {
-                    FocusUserViewModel(
-                        service = UserService(
-                            cookieProvider = AndroidCookieProvider(),
-                            httpClient = KtorHttpClient(),
-                        )
-                    )
+                    FocusUserViewModel(service = appGraph.userService)
                 }
                 val gridState = userGridStates.getOrPut(route.mid) { LazyGridState() }
                 FocusUserScreen(
@@ -374,12 +412,7 @@ fun FocusApp(
 
             is OverlayRoute.UserCollection -> {
                 val viewModel = userCollectionViewModels.getOrPut(route.collection.id) {
-                    FocusUserCollectionViewModel(
-                        service = UserService(
-                            cookieProvider = AndroidCookieProvider(),
-                            httpClient = KtorHttpClient(),
-                        )
-                    )
+                    FocusUserCollectionViewModel(service = appGraph.userService)
                 }
                 val gridState = userCollectionGridStates.getOrPut(route.collection.id) { LazyGridState() }
                 FocusUserCollectionScreen(
@@ -416,6 +449,10 @@ fun FocusApp(
                             onPageStarted = {},
                             onPageFinished = {},
                             onError = {},
+                            onOpenExternal = { externalURL ->
+                                runCatching { uriHandler.openUri(externalURL) }
+                                onBack()
+                            },
                         )
                     }
                 }
@@ -423,9 +460,7 @@ fun FocusApp(
 
             is OverlayRoute.Folder -> {
                 val viewModel = favFolderViewModels.getOrPut(route.mediaId) {
-                    FocusFavFolderViewModel(
-                        service = FavoriteService(AndroidCookieProvider(), KtorHttpClient()),
-                    )
+                    FocusFavFolderViewModel(service = appGraph.favoriteService)
                 }
                 val gridState = favFolderGridStates.getOrPut(route.mediaId) { LazyGridState() }
                 FocusFavFolderScreen(
@@ -440,9 +475,7 @@ fun FocusApp(
 
             is OverlayRoute.History -> {
                 val viewModel = historyViewModels.getOrPut(route.key) {
-                    FocusHistoryViewModel(
-                        service = HistoryService(AndroidCookieProvider(), KtorHttpClient()),
-                    )
+                    FocusHistoryViewModel(service = appGraph.historyService)
                 }
                 val gridState = historyGridStates.getOrPut(route.key) { LazyGridState() }
                 FocusHistoryScreen(
@@ -450,6 +483,16 @@ fun FocusApp(
                     onOpenVideo = onOpenVideoRoute,
                     viewModel = viewModel,
                     gridState = gridState,
+                )
+            }
+
+            OverlayRoute.WatchLater -> {
+                FocusWatchLaterScreen(
+                    onBack = onBack,
+                    onOpenVideo = onOpenVideoRoute,
+                    onOpenLogin = { showLogin = true },
+                    viewModel = watchLaterViewModel,
+                    gridState = watchLaterGridState,
                 )
             }
         }
@@ -514,6 +557,7 @@ fun FocusApp(
                     feedListState = feedListState,
                     searchViewModel = searchViewModel,
                     myViewModel = myViewModel,
+                    watchLaterViewModel = watchLaterViewModel,
                     myListState = myListState,
                     onOpenLogin = { showLogin = true },
                     onOpenRouteFromUrl = openInBrowser,
@@ -529,6 +573,7 @@ fun FocusApp(
                     initialQuery = pendingSearchQuery,
                     onInitialQueryConsumed = { pendingSearchQuery = null },
                     onOpenMyVideo = { pushOverlay(OverlayRoute.Video(it)) },
+                    onOpenWatchLater = { pushOverlay(OverlayRoute.WatchLater) },
                     onOpenHistory = { pushOverlay(OverlayRoute.History) },
                     onOpenFolder = { pushOverlay(OverlayRoute.Folder(it.id, it.title)) },
                     contentPadding = contentPadding,
@@ -548,6 +593,7 @@ fun FocusApp(
                     feedListState = feedListState,
                     searchViewModel = searchViewModel,
                     myViewModel = myViewModel,
+                    watchLaterViewModel = watchLaterViewModel,
                     myListState = myListState,
                     onOpenLogin = { showLogin = true },
                     onOpenRouteFromUrl = openInBrowser,
@@ -563,6 +609,7 @@ fun FocusApp(
                     initialQuery = pendingSearchQuery,
                     onInitialQueryConsumed = { pendingSearchQuery = null },
                     onOpenMyVideo = { pushOverlay(OverlayRoute.Video(it)) },
+                    onOpenWatchLater = { pushOverlay(OverlayRoute.WatchLater) },
                     onOpenHistory = { pushOverlay(OverlayRoute.History) },
                     onOpenFolder = { pushOverlay(OverlayRoute.Folder(it.id, it.title)) },
                     contentPadding = contentPadding,
@@ -596,6 +643,8 @@ fun FocusApp(
             FocusSettingsScreen(
                 settings = settings,
                 knownAuthors = knownDynamicAuthors,
+                loginHealthService = appGraph.loginHealthService,
+                networkEvents = appGraph.networkEvents,
                 onBack = { showSettings = false },
                 onUpdate = settingsViewModel::update,
                 onSetAuthorKind = settingsViewModel::setDynamicKindEnabled,
@@ -624,6 +673,7 @@ private fun FocusPrimaryTabContent(
     feedListState: LazyListState,
     searchViewModel: FocusSearchViewModel,
     myViewModel: FocusMyViewModel,
+    watchLaterViewModel: FocusWatchLaterViewModel,
     myListState: LazyListState,
     onOpenLogin: () -> Unit,
     onOpenRouteFromUrl: (String) -> Unit,
@@ -634,6 +684,7 @@ private fun FocusPrimaryTabContent(
     initialQuery: String?,
     onInitialQueryConsumed: () -> Unit,
     onOpenMyVideo: (String) -> Unit,
+    onOpenWatchLater: () -> Unit,
     onOpenHistory: () -> Unit,
     onOpenFolder: (FavFolder) -> Unit,
     contentPadding: PaddingValues,
@@ -665,9 +716,11 @@ private fun FocusPrimaryTabContent(
 
         2 -> FocusMyScreen(
             viewModel = myViewModel,
+            watchLaterViewModel = watchLaterViewModel,
             listState = myListState,
             onOpenLogin = onOpenLogin,
             onOpenVideo = onOpenMyVideo,
+            onOpenWatchLater = onOpenWatchLater,
             onOpenHistory = onOpenHistory,
             onOpenFolder = onOpenFolder,
             contentPadding = contentPadding,
@@ -1070,5 +1123,9 @@ private sealed interface OverlayRoute {
 
     data object History : OverlayRoute {
         override val key: String = "history"
+    }
+
+    data object WatchLater : OverlayRoute {
+        override val key: String = "watch-later"
     }
 }

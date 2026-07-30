@@ -15,6 +15,8 @@ class FocusSettingsTests {
         assertTrue(settings.redirectEnabled)
         assertTrue(settings.playerMaskEnabled)
         assertTrue(settings.nativeDanmakuEnabled)
+        assertTrue(settings.nativeSubtitleEnabled)
+        assertTrue(settings.nativeSubtitleLanguageCode.isEmpty())
         assertTrue(settings.searchMaskEnabled)
         assertTrue(settings.dynamicMaskEnabled)
         assertFalse(settings.debugMode)
@@ -31,6 +33,8 @@ class FocusSettingsTests {
             redirectEnabled = false,
             playerMaskEnabled = false,
             nativeDanmakuEnabled = false,
+            nativeSubtitleEnabled = false,
+            nativeSubtitleLanguageCode = "zh-CN",
             searchMaskEnabled = true,
             dynamicMaskEnabled = false,
             debugMode = true,
@@ -62,6 +66,8 @@ class FocusSettingsTests {
         assertEquals(FocusThemeMode.SYSTEM, restored.themeMode)
         assertEquals("#FB7299", restored.accentColorHex)
         assertTrue(restored.nativeDanmakuEnabled)
+        assertTrue(restored.nativeSubtitleEnabled)
+        assertTrue(restored.nativeSubtitleLanguageCode.isEmpty())
         assertEquals(FocusDynamicFilterKind.entries.toSet(), restored.dynamicVisibleKinds)
         assertTrue(restored.perAuthorDynamicFilters.isEmpty())
     }

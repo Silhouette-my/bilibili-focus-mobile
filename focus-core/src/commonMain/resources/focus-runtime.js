@@ -6,7 +6,7 @@
   const configKey = "__FOCUS_CONFIG__";
   const stylePrefix = "bili-focus-style-";
   const scriptStateKey = "__FOCUS_FEATURE_SCRIPT_STATE__";
-  const runtimeVersion = "2026-06-24-runtime-trace-d-src";
+  const runtimeVersion = "2026-06-24-runtime-trace-d-shared";
 
   function makeStyleId(ruleId, featureId) {
     return (stylePrefix + ruleId + "-" + featureId).replace(/[^a-zA-Z0-9_-]/g, "-");
@@ -36,11 +36,11 @@
       }
 
       try {
-        if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.logDebug) {
-          window.webkit.messageHandlers.logDebug.postMessage({
+        const debugSink = window.__FOCUS_DEBUG_SINK__;
+        if (typeof debugSink === "function") {
+          debugSink({
             message,
-            extra: extra || null,
-            url: location.href
+            extra: extra || null
           });
         }
       } catch (_) {}
@@ -103,7 +103,27 @@
         const isBilibiliHost = host === "www.bilibili.com" || host === "bilibili.com" || host === "m.bilibili.com";
 
         if (isBilibiliHost && (path.indexOf("/video/") === 0 || path.indexOf("/bangumi/play/") === 0)) {
+          url.protocol = "https:";
           url.hostname = "www.bilibili.com";
+          if (path.indexOf("/video/") === 0 && !url.pathname.endsWith("/")) {
+            url.pathname = url.pathname + "/";
+          }
+          if (path.indexOf("/video/") === 0) {
+            const preservedNames = new Set([
+              "p",
+              "t",
+              "start_progress",
+              "start_progress_ms",
+              "spm_id_from",
+              "from_spmid",
+              "from_source"
+            ]);
+            Array.from(url.searchParams.keys()).forEach((key) => {
+              if (!preservedNames.has(String(key).toLowerCase())) {
+                url.searchParams.delete(key);
+              }
+            });
+          }
         }
 
         return url.toString();
@@ -222,6 +242,11 @@
         const styleId = makeStyleId(rule.id, feature.featureId);
         if (isFeatureEnabled(feature)) {
           ensureStyle(styleId, feature.css);
+
+          if (feature.css && document.getElementById(styleId)) {
+            void document.body.offsetHeight;
+          }
+
           runFeatureScript(rule, feature);
         } else {
           removeStyle(styleId);
@@ -295,48 +320,56 @@
         postDebug("scheduleApply-skipped", runtimeLabel({ reason, branch: "history-comparable" }));
         return;
       }
-      const delay = isVideoPage ? Math.max(180, 280 - (now - state.lastApplyAt)) : 80;
-      postDebug("scheduleApply-queued", runtimeLabel({ reason, delay, branch: "timer-queued" }));
-      const token = state.applyTimerToken + 1;
-      state.applyTimerToken = token;
-      state.applyTimerMetadata = {
-        reason,
-        delay,
-        token
-      };
-      state.applyTimer = setTimeout(() => {
-        if (token !== state.applyTimerToken) {
-          postDebug("scheduleApply-cancelled", runtimeLabel({
-            reason,
-            delay,
-            branch: "token-stale",
-            cancelReason: "superseded",
-            token,
-            activeToken: state.applyTimerToken
-          }));
-          return;
-        }
+      const delay = isVideoPage ? 120 : Math.max(40, 80 - (now - state.lastApplyAt));
 
-        state.applyTimer = null;
-        state.applyTimerMetadata = null;
-        const firedStableState = stableFocusVideoState();
-        if (firedStableState.stable) {
-          postDebug("scheduleApply-cancelled", runtimeLabel({
-            reason,
-            delay,
-            branch: "stable-before-fire",
-            cancelReason: "stable-before-fire",
-            stableReady: firedStableState.ready ? 1 : 0,
-            stableRenderable: firedStableState.renderableNativeAugment ? 1 : 0,
-            stableVisibleVideo: firedStableState.visiblePrimaryVideo ? 1 : 0
-          }));
-          return;
-        }
-
+      if (delay === 0) {
+        state.applyTimerToken += 1;
         state.lastApplyAt = Date.now();
         applyAll();
-        postDebug("scheduleApply", runtimeLabel({ reason, delay, branch: "timer-fired" }));
-      }, Math.max(delay, 40));
+        postDebug("scheduleApply-immediate", runtimeLabel({ reason, delay, branch: "immediate" }));
+      } else {
+        const token = state.applyTimerToken + 1;
+        state.applyTimerToken = token;
+        state.applyTimerMetadata = {
+          reason,
+          delay,
+          token
+        };
+        state.applyTimer = setTimeout(() => {
+          if (token !== state.applyTimerToken) {
+            postDebug("scheduleApply-cancelled", runtimeLabel({
+              reason,
+              delay,
+              branch: "token-stale",
+              cancelReason: "superseded",
+              token,
+              activeToken: state.applyTimerToken
+            }));
+            return;
+          }
+
+          state.applyTimer = null;
+          state.applyTimerMetadata = null;
+          const firedStableState = stableFocusVideoState();
+          if (firedStableState.stable) {
+            postDebug("scheduleApply-cancelled", runtimeLabel({
+              reason,
+              delay,
+              branch: "stable-before-fire",
+              cancelReason: "stable-before-fire",
+              stableReady: firedStableState.ready ? 1 : 0,
+              stableRenderable: firedStableState.renderableNativeAugment ? 1 : 0,
+              stableVisibleVideo: firedStableState.visiblePrimaryVideo ? 1 : 0
+            }));
+            return;
+          }
+
+          state.lastApplyAt = Date.now();
+          applyAll();
+          postDebug("scheduleApply", runtimeLabel({ reason, delay, branch: "timer-fired" }));
+        }, delay);
+        postDebug("scheduleApply-queued", runtimeLabel({ reason, delay, branch: "timer-queued" }));
+      }
     }
 
     function isIgnoredPlayerMutationTarget(node) {
@@ -494,34 +527,34 @@
         return false;
       }
 
-      const importantVideoSelectors = [
-        "#arc_toolbar_report",
-        "#commentapp",
-        "bili-comments",
-        ".video-toolbar-container",
-        ".video-pod",
-        ".video-pod__body",
-        ".video-pod__list",
-        ".multi-page",
-        ".left-container",
-        ".right-container"
-      ].join(",");
-
       return mutations.some((mutation) => {
         const target = mutation.target;
-        if (target && target.nodeType === 1 && isSuppressedVideoAuxiliaryNode(target)) {
-          return false;
-        }
-        if (target && target.nodeType === 1 && !isIgnoredPlayerMutationTarget(target)) {
-          return true;
-        }
-
         const changedNodes = []
           .concat(Array.from(mutation.addedNodes || []))
           .concat(Array.from(mutation.removedNodes || []));
 
+        if (changedNodes.length > 0 && changedNodes.every((node) => !node || node.nodeType !== 1 || isFocusManagedNode(node))) {
+          return false;
+        }
+
+        if (target && target.nodeType === 1 && isFocusManagedNode(target)) {
+          return false;
+        }
+
+        if (target && target.nodeType === 1 && isSuppressedVideoAuxiliaryNode(target)) {
+          return false;
+        }
+
+        if (target && target.nodeType === 1 && !isIgnoredPlayerMutationTarget(target)) {
+          return true;
+        }
+
         return changedNodes.some((node) => {
           if (!node || node.nodeType !== 1) {
+            return false;
+          }
+
+          if (isFocusManagedNode(node)) {
             return false;
           }
 
@@ -533,8 +566,13 @@
             return true;
           }
 
-          return !!node.matches?.(importantVideoSelectors)
-            || !!node.querySelector?.(importantVideoSelectors);
+          return !!node.querySelector?.([
+            "#arc_toolbar_report",
+            ".video-toolbar-container",
+            ".video-pod",
+            ".left-container",
+            ".right-container"
+          ].join(","));
         });
       });
     }

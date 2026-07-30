@@ -41,9 +41,10 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
-import org.bilibilifocus.android.AndroidCookieProvider
 import org.bilibilifocus.android.FocusMyViewModel
+import org.bilibilifocus.android.FocusWatchLaterViewModel
 import org.bilibilifocus.android.MyUiState
+import org.bilibilifocus.android.WatchLaterUiState
 import org.bilibilifocus.core.model.FavFolder
 import org.bilibilifocus.core.model.HistoryItem
 import org.bilibilifocus.core.model.UserProfile
@@ -52,9 +53,11 @@ import org.bilibilifocus.core.model.UserProfile
 @Composable
 fun FocusMyScreen(
     viewModel: FocusMyViewModel,
+    watchLaterViewModel: FocusWatchLaterViewModel,
     listState: LazyListState,
     onOpenLogin: () -> Unit = {},
     onOpenVideo: (String) -> Unit = {},
+    onOpenWatchLater: () -> Unit = {},
     onOpenHistory: () -> Unit = {},
     onOpenFolder: (FavFolder) -> Unit = {},
     contentPadding: PaddingValues = PaddingValues(),
@@ -62,6 +65,7 @@ fun FocusMyScreen(
     LaunchedEffect(Unit) { viewModel.loadIfNeeded() }
 
     val state by viewModel.state.collectAsState()
+    val watchLaterState by watchLaterViewModel.state.collectAsState()
 
     when (val s = state) {
         MyUiState.Idle, MyUiState.Loading -> {
@@ -75,7 +79,7 @@ fun FocusMyScreen(
                 Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(16.dp)) {
                     Text("需要登录", style = MaterialTheme.typography.headlineSmall)
                     Text(
-                        "登录后即可查看你的播放历史和收藏夹",
+                        "登录后即可查看稍后再看、播放历史和收藏夹",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -102,7 +106,14 @@ fun FocusMyScreen(
         }
 
         is MyUiState.Loaded -> {
+            LaunchedEffect(s.profile.mid) {
+                watchLaterViewModel.reload()
+            }
             val historyVideos = s.history.filter { it.bvid.isNotEmpty() }
+            val watchLaterItems = (watchLaterState as? WatchLaterUiState.Loaded)
+                ?.items
+                .orEmpty()
+                .filter { it.targetURL.isNotEmpty() }
             BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
                 val previewColumns = when {
                     maxWidth >= 1160.dp -> 5
@@ -110,13 +121,15 @@ fun FocusMyScreen(
                     maxWidth >= 720.dp -> 3
                     else -> 2
                 }
+                val previewCapacity = if (maxWidth >= 920.dp) {
+                    previewColumns * 2
+                } else {
+                    previewColumns
+                }
                 val previewItems = historyVideos.take(
-                    if (maxWidth >= 920.dp) {
-                        previewColumns * 2
-                    } else {
-                        previewColumns
-                    }
+                    previewCapacity
                 )
+                val watchLaterPreviewItems = watchLaterItems.take(previewCapacity)
 
                 Box(
                     modifier = Modifier.fillMaxSize(),
@@ -136,6 +149,62 @@ fun FocusMyScreen(
                         verticalArrangement = Arrangement.spacedBy(20.dp),
                     ) {
                         item { MyProfileHeader(profile = s.profile) }
+
+                        item {
+                            SectionHeader(
+                                title = "稍后再看",
+                                actionLabel = "查看全部",
+                                onAction = onOpenWatchLater,
+                            )
+                        }
+                        item {
+                            when (val current = watchLaterState) {
+                                WatchLaterUiState.Idle,
+                                WatchLaterUiState.Loading,
+                                -> Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(vertical = 16.dp),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    CircularProgressIndicator(
+                                        color = MaterialTheme.colorScheme.primary,
+                                    )
+                                }
+
+                                WatchLaterUiState.LoginRequired -> {
+                                    CompactSectionMessage(
+                                        message = "登录状态已失效",
+                                        actionLabel = "重新检测",
+                                        onAction = watchLaterViewModel::reload,
+                                    )
+                                }
+
+                                is WatchLaterUiState.Failed -> {
+                                    CompactSectionMessage(
+                                        message = current.message,
+                                        actionLabel = "重试",
+                                        onAction = watchLaterViewModel::reload,
+                                    )
+                                }
+
+                                is WatchLaterUiState.Loaded -> {
+                                    if (watchLaterPreviewItems.isEmpty()) {
+                                        CompactSectionMessage(message = "暂无稍后再看")
+                                    } else {
+                                        WatchLaterPreviewGrid(
+                                            items = watchLaterPreviewItems,
+                                            columns = previewColumns,
+                                            onOpenVideo = { item ->
+                                                item.targetURL
+                                                    .takeIf(String::isNotEmpty)
+                                                    ?.let(onOpenVideo)
+                                            },
+                                        )
+                                    }
+                                }
+                            }
+                        }
 
                         if (historyVideos.isNotEmpty()) {
                             item {
@@ -251,6 +320,32 @@ private fun SectionHeader(
         Spacer(modifier = Modifier.weight(1f))
         TextButton(onClick = onAction) {
             Text(actionLabel)
+        }
+    }
+}
+
+@Composable
+private fun CompactSectionMessage(
+    message: String,
+    actionLabel: String? = null,
+    onAction: () -> Unit = {},
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = message,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(modifier = Modifier.weight(1f))
+        if (actionLabel != null) {
+            TextButton(onClick = onAction) {
+                Text(actionLabel)
+            }
         }
     }
 }

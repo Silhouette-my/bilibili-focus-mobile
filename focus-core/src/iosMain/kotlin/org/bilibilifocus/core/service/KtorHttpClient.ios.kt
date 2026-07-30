@@ -57,4 +57,8 @@ class KtorHttpClient : HttpClient {
             body = response.bodyAsText(),
         )
     }
+
+    override fun close() {
+        client.close()
+    }
 }

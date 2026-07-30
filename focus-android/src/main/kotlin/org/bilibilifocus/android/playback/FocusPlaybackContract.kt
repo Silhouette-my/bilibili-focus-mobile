@@ -11,10 +11,11 @@ data class FocusPlaybackRequest(
     val author: String,
     val artworkUrl: String?,
     val durationSeconds: Long,
+    val accountScope: String?,
     val startPositionMillis: Long = 0,
     val autoPlay: Boolean = true,
 ) {
-    val mediaId: String = "$bvid:$cid"
+    val mediaId: String = "$bvid:$cid:${accountScope.orEmpty()}"
 
     fun toBundle(): Bundle = Bundle().apply {
         putString(FocusPlaybackContract.KEY_BVID, bvid)
@@ -24,6 +25,7 @@ data class FocusPlaybackRequest(
         putString(FocusPlaybackContract.KEY_AUTHOR, author)
         putString(FocusPlaybackContract.KEY_ARTWORK_URL, artworkUrl)
         putLong(FocusPlaybackContract.KEY_DURATION_SECONDS, durationSeconds)
+        putString(FocusPlaybackContract.KEY_ACCOUNT_SCOPE, accountScope)
         putLong(FocusPlaybackContract.KEY_START_POSITION_MILLIS, startPositionMillis)
         putBoolean(FocusPlaybackContract.KEY_AUTO_PLAY, autoPlay)
     }
@@ -42,6 +44,8 @@ data class FocusPlaybackRequest(
                 author = bundle.getString(FocusPlaybackContract.KEY_AUTHOR).orEmpty(),
                 artworkUrl = bundle.getString(FocusPlaybackContract.KEY_ARTWORK_URL),
                 durationSeconds = bundle.getLong(FocusPlaybackContract.KEY_DURATION_SECONDS),
+                accountScope = bundle.getString(FocusPlaybackContract.KEY_ACCOUNT_SCOPE)
+                    ?.takeIf(String::isNotBlank),
                 startPositionMillis = bundle.getLong(FocusPlaybackContract.KEY_START_POSITION_MILLIS),
                 autoPlay = bundle.getBoolean(FocusPlaybackContract.KEY_AUTO_PLAY, true),
             )
@@ -65,6 +69,7 @@ object FocusPlaybackContract {
     internal const val KEY_AUTHOR = "author"
     internal const val KEY_ARTWORK_URL = "artwork_url"
     internal const val KEY_DURATION_SECONDS = "duration_seconds"
+    internal const val KEY_ACCOUNT_SCOPE = "account_scope"
     internal const val KEY_START_POSITION_MILLIS = "start_position_millis"
     internal const val KEY_AUTO_PLAY = "auto_play"
 }

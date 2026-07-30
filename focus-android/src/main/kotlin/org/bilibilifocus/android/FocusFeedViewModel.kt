@@ -1,6 +1,8 @@
 package org.bilibilifocus.android
 
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -11,21 +13,54 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import org.bilibilifocus.core.model.DynamicCard
 import org.bilibilifocus.core.model.FocusDynamicFilterKind
+import org.bilibilifocus.core.paging.CursorPage
+import org.bilibilifocus.core.paging.CursorPager
 import org.bilibilifocus.core.service.DynamicFeedService
 
-class FocusFeedViewModel(
-    private val service: DynamicFeedService,
+internal fun interface FeedPageFetcher {
+    suspend fun fetchPage(
+        offset: String?,
+        forceRefresh: Boolean,
+    ): DynamicFeedService.FeedPage
+}
+
+class FocusFeedViewModel internal constructor(
+    private val pageFetcher: FeedPageFetcher,
     initialSelectedFilter: FocusDynamicFilterKind = FocusDynamicFilterKind.ALL,
+    dispatcher: CoroutineDispatcher,
 ) {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main + kotlinx.coroutines.CoroutineExceptionHandler { _, e ->
-        _state.value = FeedUiState.Failed(e.message ?: "加载失败")
-    })
-    private var loadJob: Job? = null
-    private var loadMoreJob: Job? = null
-    private var nextOffset: String? = null
+    constructor(
+        service: DynamicFeedService,
+        initialSelectedFilter: FocusDynamicFilterKind = FocusDynamicFilterKind.ALL,
+    ) : this(
+        pageFetcher = FeedPageFetcher { offset, forceRefresh ->
+            if (forceRefresh) {
+                service.refreshFollowingFeedPage(offset)
+            } else {
+                service.fetchFollowingFeedPage(offset)
+            }
+        },
+        initialSelectedFilter = initialSelectedFilter,
+        dispatcher = Dispatchers.Main,
+    )
 
     private val _state = MutableStateFlow<FeedUiState>(FeedUiState.Idle)
     val state: StateFlow<FeedUiState> = _state.asStateFlow()
+
+    private val scope = CoroutineScope(
+        SupervisorJob() +
+            dispatcher +
+            CoroutineExceptionHandler { _, error ->
+                _state.value = FeedUiState.Failed(error.message ?: "加载失败")
+            },
+    )
+    private var loadJob: Job? = null
+    private var loadMoreJob: Job? = null
+    private val pager = CursorPager<DynamicCard, String, String>(
+        firstCursor = null,
+        keyOf = DynamicCard::id,
+        loadPage = { offset -> loadCursorPage(offset, forceRefresh = false) },
+    )
 
     private val _isLoadingMore = MutableStateFlow(false)
     val isLoadingMore: StateFlow<Boolean> = _isLoadingMore.asStateFlow()
@@ -39,52 +74,42 @@ class FocusFeedViewModel(
 
     fun loadIfNeeded() {
         if (_state.value !is FeedUiState.Idle) return
-        reload()
+        startRefresh(showLoading = true, forceRefresh = false)
     }
 
     fun reload() {
-        loadJob?.cancel()
-        loadJob = scope.launch {
-            _state.value = FeedUiState.Loading
-            try {
-                val page = service.fetchFollowingFeedPage()
-                nextOffset = page.nextOffset
-                _state.value = if (page.cards.isEmpty()) {
-                    FeedUiState.Empty
-                } else {
-                    FeedUiState.Loaded(page.cards)
-                }
-            } catch (e: DynamicFeedService.ServiceError) {
-                if (e == DynamicFeedService.ServiceError.LoginRequired) {
-                    _state.value = FeedUiState.LoginRequired
-                } else {
-                    _state.value = FeedUiState.Failed(e.message ?: "加载失败")
-                }
-            } catch (e: Exception) {
-                _state.value = FeedUiState.Failed(e.message ?: "加载失败")
-            }
-        }
+        startRefresh(showLoading = true, forceRefresh = true)
     }
 
     fun refresh(onComplete: () -> Unit = {}) {
+        startRefresh(
+            showLoading = false,
+            forceRefresh = true,
+            onComplete = onComplete,
+        )
+    }
+
+    private fun startRefresh(
+        showLoading: Boolean,
+        forceRefresh: Boolean,
+        onComplete: () -> Unit = {},
+    ) {
         loadJob?.cancel()
+        loadMoreJob?.cancel()
+        _isLoadingMore.value = false
         loadJob = scope.launch {
+            if (showLoading) {
+                _state.value = FeedUiState.Loading
+            }
             try {
-                val page = service.fetchFollowingFeedPage()
-                nextOffset = page.nextOffset
-                _state.value = if (page.cards.isEmpty()) {
-                    FeedUiState.Empty
+                if (forceRefresh) {
+                    pager.refresh { offset ->
+                        loadCursorPage(offset, forceRefresh = true)
+                    }
                 } else {
-                    FeedUiState.Loaded(page.cards)
+                    pager.refresh()
                 }
-            } catch (e: DynamicFeedService.ServiceError) {
-                if (e == DynamicFeedService.ServiceError.LoginRequired) {
-                    _state.value = FeedUiState.LoginRequired
-                } else {
-                    _state.value = FeedUiState.Failed(e.message ?: "加载失败")
-                }
-            } catch (e: Exception) {
-                _state.value = FeedUiState.Failed(e.message ?: "加载失败")
+                applyRefreshState()
             } finally {
                 onComplete()
             }
@@ -95,21 +120,20 @@ class FocusFeedViewModel(
         val currentCards = (_state.value as? FeedUiState.Loaded)?.cards ?: return
         if (!shouldLoadMore(currentCardID, currentCards)) return
         if (_isLoadingMore.value) return
-        val offset = nextOffset ?: return
-        if (offset.isEmpty()) return
+        if (pager.state.value.endReached) return
 
         _isLoadingMore.value = true
-        loadMoreJob?.cancel()
         loadMoreJob = scope.launch {
             try {
-                val page = service.fetchFollowingFeedPage(offset)
-                val merged = currentCards + page.cards.filter { new ->
-                    currentCards.none { it.id == new.id }
+                pager.append()
+                val pagedState = pager.state.value
+                if (!pagedState.isRefreshing) {
+                    _state.value = if (pagedState.items.isEmpty()) {
+                        FeedUiState.Empty
+                    } else {
+                        FeedUiState.Loaded(pagedState.items)
+                    }
                 }
-                nextOffset = page.nextOffset
-                _state.value = FeedUiState.Loaded(merged)
-            } catch (_: DynamicFeedService.ServiceError) {
-            } catch (_: Exception) {
             } finally {
                 _isLoadingMore.value = false
             }
@@ -118,6 +142,34 @@ class FocusFeedViewModel(
 
     fun onCleared() {
         scope.cancel()
+    }
+
+    private suspend fun loadCursorPage(
+        offset: String?,
+        forceRefresh: Boolean,
+    ): CursorPage<DynamicCard, String> {
+        val page = pageFetcher.fetchPage(offset, forceRefresh)
+        return CursorPage(page.cards, page.nextOffset)
+    }
+
+    private fun applyRefreshState() {
+        val pagedState = pager.state.value
+        val refreshError = pagedState.refreshError
+        if (refreshError != null) {
+            _state.value = if (
+                pagedState.refreshCause == DynamicFeedService.ServiceError.LoginRequired
+            ) {
+                FeedUiState.LoginRequired
+            } else {
+                FeedUiState.Failed(refreshError)
+            }
+            return
+        }
+        _state.value = if (pagedState.items.isEmpty()) {
+            FeedUiState.Empty
+        } else {
+            FeedUiState.Loaded(pagedState.items)
+        }
     }
 
     private fun shouldLoadMore(currentCardID: String, cards: List<DynamicCard>): Boolean {

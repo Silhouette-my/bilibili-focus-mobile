@@ -1,0 +1,43 @@
+{
+  "code": 0,
+  "message": "0",
+  "data": {
+    "page": {
+      "num": 1,
+      "size": 2,
+      "count": 3
+    },
+    "replies": [
+      {
+        "rpid": 90001,
+        "mid": 1001,
+        "like": 12,
+        "action": 1,
+        "rcount": 0,
+        "ctime": 1710000001,
+        "member": {
+          "uname": "第一位回复者",
+          "avatar": "//i0.hdslb.com/bfs/face/reply-1.jpg"
+        },
+        "content": {
+          "message": "第一条楼中楼回复"
+        }
+      },
+      {
+        "rpid": 90002,
+        "mid": 1002,
+        "like": 3,
+        "action": 0,
+        "rcount": 0,
+        "ctime": 1710000002,
+        "member": {
+          "uname": "第二位回复者",
+          "avatar": "//i0.hdslb.com/bfs/face/reply-2.jpg"
+        },
+        "content": {
+          "message": "第二条楼中楼回复"
+        }
+      }
+    ]
+  }
+}

@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 
 public struct SearchQuery: Equatable, Sendable {
@@ -239,17 +238,31 @@ public struct SearchResultService: Sendable {
     private let cookieProvider: any CookieSnapshotProvider
     private let requestLoader: RequestLoader
     private let userAgent: String
+    private let wbiSigner: WBISigner
 
     public init(
         cookieProvider: any CookieSnapshotProvider,
         userAgent: String = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
         requestLoader: @escaping RequestLoader = { request in
-            try await URLSession.shared.data(for: request)
+            try await BiliAPINetwork.data(for: request)
         }
     ) {
         self.cookieProvider = cookieProvider
         self.requestLoader = requestLoader
         self.userAgent = userAgent
+        wbiSigner = .shared
+    }
+
+    init(
+        cookieProvider: any CookieSnapshotProvider,
+        userAgent: String = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
+        wbiSigner: WBISigner,
+        requestLoader: @escaping RequestLoader
+    ) {
+        self.cookieProvider = cookieProvider
+        self.requestLoader = requestLoader
+        self.userAgent = userAgent
+        self.wbiSigner = wbiSigner
     }
 
     public func fetchPage(
@@ -259,36 +272,42 @@ public struct SearchResultService: Sendable {
         videoSort: SearchVideoSortOption = .default
     ) async throws -> SearchResultPage {
         let cookies = await cookieProvider.loadCookies()
-        let mixinKey = try await SearchWBIKeyCache.shared.mixinKey(
-            requestLoader: requestLoader,
+        let navigationRequest = Self.makeNavigationRequest(
             cookies: cookies,
             userAgent: userAgent
         )
+        let response: WBISigner.HTTPResponse
+        do {
+            response = try await wbiSigner.execute(
+                parameters: Self.searchParameters(
+                    query: query,
+                    filter: filter,
+                    page: page,
+                    videoSort: videoSort
+                ),
+                navigationRequest: navigationRequest,
+                requestLoader: requestLoader
+            ) { signedQuery in
+                try Self.makeSearchRequest(
+                    query: query,
+                    filter: filter,
+                    signedQuery: signedQuery,
+                    cookies: cookies,
+                    userAgent: userAgent
+                )
+            }
+        } catch is WBISigner.SigningError {
+            throw ServiceError.signingUnavailable
+        }
 
-        let url = try Self.makeSignedSearchURL(
-            query: query,
-            filter: filter,
-            page: page,
-            mixinKey: mixinKey,
-            videoSort: videoSort
-        )
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
-        request.setValue(query.resultURL.absoluteString, forHTTPHeaderField: "Referer")
-        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
-        request = Self.attach(cookies: cookies, to: request)
-
-        let (data, response) = try await requestLoader(request)
         guard
-            let httpResponse = response as? HTTPURLResponse,
-            (200 ..< 300).contains(httpResponse.statusCode)
+            (200 ..< 300).contains(response.response.statusCode)
         else {
             throw ServiceError.invalidResponse
         }
 
         return try Self.decodePage(
-            from: data,
+            from: response.data,
             query: query,
             filter: filter,
             requestedPage: page
@@ -330,16 +349,7 @@ public struct SearchResultService: Sendable {
     }
 
     public static func attach(cookies: [HTTPCookie], to request: URLRequest) -> URLRequest {
-        guard !cookies.isEmpty else {
-            return request
-        }
-
-        var updatedRequest = request
-        let headerFields = HTTPCookie.requestHeaderFields(with: cookies)
-        for (name, value) in headerFields {
-            updatedRequest.setValue(value, forHTTPHeaderField: name)
-        }
-        return updatedRequest
+        CookieRequestPolicy.attach(cookies: cookies, to: request)
     }
 
     private static func makeOverviewSections(from dataPayload: [String: Any]) -> [SearchResultSection] {
@@ -657,141 +667,71 @@ public struct SearchResultService: Sendable {
         )
     }
 
-    private static func makeSignedSearchURL(
+    private static func searchParameters(
         query: SearchQuery,
         filter: SearchResultFilter,
         page: Int,
-        mixinKey: String,
         videoSort: SearchVideoSortOption
-    ) throws -> URL {
-        var components = URLComponents()
-        components.scheme = "https"
-        components.host = "api.bilibili.com"
-        components.path = filter == .all
-            ? "/x/web-interface/wbi/search/all/v2"
-            : "/x/web-interface/wbi/search/type"
-
-        var parameters: [(String, String)] = [
-            ("keyword", query.keyword),
+    ) -> [String: String] {
+        var parameters = [
+            "keyword": query.keyword,
+            "page": String(max(page, 1)),
         ]
         if let searchType = filter.apiSearchType {
-            parameters.append(("search_type", searchType))
-            parameters.append(("page", String(max(page, 1))))
+            parameters["search_type"] = searchType
         }
 
         if filter == .video, let orderValue = videoSort.apiOrderValue {
-            parameters.append(("order", orderValue))
+            parameters["order"] = orderValue
         }
+        return parameters
+    }
 
-        let wts = String(Int(Date().timeIntervalSince1970))
-        parameters.append(("wts", wts))
-
-        let filteredParameters = parameters
-            .map { (key, value) in
-                (key, sanitizeWBIValue(value))
-            }
-            .sorted { $0.0 < $1.0 }
-
-        components.queryItems = filteredParameters.map { key, value in
-            URLQueryItem(name: key, value: value)
-        }
-
-        guard let encodedQuery = components.percentEncodedQuery else {
+    private static func makeSearchRequest(
+        query: SearchQuery,
+        filter: SearchResultFilter,
+        signedQuery: String,
+        cookies: [HTTPCookie],
+        userAgent: String
+    ) throws -> URLRequest {
+        let endpoint = BiliAPIContractCatalog.require(
+            filter == .all
+                ? "search.search.web_search"
+                : "search.search.web_search_by_type"
+        ).url
+        guard var components = URLComponents(
+            url: endpoint,
+            resolvingAgainstBaseURL: false
+        ) else {
             throw ServiceError.signingUnavailable
         }
-
-        let signature = md5Hex(encodedQuery + mixinKey)
-        components.queryItems?.append(URLQueryItem(name: "w_rid", value: signature))
-
+        components.percentEncodedQuery = signedQuery
         guard let url = components.url else {
             throw ServiceError.signingUnavailable
         }
-        return url
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
+        request.setValue(query.resultURL.absoluteString, forHTTPHeaderField: "Referer")
+        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        return attach(cookies: cookies, to: request)
     }
 
-    private static func sanitizeWBIValue(_ value: String) -> String {
-        value.filter { character in
-            !"!'()*".contains(character)
-        }
-    }
-
-    private static func md5Hex(_ string: String) -> String {
-        let digest = Insecure.MD5.hash(data: Data(string.utf8))
-        return digest.map { String(format: "%02x", $0) }.joined()
-    }
-
-    static func mixinKey(imgKey: String, subKey: String) -> String {
-        let combined = Array(imgKey + subKey)
-        let mixed = searchWBIShuffleTable.compactMap { index in
-            index < combined.count ? combined[index] : nil
-        }
-        return String(mixed.prefix(32))
-    }
-}
-
-private actor SearchWBIKeyCache {
-    static let shared = SearchWBIKeyCache()
-
-    private struct Entry: Sendable {
-        let mixinKey: String
-        let expiresAt: Date
-    }
-
-    private var entry: Entry?
-
-    func mixinKey(
-        requestLoader: SearchResultService.RequestLoader,
+    private static func makeNavigationRequest(
         cookies: [HTTPCookie],
         userAgent: String
-    ) async throws -> String {
-        if let entry, entry.expiresAt > Date() {
-            return entry.mixinKey
-        }
-
-        var request = URLRequest(url: URL(string: "https://api.bilibili.com/x/web-interface/nav")!)
+    ) -> URLRequest {
+        var request = URLRequest(
+            url: BiliAPIContractCatalog.require("credential.info.valid").url
+        )
         request.httpMethod = "GET"
         request.setValue("https://www.bilibili.com/", forHTTPHeaderField: "Referer")
         request.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
         request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
-        request = SearchResultService.attach(cookies: cookies, to: request)
-
-        let (data, response) = try await requestLoader(request)
-        guard
-            let httpResponse = response as? HTTPURLResponse,
-            (200 ..< 300).contains(httpResponse.statusCode),
-            let payload = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-            SearchResultService.intValue(in: payload, path: ["code"]) == 0,
-            let imgURL = SearchResultService.stringValue(in: payload, path: ["data", "wbi_img", "img_url"]),
-            let subURL = SearchResultService.stringValue(in: payload, path: ["data", "wbi_img", "sub_url"])
-        else {
-            throw SearchResultService.ServiceError.signingUnavailable
-        }
-
-        let imgKey = URL(string: imgURL)?.deletingPathExtension().lastPathComponent ?? ""
-        let subKey = URL(string: subURL)?.deletingPathExtension().lastPathComponent ?? ""
-        guard !imgKey.isEmpty, !subKey.isEmpty else {
-            throw SearchResultService.ServiceError.signingUnavailable
-        }
-
-        let mixinKey = SearchResultService.mixinKey(imgKey: imgKey, subKey: subKey)
-        entry = Entry(
-            mixinKey: mixinKey,
-            expiresAt: Date().addingTimeInterval(30 * 60)
-        )
-        return mixinKey
+        return attach(cookies: cookies, to: request)
     }
 }
-
-private let searchWBIShuffleTable: [Int] = [
-    46, 47, 18, 2, 53, 8, 23, 32,
-    15, 50, 10, 31, 58, 3, 45, 35,
-    27, 43, 5, 49, 33, 9, 42, 19,
-    29, 28, 14, 39, 12, 38, 41, 13,
-    37, 48, 7, 16, 24, 55, 40, 61,
-    26, 17, 0, 1, 60, 51, 30, 4,
-    22, 25, 54, 21, 56, 59, 6, 63,
-    57, 62, 11, 36, 20, 34, 44, 52,
-]
 
 private extension SearchResultService {
     static func dictionaryValue(in dictionary: [String: Any], path: [String]) -> [String: Any]? {

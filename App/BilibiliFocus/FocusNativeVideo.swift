@@ -7,12 +7,43 @@ import MediaPlayer
 import SwiftUI
 import UIKit
 
+/// Serializes local playback-progress writes across video routes. Registering a
+/// write is synchronous on the main actor, so a route opened immediately after
+/// another route is suspended can wait for every write that was already queued.
+/// Remote history delivery deliberately stays outside this coordinator.
+@MainActor
+final class FocusPlaybackProgressWriteCoordinator {
+    typealias Write = @Sendable () async -> Void
+
+    private var tail: Task<Void, Never>?
+
+    @discardableResult
+    func enqueue(_ write: @escaping Write) -> Task<Void, Never> {
+        let predecessor = tail
+        let task = Task { @MainActor in
+            await predecessor?.value
+            await write()
+        }
+        tail = task
+        return task
+    }
+
+    func waitForPendingWrites() async {
+        let pendingWrites = tail
+        await pendingWrites?.value
+    }
+}
+
 @MainActor
 final class FocusNativeVideoViewModel: ObservableObject {
     typealias LandscapeRequest = @MainActor () -> Void
     typealias PortraitFullscreenRequest = @MainActor () -> Void
     typealias PortraitTransition = @MainActor () async -> Void
     typealias DanmakuPreferenceChange = @MainActor (Bool) -> Void
+    typealias SubtitlePreferenceChange = @MainActor (Bool, String) -> Void
+    typealias PlaybackReadyWaiter = @MainActor (AVPlayerItem) async throws -> Void
+    typealias InitialPlaybackSeeker = @MainActor (AVQueuePlayer, Int64) async throws -> Void
+    typealias AccountScopeProvider = @Sendable () async -> FocusPlaybackAccountScope
 
     enum State: Equatable {
         case idle
@@ -35,8 +66,34 @@ final class FocusNativeVideoViewModel: ObservableObject {
         case failed(String)
     }
 
+    enum SubtitleLoadState: Equatable {
+        case idle
+        case loadingTracks
+        case loadingDocument
+        case ready
+        case unavailable
+        case failed(String)
+    }
+
+    struct CommentThreadState: Equatable {
+        var replies: [FocusVideoComment]
+        var totalCount: Int64
+        var nextCursor: FocusVideoCommentRepliesCursor?
+        var isExpanded: Bool
+        var isLoading: Bool
+        var hasLoadedFirstPage: Bool
+        var errorMessage: String?
+    }
+
+    struct CommentLikeState: Equatable {
+        let likes: Int64
+        let isLiked: Bool
+    }
+
     @Published private(set) var state: State = .idle
     @Published private(set) var comments: [FocusVideoComment] = []
+    @Published private(set) var commentTotalCount: Int64 = 0
+    @Published private(set) var isLoadingMoreComments = false
     @Published private(set) var interactionState = FocusVideoInteractionState()
     @Published private(set) var isLoadingInteractions = false
     @Published private(set) var actionsInFlight: Set<Action> = []
@@ -50,6 +107,14 @@ final class FocusNativeVideoViewModel: ObservableObject {
     @Published private(set) var danmakus: [FocusVideoDanmaku] = []
     @Published private(set) var danmakuLoadState: DanmakuLoadState = .idle
     @Published private(set) var isDanmakuEnabled: Bool
+    @Published private(set) var subtitleTracks: [FocusVideoSubtitleTrack] = []
+    @Published private(set) var selectedSubtitleTrackID: Int64?
+    @Published private(set) var subtitleCues: [FocusVideoSubtitleCue] = []
+    @Published private(set) var subtitleLoadState: SubtitleLoadState = .idle
+    @Published private(set) var isSubtitleEnabled: Bool
+    @Published private(set) var commentThreadStates: [Int64: CommentThreadState] = [:]
+    @Published private(set) var commentLikeOverrides: [Int64: CommentLikeState] = [:]
+    @Published private(set) var commentLikeActionsInFlight: Set<Int64> = []
     @Published var isFullscreen = false
     @Published var actionErrorMessage: String?
 
@@ -57,15 +122,35 @@ final class FocusNativeVideoViewModel: ObservableObject {
 
     private let detailService: FocusVideoDetailService
     private let actionService: FocusVideoActionService
+    private let subtitleService: FocusVideoSubtitleService?
+    private let commentService: FocusVideoCommentService?
+    private let playbackProgressStore: FocusPlaybackProgressStore
+    private let playbackProgressWriteCoordinator: FocusPlaybackProgressWriteCoordinator
+    private let accountScopeProvider: AccountScopeProvider
+    private var activePlaybackAccountScope: FocusPlaybackAccountScope?
+    private var commentAccountScope: FocusPlaybackAccountScope?
     private var sourceURL: URL?
     private var requestedPageNumber: Int?
     private var requestedPageCID: Int64?
+    private var shouldResolveInitialResumePage = false
     private var loadTask: Task<Void, Never>?
     private var commentsTask: Task<Void, Never>?
+    private var commentsNextCursor: FocusVideoCommentCursor?
+    private var commentReplyTasks: [Int64: Task<Void, Never>] = [:]
+    private var commentLikeTasks: [Int64: Task<Void, Never>] = [:]
     private var interactionTask: Task<Void, Never>?
     private var playbackTask: Task<Void, Never>?
     private var actionTasks: [Action: Task<Void, Never>] = [:]
+    private var loadGeneration: UInt64 = 0
+    private var commentsGeneration: UInt64 = 0
+    private var commentThreadsGeneration: UInt64 = 0
+    private var commentLikeGenerations: [Int64: UInt64] = [:]
+    private var interactionGeneration: UInt64 = 0
+    private var playbackGeneration: UInt64 = 0
+    private var actionGenerations: [Action: UInt64] = [:]
     private var watchHistoryReportTask: Task<Void, Never>?
+    private var watchHistoryRetryTask: Task<Void, Never>?
+    private var watchHistoryRetryGeneration: UInt64 = 0
     private var lastQueuedWatchHistoryReport: WatchHistoryReport?
     private var orientationDebounceTask: Task<Void, Never>?
     private var portraitExitTask: Task<Void, Never>?
@@ -79,6 +164,13 @@ final class FocusNativeVideoViewModel: ObservableObject {
     private var danmakuView: FocusVideoDanmakuView?
     private var danmakuContext: DanmakuContext?
     private var danmakuRevision = 0
+    private var subtitleTracksTask: Task<Void, Never>?
+    private var subtitleDocumentTask: Task<Void, Never>?
+    private var subtitleGeneration: UInt64 = 0
+    private var subtitleDocumentGeneration: UInt64 = 0
+    private var subtitleContext: SubtitleContext?
+    private var subtitleCueCache: [Int64: [FocusVideoSubtitleCue]] = [:]
+    private var preferredSubtitleLanguageCode: String
     private var shouldResumeAfterActivation = false
     private var shouldResumeAfterAudioInterruption = false
     private var isReplacingPlayerItem = false
@@ -97,6 +189,9 @@ final class FocusNativeVideoViewModel: ObservableObject {
     private let portraitFullscreenRequest: PortraitFullscreenRequest
     private let portraitTransition: PortraitTransition
     private let danmakuPreferenceChange: DanmakuPreferenceChange
+    private let subtitlePreferenceChange: SubtitlePreferenceChange
+    private let playbackReadyWaiter: PlaybackReadyWaiter
+    private let initialPlaybackSeeker: InitialPlaybackSeeker
     private(set) var isCompletingPortraitExit = false
 
     var navigationTitle: String {
@@ -134,19 +229,58 @@ final class FocusNativeVideoViewModel: ObservableObject {
         loadTask != nil || commentsTask != nil || interactionTask != nil || playbackTask != nil
     }
 
+    var hasActivePlaybackPreparationTask: Bool {
+        playbackTask != nil
+    }
+
+    var hasActiveWatchHistoryRetryTask: Bool {
+        watchHistoryRetryTask != nil
+    }
+
+    var hasBoundPlaybackAccountScope: Bool {
+        activePlaybackAccountScope != nil
+    }
+
+    var hasMoreComments: Bool {
+        commentsNextCursor != nil
+    }
+
+    var displayedCommentCount: Int64 {
+        commentTotalCount > 0 ? commentTotalCount : Int64(comments.count)
+    }
+
     init(
         detailService: FocusVideoDetailService,
         actionService: FocusVideoActionService,
+        subtitleService: FocusVideoSubtitleService? = nil,
+        commentService: FocusVideoCommentService? = nil,
+        playbackProgressStore: FocusPlaybackProgressStore = .shared,
+        playbackProgressWriteCoordinator: FocusPlaybackProgressWriteCoordinator? = nil,
+        accountScopeProvider: @escaping AccountScopeProvider = { .anonymous },
         nativeDanmakuEnabled: Bool = true,
         danmakuPreferenceChange: DanmakuPreferenceChange? = nil,
+        nativeSubtitleEnabled: Bool = true,
+        preferredSubtitleLanguageCode: String = "",
+        subtitlePreferenceChange: SubtitlePreferenceChange? = nil,
         landscapeRequest: LandscapeRequest? = nil,
         portraitFullscreenRequest: PortraitFullscreenRequest? = nil,
-        portraitTransition: PortraitTransition? = nil
+        portraitTransition: PortraitTransition? = nil,
+        playbackReadyWaiter: PlaybackReadyWaiter? = nil,
+        initialPlaybackSeeker: InitialPlaybackSeeker? = nil
     ) {
         self.detailService = detailService
         self.actionService = actionService
+        self.subtitleService = subtitleService
+        self.commentService = commentService
+        self.playbackProgressStore = playbackProgressStore
+        self.playbackProgressWriteCoordinator =
+            playbackProgressWriteCoordinator ?? FocusPlaybackProgressWriteCoordinator()
+        self.accountScopeProvider = accountScopeProvider
         self.isDanmakuEnabled = nativeDanmakuEnabled
+        self.isSubtitleEnabled = nativeSubtitleEnabled
+        self.preferredSubtitleLanguageCode = preferredSubtitleLanguageCode
         self.danmakuPreferenceChange = danmakuPreferenceChange ?? { _ in }
+        self.subtitlePreferenceChange = subtitlePreferenceChange ?? { _, _ in }
         self.landscapeRequest = landscapeRequest ?? {
             FocusNativeVideoOrientation.update(to: .landscape)
         }
@@ -155,6 +289,12 @@ final class FocusNativeVideoViewModel: ObservableObject {
         }
         self.portraitTransition = portraitTransition ?? {
             await FocusNativeVideoOrientation.rotateToPortraitAndWait()
+        }
+        self.playbackReadyWaiter = playbackReadyWaiter ?? { item in
+            try await Self.waitUntilReadyToPlay(item)
+        }
+        self.initialPlaybackSeeker = initialPlaybackSeeker ?? { player, milliseconds in
+            try await Self.seek(player, toMilliseconds: milliseconds)
         }
         let player = AVQueuePlayer()
         player.actionAtItemEnd = .advance
@@ -211,14 +351,18 @@ final class FocusNativeVideoViewModel: ObservableObject {
                 }
             }
         }
+        retryPendingWatchHistoryReports()
     }
 
     deinit {
         loadTask?.cancel()
         commentsTask?.cancel()
+        commentReplyTasks.values.forEach { $0.cancel() }
+        commentLikeTasks.values.forEach { $0.cancel() }
         interactionTask?.cancel()
         playbackTask?.cancel()
         actionTasks.values.forEach { $0.cancel() }
+        watchHistoryRetryTask?.cancel()
         orientationDebounceTask?.cancel()
         portraitExitTask?.cancel()
         nowPlayingArtworkTask?.cancel()
@@ -230,6 +374,8 @@ final class FocusNativeVideoViewModel: ObservableObject {
         }
         danmakuViewTask?.cancel()
         danmakuSegmentTasks.values.forEach { $0.cancel() }
+        subtitleTracksTask?.cancel()
+        subtitleDocumentTask?.cancel()
         if let audioInterruptionObserver {
             NotificationCenter.default.removeObserver(audioInterruptionObserver)
         }
@@ -250,6 +396,7 @@ final class FocusNativeVideoViewModel: ObservableObject {
 
     func activate(url: URL) {
         open(url)
+        retryPendingWatchHistoryReports()
         activatePlaybackSession()
         loadIfNeeded()
 
@@ -258,11 +405,18 @@ final class FocusNativeVideoViewModel: ObservableObject {
                 for: detail,
                 playbackPositionMilliseconds: currentPlaybackMilliseconds
             )
+            configureSubtitles(for: detail)
+            if (comments.isEmpty || commentAccountScope == nil),
+               commentsTask == nil
+            {
+                loadComments(for: detail)
+            }
+            resumeExpandedCommentReplyLoads()
         }
 
         if hasPreparedPlayer, shouldResumeAfterActivation {
             player.playImmediately(atRate: playbackRate)
-        } else if detail != nil, player.currentItem == nil, playbackTask == nil {
+        } else if detail != nil, !hasPreparedPlayer, playbackTask == nil {
             preparePlayback()
         }
         shouldResumeAfterActivation = false
@@ -275,17 +429,24 @@ final class FocusNativeVideoViewModel: ObservableObject {
         }
 
         queueWatchHistoryReport(force: true)
+        activePlaybackAccountScope = nil
         cancelTasks()
         sourceURL = canonicalURL
         requestedPageNumber = FocusVideoDetailService.requestedPageNumber(from: canonicalURL)
         requestedPageCID = FocusVideoDetailService.requestedPageCID(from: canonicalURL)
+        shouldResolveInitialResumePage = requestedPageNumber == nil && requestedPageCID == nil
         state = .idle
         comments = []
+        commentTotalCount = 0
+        commentsNextCursor = nil
+        isLoadingMoreComments = false
+        resetCommentInteractionSession()
         interactionState = FocusVideoInteractionState()
         isLoadingInteractions = false
         actionsInFlight = []
         selectedPageCID = nil
         resetDanmakuSession()
+        resetSubtitleSession()
         playerErrorMessage = nil
         hasPreparedPlayer = false
         isLoadingPlayback = false
@@ -308,27 +469,42 @@ final class FocusNativeVideoViewModel: ObservableObject {
         }
 
         queueWatchHistoryReport(force: true)
+        activePlaybackAccountScope = nil
         cancelTasks()
         state = .loading
         comments = []
+        commentTotalCount = 0
+        commentsNextCursor = nil
+        isLoadingMoreComments = false
+        resetCommentInteractionSession()
         interactionState = FocusVideoInteractionState()
         isLoadingInteractions = false
         selectedPageCID = nil
         resetDanmakuSession()
+        resetSubtitleSession()
         playerErrorMessage = nil
         hasPreparedPlayer = false
         isLoadingPlayback = false
+        shouldResolveInitialResumePage = requestedPageNumber == nil && requestedPageCID == nil
         player.pause()
         player.removeAllItems()
 
+        let generation = loadGeneration
         loadTask = Task { [weak self, detailService] in
-            defer { self?.loadTask = nil }
             guard let self else {
                 return
+            }
+            defer {
+                if self.loadGeneration == generation {
+                    self.loadTask = nil
+                }
             }
             do {
                 let detail = try await detailService.fetchDetail(for: sourceURL)
                 try Task.checkCancellation()
+                guard loadGeneration == generation else {
+                    return
+                }
                 state = .loaded(detail)
                 let requestedPage = requestedPageNumber.flatMap { number in
                     detail.pages.first(where: { $0.pageNumber == number })
@@ -342,13 +518,14 @@ final class FocusNativeVideoViewModel: ObservableObject {
                     ?? detail.cid
                 configureNowPlayingMetadata(for: detail)
                 configureDanmaku(for: detail, playbackPositionMilliseconds: 0)
+                configureSubtitles(for: detail)
                 preparePlayback()
                 loadComments(for: detail)
                 loadInteractions(for: detail)
             } catch is CancellationError {
                 return
             } catch {
-                guard !Task.isCancelled else {
+                guard !Task.isCancelled, loadGeneration == generation else {
                     return
                 }
                 state = .failed(error.localizedDescription)
@@ -360,21 +537,24 @@ final class FocusNativeVideoViewModel: ObservableObject {
         queueWatchHistoryReport(force: true)
         shouldResumeAfterActivation = player.timeControlStatus == .playing
         shouldResumeAfterAudioInterruption = false
-        loadTask?.cancel()
-        loadTask = nil
-        commentsTask?.cancel()
-        commentsTask = nil
-        interactionTask?.cancel()
-        interactionTask = nil
-        playbackTask?.cancel()
-        playbackTask = nil
-        actionTasks.values.forEach { $0.cancel() }
-        actionTasks.removeAll()
+        let wasPreparingPlayback = playbackTask != nil || isLoadingPlayback
+        cancelLoadTask()
+        cancelCommentsTask()
+        cancelInteractionTask()
+        cancelPlaybackTask()
+        cancelActionTasks()
+        cancelCommentReplyTasks()
         cancelFullscreenTransitions()
         actionsInFlight = []
         cancelDanmakuRequests()
+        cancelSubtitleRequests()
         isLoadingInteractions = false
         isLoadingPlayback = false
+        isReplacingPlayerItem = false
+        if wasPreparingPlayback {
+            hasPreparedPlayer = false
+            player.removeAllItems()
+        }
         if isFullscreen {
             FocusNativeVideoOrientation.update(to: .portrait)
         }
@@ -397,6 +577,7 @@ final class FocusNativeVideoViewModel: ObservableObject {
     }
 
     func handleAppDidBecomeActive() {
+        retryPendingWatchHistoryReports()
         updateNowPlayingInfo()
     }
 
@@ -405,10 +586,13 @@ final class FocusNativeVideoViewModel: ObservableObject {
             return
         }
         queueWatchHistoryReport(force: true)
+        activePlaybackAccountScope = nil
+        shouldResolveInitialResumePage = false
         selectedPageCID = page.cid
         updateNowPlayingInfo()
         if let detail {
             configureDanmaku(for: detail, playbackPositionMilliseconds: 0)
+            configureSubtitles(for: detail)
         }
         preparePlayback()
     }
@@ -418,6 +602,9 @@ final class FocusNativeVideoViewModel: ObservableObject {
     }
 
     func togglePlayback() {
+        guard !isLoadingPlayback else {
+            return
+        }
         guard player.currentItem != nil else {
             preparePlayback()
             return
@@ -467,6 +654,309 @@ final class FocusNativeVideoViewModel: ObservableObject {
             loadDanmakuView(playbackPositionMilliseconds: currentPlaybackMilliseconds)
         } else {
             updateDanmakuPosition(currentPlaybackMilliseconds)
+        }
+    }
+
+    var selectedSubtitleTrack: FocusVideoSubtitleTrack? {
+        subtitleTracks.first(where: { $0.id == selectedSubtitleTrackID })
+    }
+
+    var subtitleControlTitle: String {
+        guard isSubtitleEnabled else {
+            return "关"
+        }
+        switch subtitleLoadState {
+        case .loadingTracks, .loadingDocument:
+            return "…"
+        case .unavailable:
+            return "无"
+        case .failed:
+            return "!"
+        case .idle, .ready:
+            return selectedSubtitleTrack?.displayName ?? "开"
+        }
+    }
+
+    func selectSubtitleTrack(_ track: FocusVideoSubtitleTrack) {
+        guard subtitleTracks.contains(where: { $0.id == track.id }) else {
+            return
+        }
+        let preferenceChanged = !isSubtitleEnabled
+            || preferredSubtitleLanguageCode != track.languageCode
+        isSubtitleEnabled = true
+        preferredSubtitleLanguageCode = track.languageCode
+        selectedSubtitleTrackID = track.id
+        if preferenceChanged {
+            subtitlePreferenceChange(true, track.languageCode)
+        }
+        loadSubtitleDocument(for: track)
+    }
+
+    func disableSubtitles() {
+        setSubtitlesEnabled(false, persist: true)
+    }
+
+    func enableSubtitles() {
+        setSubtitlesEnabled(true, persist: true)
+    }
+
+    func applySubtitlePreference(enabled: Bool, languageCode: String) {
+        preferredSubtitleLanguageCode = languageCode
+        setSubtitlesEnabled(enabled, persist: false)
+        guard enabled else {
+            return
+        }
+        if let preferredTrack = preferredSubtitleTrack(in: subtitleTracks) {
+            selectedSubtitleTrackID = preferredTrack.id
+            loadSubtitleDocument(for: preferredTrack)
+        }
+    }
+
+    func retrySubtitles() {
+        guard let detail else {
+            return
+        }
+        subtitleTracksTask?.cancel()
+        subtitleDocumentTask?.cancel()
+        subtitleTracksTask = nil
+        subtitleDocumentTask = nil
+        configureSubtitles(for: detail, forceReload: subtitleTracks.isEmpty)
+    }
+
+    func subtitleText(at playbackPositionMilliseconds: Int64) -> String {
+        guard isSubtitleEnabled, !subtitleCues.isEmpty else {
+            return ""
+        }
+        let position = max(playbackPositionMilliseconds, 0)
+        return subtitleCues.lazy
+            .filter {
+                $0.startMilliseconds <= position
+                    && position < $0.endMilliseconds
+            }
+            .map(\.content)
+            .joined(separator: "\n")
+    }
+
+    func loadMoreComments() {
+        guard
+            commentsTask == nil,
+            let detail,
+            let cursor = commentsNextCursor,
+            let accountScope = commentAccountScope
+        else {
+            return
+        }
+
+        let generation = commentsGeneration
+        isLoadingMoreComments = true
+        commentsTask = Task {
+            [weak self, detailService, accountScopeProvider] in
+            guard let self else {
+                return
+            }
+            defer {
+                if self.commentsGeneration == generation {
+                    self.commentsTask = nil
+                    self.isLoadingMoreComments = false
+                }
+            }
+            do {
+                let currentScope = await accountScopeProvider()
+                try Task.checkCancellation()
+                guard commentsGeneration == generation else {
+                    return
+                }
+                guard currentScope == accountScope else {
+                    invalidateCommentSessionForAccountChange(
+                        detail: detail,
+                        presentsError: true
+                    )
+                    return
+                }
+
+                let page = try await detailService.fetchCommentsPage(
+                    aid: detail.aid,
+                    cursor: cursor
+                )
+                try Task.checkCancellation()
+                guard commentsGeneration == generation else {
+                    return
+                }
+
+                let resultingScope = await accountScopeProvider()
+                try Task.checkCancellation()
+                guard commentsGeneration == generation else {
+                    return
+                }
+                guard resultingScope == accountScope else {
+                    invalidateCommentSessionForAccountChange(
+                        detail: detail,
+                        presentsError: true
+                    )
+                    return
+                }
+
+                var seen = Set(comments.map(\.id))
+                comments.append(
+                    contentsOf: page.comments.filter { seen.insert($0.id).inserted }
+                )
+                commentTotalCount = max(commentTotalCount, page.totalCount)
+                commentsNextCursor = page.nextCursor == cursor ? nil : page.nextCursor
+            } catch {
+                return
+            }
+        }
+    }
+
+    func replies(for comment: FocusVideoComment) -> [FocusVideoComment] {
+        guard let thread = commentThreadStates[comment.id], thread.isExpanded else {
+            return Array(comment.previewReplies.prefix(2))
+        }
+        return thread.replies
+    }
+
+    func commentThreadState(for commentID: Int64) -> CommentThreadState? {
+        commentThreadStates[commentID]
+    }
+
+    func toggleCommentReplies(_ comment: FocusVideoComment) {
+        var thread = commentThreadStates[comment.id] ?? initialCommentThreadState(for: comment)
+        if thread.isExpanded {
+            thread.isExpanded = false
+            commentThreadStates[comment.id] = thread
+            return
+        }
+
+        thread.isExpanded = true
+        thread.errorMessage = nil
+        commentThreadStates[comment.id] = thread
+        if !thread.hasLoadedFirstPage, !thread.isLoading {
+            loadCommentReplies(for: comment, cursor: nil)
+        }
+    }
+
+    func loadMoreCommentReplies(for comment: FocusVideoComment) {
+        guard
+            let thread = commentThreadStates[comment.id],
+            thread.isExpanded,
+            !thread.isLoading,
+            let cursor = thread.nextCursor
+        else {
+            return
+        }
+        loadCommentReplies(for: comment, cursor: cursor)
+    }
+
+    func retryCommentReplies(for comment: FocusVideoComment) {
+        guard commentThreadStates[comment.id]?.isLoading != true else {
+            return
+        }
+        let cursor = commentThreadStates[comment.id]?.hasLoadedFirstPage == true
+            ? commentThreadStates[comment.id]?.nextCursor
+            : nil
+        loadCommentReplies(for: comment, cursor: cursor)
+    }
+
+    func commentLikeState(for comment: FocusVideoComment) -> CommentLikeState {
+        commentLikeOverrides[comment.id]
+            ?? CommentLikeState(likes: comment.likes, isLiked: comment.isLiked)
+    }
+
+    func toggleCommentLike(_ comment: FocusVideoComment) {
+        guard
+            let detail,
+            let commentService,
+            let accountScope = commentAccountScope,
+            comment.id > 0,
+            !commentLikeActionsInFlight.contains(comment.id)
+        else {
+            return
+        }
+
+        let previous = commentLikeState(for: comment)
+        let shouldLike = !previous.isLiked
+        let optimistic = CommentLikeState(
+            likes: max(previous.likes + (shouldLike ? 1 : -1), 0),
+            isLiked: shouldLike
+        )
+        let generation = (commentLikeGenerations[comment.id] ?? 0) &+ 1
+        commentLikeGenerations[comment.id] = generation
+        commentLikeOverrides[comment.id] = optimistic
+        commentLikeActionsInFlight.insert(comment.id)
+        actionErrorMessage = nil
+
+        commentLikeTasks[comment.id]?.cancel()
+        commentLikeTasks[comment.id] = Task {
+            [weak self, accountScopeProvider] in
+            guard let self else {
+                return
+            }
+            defer {
+                if self.commentLikeGenerations[comment.id] == generation {
+                    self.commentLikeActionsInFlight.remove(comment.id)
+                    self.commentLikeTasks[comment.id] = nil
+                }
+            }
+            do {
+                let currentScope = await accountScopeProvider()
+                try Task.checkCancellation()
+                guard commentLikeGenerations[comment.id] == generation else {
+                    return
+                }
+                guard currentScope == accountScope else {
+                    invalidateCommentSessionForAccountChange(
+                        detail: detail,
+                        presentsError: true
+                    )
+                    return
+                }
+
+                try await commentService.setCommentLiked(
+                    aid: detail.aid,
+                    commentID: comment.id,
+                    liked: shouldLike,
+                    expectedAccountScope: accountScope
+                )
+                try Task.checkCancellation()
+                guard commentLikeGenerations[comment.id] == generation else {
+                    return
+                }
+
+                let resultingScope = await accountScopeProvider()
+                try Task.checkCancellation()
+                guard commentLikeGenerations[comment.id] == generation else {
+                    return
+                }
+                guard resultingScope == accountScope else {
+                    invalidateCommentSessionForAccountChange(
+                        detail: detail,
+                        presentsError: true
+                    )
+                    return
+                }
+            } catch is CancellationError {
+                return
+            } catch FocusVideoCommentService.ServiceError.accountScopeChanged {
+                guard
+                    !Task.isCancelled,
+                    commentLikeGenerations[comment.id] == generation
+                else {
+                    return
+                }
+                invalidateCommentSessionForAccountChange(
+                    detail: detail,
+                    presentsError: true
+                )
+            } catch {
+                guard
+                    !Task.isCancelled,
+                    commentLikeGenerations[comment.id] == generation
+                else {
+                    return
+                }
+                commentLikeOverrides[comment.id] = previous
+                actionErrorMessage = error.localizedDescription
+            }
         }
     }
 
@@ -559,7 +1049,7 @@ final class FocusNativeVideoViewModel: ObservableObject {
         let shouldLike = !interactionState.liked
         performAction(.like) { [weak self, actionService] in
             try await actionService.setLiked(aid: detail.aid, liked: shouldLike)
-            guard let self else {
+            guard let self, !Task.isCancelled else {
                 return
             }
             interactionState = FocusVideoInteractionState(
@@ -586,7 +1076,7 @@ final class FocusNativeVideoViewModel: ObservableObject {
         }
         performAction(.coin) { [weak self, actionService] in
             try await actionService.addCoin(aid: detail.aid)
-            guard let self else {
+            guard let self, !Task.isCancelled else {
                 return
             }
             interactionState = FocusVideoInteractionState(
@@ -616,7 +1106,7 @@ final class FocusNativeVideoViewModel: ObservableObject {
                 favorited: shouldFavorite,
                 folderID: currentFolderID
             )
-            guard let self else {
+            guard let self, !Task.isCancelled else {
                 return
             }
             interactionState = FocusVideoInteractionState(
@@ -641,25 +1131,137 @@ final class FocusNativeVideoViewModel: ObservableObject {
             ?? detail.pages.first(where: { $0.cid == detail.cid })?.cid
             ?? detail.pages.first?.cid
             ?? detail.cid
+        let mayResolveResumePage = shouldResolveInitialResumePage
 
-        playbackTask?.cancel()
+        cancelPlaybackTask()
+        activePlaybackAccountScope = nil
+        let generation = playbackGeneration
         isReplacingPlayerItem = true
         player.pause()
         player.removeAllItems()
+        playbackPositionMilliseconds = 0
         isLoadingPlayback = true
         hasPreparedPlayer = false
         playerErrorMessage = nil
 
-        playbackTask = Task { [weak self, detailService] in
-            defer { self?.playbackTask = nil }
+        playbackTask = Task {
+            [
+                weak self,
+                detailService,
+                playbackProgressStore,
+                playbackProgressWriteCoordinator,
+                accountScopeProvider,
+                playbackReadyWaiter,
+                initialPlaybackSeeker,
+            ] in
             guard let self else {
                 return
             }
+            defer {
+                if self.playbackGeneration == generation {
+                    self.playbackTask = nil
+                }
+            }
             do {
-                let source = try await detailService.fetchPlayback(bvid: detail.bvid, cid: cid)
+                let accountScope = await accountScopeProvider()
                 try Task.checkCancellation()
+                guard playbackGeneration == generation else {
+                    return
+                }
+                await playbackProgressWriteCoordinator.waitForPendingWrites()
+                try Task.checkCancellation()
+                guard playbackGeneration == generation else {
+                    return
+                }
+
+                var playbackCID = cid
+                var localResume: FocusPlaybackProgressEntry?
+                var serverResume: FocusVideoPlaybackResume?
+                let source: FocusVideoPlaybackSource
+                if mayResolveResumePage {
+                    let storedResume = await playbackProgressStore.recentProgress(
+                        accountScope: accountScope,
+                        aid: detail.aid,
+                        bvid: detail.bvid
+                    )
+                    try Task.checkCancellation()
+                    guard playbackGeneration == generation else {
+                        return
+                    }
+
+                    if shouldResolveInitialResumePage {
+                        shouldResolveInitialResumePage = false
+                        if let storedResume,
+                           FocusPlaybackResumeResolver.isMeaningfulResume(
+                               storedResume.playbackResume
+                           ),
+                           detail.pages.contains(where: { $0.cid == storedResume.cid })
+                        {
+                            localResume = storedResume
+                            playbackCID = storedResume.cid
+                            selectedPageCID = storedResume.cid
+                            updateNowPlayingInfo()
+                            configureDanmaku(for: detail, playbackPositionMilliseconds: 0)
+                        } else {
+                            serverResume = try? await detailService.fetchPlaybackResume(
+                                aid: detail.aid,
+                                cid: cid
+                            )
+                            try Task.checkCancellation()
+                            guard playbackGeneration == generation else {
+                                return
+                            }
+                            if let serverResume,
+                               FocusPlaybackResumeResolver.isMeaningfulResume(serverResume),
+                               detail.pages.contains(where: { $0.cid == serverResume.cid })
+                            {
+                                playbackCID = serverResume.cid
+                                selectedPageCID = serverResume.cid
+                                updateNowPlayingInfo()
+                                configureDanmaku(for: detail, playbackPositionMilliseconds: 0)
+                            }
+                        }
+                    }
+                    source = try await detailService.fetchPlayback(
+                        bvid: detail.bvid,
+                        cid: playbackCID
+                    )
+                } else {
+                    async let sourceRequest = detailService.fetchPlayback(bvid: detail.bvid, cid: cid)
+                    localResume = await playbackProgressStore.recentProgress(
+                        accountScope: accountScope,
+                        aid: detail.aid,
+                        bvid: detail.bvid,
+                        cid: cid
+                    )
+                    try Task.checkCancellation()
+                    guard playbackGeneration == generation else {
+                        return
+                    }
+                    if let storedResume = localResume,
+                       !FocusPlaybackResumeResolver.isMeaningfulResume(
+                           storedResume.playbackResume
+                       )
+                    {
+                        localResume = nil
+                    }
+                    if localResume == nil {
+                        serverResume = try? await detailService.fetchPlaybackResume(
+                            aid: detail.aid,
+                            cid: cid
+                        )
+                    }
+                    source = try await sourceRequest
+                }
+                try Task.checkCancellation()
+                guard playbackGeneration == generation else {
+                    return
+                }
                 let items = try await FocusNativePlaybackFactory.makeItems(for: source)
                 try Task.checkCancellation()
+                guard playbackGeneration == generation else {
+                    return
+                }
                 guard !items.isEmpty else {
                     throw FocusVideoDetailService.ServiceError.noStream
                 }
@@ -670,18 +1272,48 @@ final class FocusNativeVideoViewModel: ObservableObject {
                     player.insert(item, after: previousItem)
                     previousItem = item
                 }
+                guard let firstItem = player.currentItem else {
+                    throw FocusVideoDetailService.ServiceError.noStream
+                }
+
+                try await playbackReadyWaiter(firstItem)
+                try Task.checkCancellation()
+                guard playbackGeneration == generation else {
+                    return
+                }
+
+                let durationSeconds = detail.pages.first(where: { $0.cid == playbackCID })?.duration
+                    ?? detail.duration
+                let initialPositionMilliseconds =
+                    FocusPlaybackResumeResolver.initialPositionMilliseconds(
+                        local: localResume,
+                        server: serverResume,
+                        selectedCID: playbackCID,
+                        durationSeconds: durationSeconds
+                    )
+                if initialPositionMilliseconds > 0 {
+                    try await initialPlaybackSeeker(player, initialPositionMilliseconds)
+                    try Task.checkCancellation()
+                    guard playbackGeneration == generation else {
+                        return
+                    }
+                    playbackPositionMilliseconds = initialPositionMilliseconds
+                    updateDanmakuPosition(initialPositionMilliseconds)
+                }
+
+                activePlaybackAccountScope = accountScope
                 isLoadingPlayback = false
-                hasPreparedPlayer = player.currentItem != nil
+                hasPreparedPlayer = true
                 configureAudioSession()
                 player.defaultRate = playbackRate
-                player.playImmediately(atRate: playbackRate)
                 isReplacingPlayerItem = false
                 updateNowPlayingInfo()
+                player.playImmediately(atRate: playbackRate)
                 queueWatchHistoryReport(force: true)
             } catch is CancellationError {
                 return
             } catch {
-                guard !Task.isCancelled else {
+                guard !Task.isCancelled, playbackGeneration == generation else {
                     return
                 }
                 isLoadingPlayback = false
@@ -693,7 +1325,7 @@ final class FocusNativeVideoViewModel: ObservableObject {
     }
 
     private func queueWatchHistoryReport(force: Bool) {
-        guard let detail else {
+        guard let detail, let activePlaybackAccountScope else {
             return
         }
         let cid = selectedPageCID
@@ -701,12 +1333,15 @@ final class FocusNativeVideoViewModel: ObservableObject {
             ?? detail.pages.first?.cid
             ?? detail.cid
         let report = WatchHistoryReport(
+            accountScope: activePlaybackAccountScope,
             aid: detail.aid,
+            bvid: detail.bvid,
             cid: cid,
-            progressSeconds: max(currentPlaybackMilliseconds / 1_000, 0)
+            positionMilliseconds: max(currentPlaybackMilliseconds, 0)
         )
 
         if let previous = lastQueuedWatchHistoryReport,
+           previous.accountScope == report.accountScope,
            previous.aid == report.aid,
            previous.cid == report.cid
         {
@@ -719,17 +1354,74 @@ final class FocusNativeVideoViewModel: ObservableObject {
         }
 
         lastQueuedWatchHistoryReport = report
-        let precedingTask = watchHistoryReportTask
-        watchHistoryReportTask = Task { [actionService] in
-            _ = await precedingTask?.result
-            guard !Task.isCancelled else {
+        let localWrite = playbackProgressWriteCoordinator.enqueue {
+            [playbackProgressStore] in
+            if report.accountScope == .anonymous {
+                _ = await playbackProgressStore.recordProgress(
+                    accountScope: report.accountScope,
+                    aid: report.aid,
+                    bvid: report.bvid,
+                    cid: report.cid,
+                    positionMilliseconds: report.positionMilliseconds
+                )
                 return
             }
-            try? await actionService.reportWatchHistory(
+
+            _ = await playbackProgressStore.recordProgressAndEnqueueHistory(
+                accountScope: report.accountScope,
                 aid: report.aid,
+                bvid: report.bvid,
                 cid: report.cid,
-                progressSeconds: report.progressSeconds
+                positionMilliseconds: report.positionMilliseconds
             )
+        }
+        guard report.accountScope != .anonymous else {
+            watchHistoryReportTask = localWrite
+            return
+        }
+
+        watchHistoryReportTask = Task { [actionService, playbackProgressStore] in
+            await localWrite.value
+            FocusHistoryBackgroundScheduler.shared.schedule()
+            let outcome = await playbackProgressStore.drainPendingHistory(
+                accountScope: report.accountScope
+            ) { pendingReport in
+                await actionService.attemptWatchHistory(pendingReport)
+            }
+            if outcome.requiresRetry {
+                FocusHistoryBackgroundScheduler.shared.schedule()
+            }
+        }
+    }
+
+    private func retryPendingWatchHistoryReports() {
+        guard watchHistoryRetryTask == nil else {
+            return
+        }
+        watchHistoryRetryGeneration &+= 1
+        let generation = watchHistoryRetryGeneration
+        watchHistoryRetryTask = Task {
+            [
+                weak self,
+                actionService,
+                playbackProgressStore,
+                accountScopeProvider,
+            ] in
+            let accountScope = await accountScopeProvider()
+            if accountScope != .anonymous, !Task.isCancelled {
+                let outcome = await playbackProgressStore.drainPendingHistory(
+                    accountScope: accountScope
+                ) { pendingReport in
+                    await actionService.attemptWatchHistory(pendingReport)
+                }
+                if outcome.requiresRetry {
+                    FocusHistoryBackgroundScheduler.shared.schedule()
+                }
+            }
+            guard let self, watchHistoryRetryGeneration == generation else {
+                return
+            }
+            watchHistoryRetryTask = nil
         }
     }
 
@@ -738,6 +1430,10 @@ final class FocusNativeVideoViewModel: ObservableObject {
     }
 
     var danmakuPlaybackPositionMilliseconds: Int64 {
+        currentPlaybackMilliseconds
+    }
+
+    var subtitlePlaybackPositionMilliseconds: Int64 {
         currentPlaybackMilliseconds
     }
 
@@ -758,6 +1454,196 @@ final class FocusNativeVideoViewModel: ObservableObject {
             danmakuRevision &+= 1
             cancelDanmakuRequests()
         }
+    }
+
+    private func setSubtitlesEnabled(_ enabled: Bool, persist: Bool) {
+        let changed = isSubtitleEnabled != enabled
+        isSubtitleEnabled = enabled
+        if persist, changed {
+            subtitlePreferenceChange(enabled, preferredSubtitleLanguageCode)
+        }
+
+        guard enabled else {
+            subtitleDocumentGeneration &+= 1
+            subtitleDocumentTask?.cancel()
+            subtitleDocumentTask = nil
+            return
+        }
+        guard let detail else {
+            return
+        }
+        configureSubtitles(for: detail)
+    }
+
+    private func configureSubtitles(
+        for detail: FocusVideoDetail,
+        forceReload: Bool = false
+    ) {
+        guard let subtitleService else {
+            subtitleLoadState = .unavailable
+            return
+        }
+        let cid = selectedPageCID
+            ?? detail.pages.first(where: { $0.cid == detail.cid })?.cid
+            ?? detail.pages.first?.cid
+            ?? detail.cid
+        let context = SubtitleContext(aid: detail.aid, cid: cid)
+        if subtitleContext != context || forceReload {
+            resetSubtitleSession()
+            subtitleContext = context
+        }
+
+        if !subtitleTracks.isEmpty {
+            let track = selectedSubtitleTrack
+                ?? preferredSubtitleTrack(in: subtitleTracks)
+            selectedSubtitleTrackID = track?.id
+            if isSubtitleEnabled, let track {
+                loadSubtitleDocument(for: track)
+            } else {
+                subtitleLoadState = .ready
+            }
+            return
+        }
+        guard subtitleTracksTask == nil else {
+            return
+        }
+
+        let generation = subtitleGeneration
+        subtitleLoadState = .loadingTracks
+        subtitleTracksTask = Task { [weak self] in
+            guard let self else {
+                return
+            }
+            defer {
+                if self.subtitleGeneration == generation {
+                    self.subtitleTracksTask = nil
+                }
+            }
+            do {
+                let tracks = try await subtitleService.fetchTracks(
+                    aid: context.aid,
+                    cid: context.cid
+                )
+                guard
+                    !Task.isCancelled,
+                    subtitleGeneration == generation,
+                    subtitleContext == context
+                else {
+                    return
+                }
+                subtitleTracks = tracks
+                guard !tracks.isEmpty else {
+                    selectedSubtitleTrackID = nil
+                    subtitleCues = []
+                    subtitleLoadState = .unavailable
+                    return
+                }
+                let track = preferredSubtitleTrack(in: tracks) ?? tracks[0]
+                selectedSubtitleTrackID = track.id
+                if isSubtitleEnabled {
+                    loadSubtitleDocument(for: track)
+                } else {
+                    subtitleLoadState = .ready
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                guard
+                    !Task.isCancelled,
+                    subtitleGeneration == generation,
+                    subtitleContext == context
+                else {
+                    return
+                }
+                subtitleLoadState = .failed(error.localizedDescription)
+            }
+        }
+    }
+
+    private func loadSubtitleDocument(for track: FocusVideoSubtitleTrack) {
+        guard isSubtitleEnabled, let subtitleService else {
+            return
+        }
+        selectedSubtitleTrackID = track.id
+        if let cachedCues = subtitleCueCache[track.id] {
+            subtitleCues = cachedCues
+            subtitleLoadState = .ready
+            return
+        }
+
+        subtitleDocumentGeneration &+= 1
+        let generation = subtitleDocumentGeneration
+        subtitleDocumentTask?.cancel()
+        subtitleLoadState = .loadingDocument
+        subtitleCues = []
+        subtitleDocumentTask = Task { [weak self] in
+            guard let self else {
+                return
+            }
+            defer {
+                if self.subtitleDocumentGeneration == generation {
+                    self.subtitleDocumentTask = nil
+                }
+            }
+            do {
+                let document = try await subtitleService.fetchDocument(for: track)
+                guard
+                    !Task.isCancelled,
+                    subtitleDocumentGeneration == generation,
+                    selectedSubtitleTrackID == track.id
+                else {
+                    return
+                }
+                subtitleCueCache[track.id] = document.cues
+                subtitleCues = document.cues
+                subtitleLoadState = .ready
+            } catch is CancellationError {
+                return
+            } catch {
+                guard
+                    !Task.isCancelled,
+                    subtitleDocumentGeneration == generation,
+                    selectedSubtitleTrackID == track.id
+                else {
+                    return
+                }
+                subtitleCues = []
+                subtitleLoadState = .failed(error.localizedDescription)
+            }
+        }
+    }
+
+    private func preferredSubtitleTrack(
+        in tracks: [FocusVideoSubtitleTrack]
+    ) -> FocusVideoSubtitleTrack? {
+        let unlockedTracks = tracks.filter { !$0.isLocked }
+        let candidates = unlockedTracks.isEmpty ? tracks : unlockedTracks
+        let preferredCodes = [
+            preferredSubtitleLanguageCode,
+            Locale.preferredLanguages.first ?? "",
+        ]
+        .map { $0.replacingOccurrences(of: "_", with: "-").lowercased() }
+        .filter { !$0.isEmpty }
+
+        for code in preferredCodes {
+            if let exact = candidates.first(where: {
+                $0.languageCode.replacingOccurrences(of: "_", with: "-")
+                    .lowercased() == code
+            }) {
+                return exact
+            }
+            let base = code.split(separator: "-").first.map(String.init) ?? code
+            if let languageMatch = candidates.first(where: {
+                $0.languageCode.replacingOccurrences(of: "_", with: "-")
+                    .lowercased()
+                    .split(separator: "-")
+                    .first
+                    .map(String.init) == base
+            }) {
+                return languageMatch
+            }
+        }
+        return candidates.first
     }
 
     private func configureDanmaku(
@@ -903,6 +1789,32 @@ final class FocusNativeVideoViewModel: ObservableObject {
         danmakuSegmentTasks.removeAll()
     }
 
+    private func cancelSubtitleRequests() {
+        subtitleGeneration &+= 1
+        subtitleDocumentGeneration &+= 1
+        subtitleTracksTask?.cancel()
+        subtitleDocumentTask?.cancel()
+        subtitleTracksTask = nil
+        subtitleDocumentTask = nil
+        if subtitleTracks.isEmpty {
+            subtitleLoadState = .idle
+        } else if subtitleLoadState == .loadingDocument
+            || subtitleLoadState == .loadingTracks
+        {
+            subtitleLoadState = .ready
+        }
+    }
+
+    private func resetSubtitleSession() {
+        cancelSubtitleRequests()
+        subtitleContext = nil
+        subtitleCueCache.removeAll()
+        subtitleTracks = []
+        selectedSubtitleTrackID = nil
+        subtitleCues = []
+        subtitleLoadState = .idle
+    }
+
     private func resetDanmakuSession() {
         danmakuRevision &+= 1
         cancelDanmakuRequests()
@@ -938,40 +1850,250 @@ final class FocusNativeVideoViewModel: ObservableObject {
     }
 
     private func loadComments(for detail: FocusVideoDetail) {
-        commentsTask?.cancel()
-        commentsTask = Task { [weak self, detailService] in
-            defer { self?.commentsTask = nil }
+        cancelCommentsTask()
+        commentsNextCursor = nil
+        commentTotalCount = 0
+        commentAccountScope = nil
+        let generation = commentsGeneration
+        commentsTask = Task {
+            [weak self, detailService, accountScopeProvider] in
+            guard let self else {
+                return
+            }
+            defer {
+                if self.commentsGeneration == generation {
+                    self.commentsTask = nil
+                }
+            }
             do {
-                let comments = try await detailService.fetchComments(aid: detail.aid)
-                guard !Task.isCancelled else {
+                let accountScope = await accountScopeProvider()
+                try Task.checkCancellation()
+                guard commentsGeneration == generation else {
                     return
                 }
-                self?.comments = comments
+
+                let page = try await detailService.fetchCommentsPage(aid: detail.aid)
+                try Task.checkCancellation()
+                guard commentsGeneration == generation else {
+                    return
+                }
+
+                let resultingScope = await accountScopeProvider()
+                try Task.checkCancellation()
+                guard commentsGeneration == generation else {
+                    return
+                }
+                guard resultingScope == accountScope else {
+                    invalidateCommentSessionForAccountChange(
+                        detail: detail,
+                        presentsError: false
+                    )
+                    return
+                }
+
+                self.comments = page.comments
+                self.commentTotalCount = page.totalCount
+                self.commentsNextCursor = page.nextCursor
+                self.commentAccountScope = accountScope
+            } catch is CancellationError {
+                return
             } catch {
                 return
             }
         }
     }
 
+    private func initialCommentThreadState(
+        for comment: FocusVideoComment
+    ) -> CommentThreadState {
+        let previewReplies = Array(comment.previewReplies.prefix(2))
+        return CommentThreadState(
+            replies: previewReplies,
+            totalCount: max(comment.replies, Int64(previewReplies.count)),
+            nextCursor: nil,
+            isExpanded: false,
+            isLoading: false,
+            hasLoadedFirstPage: comment.replies <= Int64(previewReplies.count),
+            errorMessage: nil
+        )
+    }
+
+    private func resumeExpandedCommentReplyLoads() {
+        guard commentAccountScope != nil else {
+            return
+        }
+        let pendingComments = comments.filter { comment in
+            guard let thread = commentThreadStates[comment.id] else {
+                return false
+            }
+            return thread.isExpanded
+                && !thread.hasLoadedFirstPage
+                && !thread.isLoading
+                && commentReplyTasks[comment.id] == nil
+        }
+        for comment in pendingComments {
+            loadCommentReplies(for: comment, cursor: nil)
+        }
+    }
+
+    private func loadCommentReplies(
+        for comment: FocusVideoComment,
+        cursor: FocusVideoCommentRepliesCursor?
+    ) {
+        guard let detail, let commentService else {
+            var thread = commentThreadStates[comment.id]
+                ?? initialCommentThreadState(for: comment)
+            thread.errorMessage = "评论回复服务暂不可用"
+            thread.isLoading = false
+            commentThreadStates[comment.id] = thread
+            return
+        }
+        guard let accountScope = commentAccountScope else {
+            invalidateCommentSessionForAccountChange(
+                detail: detail,
+                presentsError: false
+            )
+            return
+        }
+        guard commentReplyTasks[comment.id] == nil else {
+            return
+        }
+
+        var loadingThread = commentThreadStates[comment.id]
+            ?? initialCommentThreadState(for: comment)
+        loadingThread.isExpanded = true
+        loadingThread.isLoading = true
+        loadingThread.errorMessage = nil
+        commentThreadStates[comment.id] = loadingThread
+
+        let generation = commentThreadsGeneration
+        commentReplyTasks[comment.id] = Task {
+            [weak self, accountScopeProvider] in
+            guard let self else {
+                return
+            }
+            defer {
+                if commentThreadsGeneration == generation {
+                    commentReplyTasks[comment.id] = nil
+                    if var thread = commentThreadStates[comment.id] {
+                        thread.isLoading = false
+                        commentThreadStates[comment.id] = thread
+                    }
+                }
+            }
+            do {
+                let currentScope = await accountScopeProvider()
+                try Task.checkCancellation()
+                guard commentThreadsGeneration == generation else {
+                    return
+                }
+                guard currentScope == accountScope else {
+                    invalidateCommentSessionForAccountChange(
+                        detail: detail,
+                        presentsError: true
+                    )
+                    return
+                }
+
+                let page = try await commentService.fetchReplies(
+                    aid: detail.aid,
+                    rootCommentID: comment.id,
+                    cursor: cursor
+                )
+                try Task.checkCancellation()
+                guard commentThreadsGeneration == generation else {
+                    return
+                }
+
+                let resultingScope = await accountScopeProvider()
+                try Task.checkCancellation()
+                guard commentThreadsGeneration == generation else {
+                    return
+                }
+                guard resultingScope == accountScope else {
+                    invalidateCommentSessionForAccountChange(
+                        detail: detail,
+                        presentsError: true
+                    )
+                    return
+                }
+
+                var thread = commentThreadStates[comment.id]
+                    ?? initialCommentThreadState(for: comment)
+                let existing = cursor == nil ? [] : thread.replies
+                var seen = Set<Int64>()
+                thread.replies = (existing + page.replies).filter {
+                    seen.insert($0.id).inserted
+                }
+                thread.totalCount = max(
+                    max(page.totalCount, comment.replies),
+                    Int64(thread.replies.count)
+                )
+                thread.nextCursor = page.nextCursor
+                thread.hasLoadedFirstPage = true
+                thread.errorMessage = nil
+                commentThreadStates[comment.id] = thread
+            } catch is CancellationError {
+                return
+            } catch {
+                guard
+                    !Task.isCancelled,
+                    commentThreadsGeneration == generation
+                else {
+                    return
+                }
+                var thread = commentThreadStates[comment.id]
+                    ?? initialCommentThreadState(for: comment)
+                thread.errorMessage = error.localizedDescription
+                commentThreadStates[comment.id] = thread
+            }
+        }
+    }
+
+    private func invalidateCommentSessionForAccountChange(
+        detail: FocusVideoDetail,
+        presentsError: Bool
+    ) {
+        guard self.detail?.aid == detail.aid else {
+            return
+        }
+
+        comments = []
+        commentTotalCount = 0
+        commentsNextCursor = nil
+        isLoadingMoreComments = false
+        resetCommentInteractionSession()
+        if presentsError {
+            actionErrorMessage = "登录账号已切换，评论已刷新，请重试。"
+        }
+        loadComments(for: detail)
+    }
+
     private func loadInteractions(for detail: FocusVideoDetail) {
-        interactionTask?.cancel()
+        cancelInteractionTask()
+        let generation = interactionGeneration
         isLoadingInteractions = true
         interactionTask = Task { [weak self, actionService] in
+            guard let self else {
+                return
+            }
             defer {
-                self?.interactionTask = nil
-                self?.isLoadingInteractions = false
+                if self.interactionGeneration == generation {
+                    self.interactionTask = nil
+                    self.isLoadingInteractions = false
+                }
             }
             do {
                 let state = try await actionService.fetchInteractionState(aid: detail.aid)
-                guard !Task.isCancelled else {
+                guard !Task.isCancelled, interactionGeneration == generation else {
                     return
                 }
-                self?.interactionState = state
+                self.interactionState = state
             } catch {
-                guard !Task.isCancelled else {
+                guard !Task.isCancelled, interactionGeneration == generation else {
                     return
                 }
-                self?.actionErrorMessage = error.localizedDescription
+                self.actionErrorMessage = error.localizedDescription
             }
         }
     }
@@ -981,22 +2103,32 @@ final class FocusNativeVideoViewModel: ObservableObject {
         operation: @escaping @MainActor () async throws -> Void
     ) {
         actionTasks[action]?.cancel()
+        let generation = (actionGenerations[action] ?? 0) &+ 1
+        actionGenerations[action] = generation
         actionsInFlight.insert(action)
         actionErrorMessage = nil
         actionTasks[action] = Task { [weak self] in
+            guard let self else {
+                return
+            }
             defer {
-                self?.actionsInFlight.remove(action)
-                self?.actionTasks[action] = nil
+                if self.actionGenerations[action] == generation {
+                    self.actionsInFlight.remove(action)
+                    self.actionTasks[action] = nil
+                }
             }
             do {
                 try await operation()
             } catch is CancellationError {
                 return
             } catch {
-                guard !Task.isCancelled else {
+                guard
+                    !Task.isCancelled,
+                    actionGenerations[action] == generation
+                else {
                     return
                 }
-                self?.actionErrorMessage = error.localizedDescription
+                self.actionErrorMessage = error.localizedDescription
             }
         }
     }
@@ -1201,7 +2333,12 @@ final class FocusNativeVideoViewModel: ObservableObject {
     }
 
     private func playFromRemoteCommand() {
-        guard isPlaybackSessionActive, player.currentItem != nil else {
+        guard
+            isPlaybackSessionActive,
+            hasPreparedPlayer,
+            !isLoadingPlayback,
+            player.currentItem != nil
+        else {
             return
         }
         configureAudioSession()
@@ -1219,7 +2356,12 @@ final class FocusNativeVideoViewModel: ObservableObject {
     }
 
     private func seekFromRemoteCommand(to seconds: TimeInterval) {
-        guard isPlaybackSessionActive, let item = player.currentItem else {
+        guard
+            isPlaybackSessionActive,
+            hasPreparedPlayer,
+            !isLoadingPlayback,
+            let item = player.currentItem
+        else {
             return
         }
         let duration = item.duration.seconds
@@ -1330,18 +2472,128 @@ final class FocusNativeVideoViewModel: ObservableObject {
         }
     }
 
+    private static func waitUntilReadyToPlay(_ item: AVPlayerItem) async throws {
+        for await status in item.publisher(
+            for: \.status,
+            options: [.initial, .new]
+        ).values {
+            try Task.checkCancellation()
+            switch status {
+            case .readyToPlay:
+                return
+            case .failed:
+                if let error = item.error {
+                    throw error
+                }
+                throw FocusVideoDetailService.ServiceError.invalidResponse
+            case .unknown:
+                continue
+            @unknown default:
+                continue
+            }
+        }
+        throw CancellationError()
+    }
+
+    private static func seek(
+        _ player: AVQueuePlayer,
+        toMilliseconds milliseconds: Int64
+    ) async throws {
+        guard milliseconds > 0 else {
+            return
+        }
+        let target = CMTime(value: milliseconds, timescale: 1_000)
+        let finished = await withCheckedContinuation { continuation in
+            player.seek(
+                to: target,
+                toleranceBefore: .zero,
+                toleranceAfter: .zero
+            ) { completed in
+                continuation.resume(returning: completed)
+            }
+        }
+        try Task.checkCancellation()
+        guard finished else {
+            throw FocusVideoDetailService.ServiceError.invalidResponse
+        }
+    }
+
     private func cancelTasks() {
+        cancelLoadTask()
+        cancelCommentsTask()
+        cancelInteractionTask()
+        cancelPlaybackTask()
+        cancelActionTasks()
+        cancelCommentReplyTasks()
+        cancelCommentLikeTasks()
+        cancelDanmakuRequests()
+        cancelSubtitleRequests()
+    }
+
+    private func cancelLoadTask() {
+        loadGeneration &+= 1
         loadTask?.cancel()
         loadTask = nil
+    }
+
+    private func cancelCommentsTask() {
+        commentsGeneration &+= 1
         commentsTask?.cancel()
         commentsTask = nil
+        isLoadingMoreComments = false
+    }
+
+    private func cancelCommentReplyTasks() {
+        commentThreadsGeneration &+= 1
+        commentReplyTasks.values.forEach { $0.cancel() }
+        commentReplyTasks.removeAll()
+        for commentID in Array(commentThreadStates.keys) {
+            guard var thread = commentThreadStates[commentID] else {
+                continue
+            }
+            thread.isLoading = false
+            commentThreadStates[commentID] = thread
+        }
+    }
+
+    private func cancelCommentLikeTasks() {
+        for commentID in commentLikeTasks.keys {
+            commentLikeGenerations[commentID] =
+                (commentLikeGenerations[commentID] ?? 0) &+ 1
+        }
+        commentLikeTasks.values.forEach { $0.cancel() }
+        commentLikeTasks.removeAll()
+        commentLikeActionsInFlight.removeAll()
+    }
+
+    private func resetCommentInteractionSession() {
+        cancelCommentReplyTasks()
+        cancelCommentLikeTasks()
+        commentThreadStates.removeAll()
+        commentLikeOverrides.removeAll()
+        commentAccountScope = nil
+        // Keep per-comment generations monotonic. A cancelled task may finish
+        // after a new session has started with the same comment identifier.
+    }
+
+    private func cancelInteractionTask() {
+        interactionGeneration &+= 1
         interactionTask?.cancel()
         interactionTask = nil
+    }
+
+    private func cancelPlaybackTask() {
+        playbackGeneration &+= 1
         playbackTask?.cancel()
         playbackTask = nil
+    }
+
+    private func cancelActionTasks() {
+        for action in actionTasks.keys {
+            actionGenerations[action] = (actionGenerations[action] ?? 0) &+ 1
+        }
         actionTasks.values.forEach { $0.cancel() }
         actionTasks.removeAll()
-        cancelDanmakuRequests()
     }
 
     private func cancelPortraitExitTransition() {
@@ -1367,15 +2619,26 @@ final class FocusNativeVideoViewModel: ObservableObject {
     }
 
     private struct WatchHistoryReport: Equatable, Sendable {
+        let accountScope: FocusPlaybackAccountScope
         let aid: Int64
+        let bvid: String
         let cid: Int64
-        let progressSeconds: Int64
+        let positionMilliseconds: Int64
+
+        var progressSeconds: Int64 {
+            max(positionMilliseconds, 0) / 1_000
+        }
     }
 
     private struct DanmakuContext: Equatable {
         let aid: Int64
         let cid: Int64
         let durationMilliseconds: Int64
+    }
+
+    private struct SubtitleContext: Equatable {
+        let aid: Int64
+        let cid: Int64
     }
 
     private static let defaultDanmakuSegmentMilliseconds: Int64 = 360_000
@@ -1562,845 +2825,6 @@ enum FocusNativeVideoSelection {
     }
 }
 
-struct FocusNativeVideoDetailView: View {
-    @Environment(\.colorScheme) private var colorScheme
-    @ObservedObject var viewModel: FocusNativeVideoViewModel
-    let onOpenUser: (Int64) -> Void
-    let onOpenVideo: (URL) -> Void
-    let onOpenURL: (URL) -> Void
-    let onOpenWeb: (URL) -> Void
-    @State private var isDescriptionExpanded = true
-
-    var body: some View {
-        content
-            .background(Color(uiColor: .systemGroupedBackground))
-            .fullScreenCover(isPresented: $viewModel.isFullscreen) {
-                FocusNativeVideoFullscreenView(viewModel: viewModel)
-            }
-            .alert(
-                "操作未完成",
-                isPresented: Binding(
-                    get: { viewModel.actionErrorMessage != nil },
-                    set: { isPresented in
-                        if !isPresented {
-                            viewModel.actionErrorMessage = nil
-                        }
-                    }
-                )
-            ) {
-                Button("知道了", role: .cancel) {
-                    viewModel.actionErrorMessage = nil
-                }
-            } message: {
-                Text(viewModel.actionErrorMessage ?? "请稍后重试")
-            }
-            .onReceive(NotificationCenter.default.publisher(for: UIDevice.orientationDidChangeNotification)) { _ in
-                viewModel.handleDeviceOrientationChange(UIDevice.current.orientation)
-            }
-    }
-
-    @ViewBuilder
-    private var content: some View {
-        switch viewModel.state {
-        case .idle, .loading:
-            VStack(spacing: 0) {
-                playerPlaceholder(coverURL: nil)
-                ProgressView("加载视频详情…")
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-
-        case let .failed(message):
-            VStack(spacing: 0) {
-                playerPlaceholder(coverURL: nil)
-                FocusStateView(
-                    title: "原生视频加载失败",
-                    message: message,
-                    buttonTitle: "重新加载",
-                    action: viewModel.reload
-                )
-                if let url = viewModel.currentURL {
-                    Button("改用网页打开") {
-                        onOpenWeb(url)
-                    }
-                    .buttonStyle(.bordered)
-                    .padding(.bottom, 24)
-                }
-            }
-
-        case let .loaded(detail):
-            VStack(spacing: 0) {
-                player(detail: detail)
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 18) {
-                        titleSection(detail)
-                        FocusNativeVideoActionBar(viewModel: viewModel, statistics: detail.statistics)
-                        authorSection(detail.owner)
-                        if detail.pages.count > 1 {
-                            pageSection(detail.pages)
-                        }
-                        ForEach(detail.episodeGroups) { group in
-                            episodeSection(
-                                group,
-                                currentBVID: detail.bvid,
-                                currentCID: viewModel.activePage?.cid ?? detail.cid
-                            )
-                        }
-                        if !detail.summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                            descriptionSection(detail.summary)
-                        }
-                        commentsSection
-                    }
-                    .padding(.horizontal, 16)
-                    .padding(.top, 16)
-                    .padding(.bottom, 24)
-                }
-            }
-        }
-    }
-
-    private func player(detail: FocusVideoDetail) -> some View {
-        ZStack {
-            Color.black
-            if viewModel.hasPreparedPlayer, !viewModel.isFullscreen {
-                FocusNativePlayerSurface(player: viewModel.player, showsPlaybackControls: false)
-            } else {
-                FocusRemoteImage(url: detail.coverURL, referer: viewModel.currentURL?.absoluteString ?? "https://www.bilibili.com/") { phase in
-                    switch phase {
-                    case let .success(image):
-                        image
-                            .resizable()
-                            .scaledToFit()
-                            .opacity(0.72)
-                    case .empty, .failure:
-                        Color.black
-                    }
-                }
-            }
-
-            if !viewModel.isFullscreen {
-                FocusNativeDanmakuOverlay(viewModel: viewModel)
-                    .allowsHitTesting(false)
-                FocusNativeDanmakuStatusOverlay(viewModel: viewModel)
-                    .frame(maxHeight: .infinity, alignment: .top)
-                    .padding(.top, 8)
-            }
-
-            if viewModel.isLoadingPlayback {
-                ProgressView()
-                    .tint(.white)
-                    .scaleEffect(1.15)
-            }
-
-            if let message = viewModel.playerErrorMessage {
-                VStack(spacing: 10) {
-                    Text(message)
-                        .font(.footnote)
-                        .foregroundStyle(.white)
-                        .multilineTextAlignment(.center)
-                        .lineLimit(3)
-                    HStack(spacing: 10) {
-                        Button("重试播放", action: viewModel.retryPlayback)
-                            .buttonStyle(.borderedProminent)
-                        if let url = viewModel.currentURL {
-                            Button("网页播放") {
-                                onOpenWeb(url)
-                            }
-                            .buttonStyle(.bordered)
-                            .tint(.white)
-                        }
-                    }
-                }
-                .padding(20)
-                .background(.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-                .padding(24)
-            }
-        }
-        .frame(maxWidth: .infinity)
-        .aspectRatio(max(detail.aspectRatio, 0.5), contentMode: .fit)
-        .clipped()
-        .accessibilityLabel("原生视频播放器")
-    }
-
-    private func playerPlaceholder(coverURL: URL?) -> some View {
-        ZStack {
-            Color.black
-            if let coverURL {
-                FocusRemoteImage(url: coverURL) { phase in
-                    if case let .success(image) = phase {
-                        image.resizable().scaledToFit().opacity(0.7)
-                    } else {
-                        Color.black
-                    }
-                }
-            }
-        }
-        .aspectRatio(16 / 9, contentMode: .fit)
-    }
-
-    private func titleSection(_ detail: FocusVideoDetail) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text(detail.title)
-                .font(.title3.weight(.semibold))
-                .fixedSize(horizontal: false, vertical: true)
-
-            HStack(spacing: 14) {
-                Label(FocusNativeVideoFormatting.count(detail.statistics.views), systemImage: "play.rectangle")
-                Label(FocusNativeVideoFormatting.count(detail.statistics.danmaku), systemImage: "text.bubble")
-                if detail.publishedAt > 0 {
-                    Text(FocusNativeVideoFormatting.date(detail.publishedAt))
-                }
-            }
-            .font(.caption)
-            .foregroundStyle(.secondary)
-
-        }
-    }
-
-    private func authorSection(_ owner: FocusVideoOwner) -> some View {
-        Button {
-            guard owner.mid > 0 else {
-                return
-            }
-            onOpenUser(owner.mid)
-        } label: {
-            HStack(spacing: 12) {
-                FocusRemoteImage(
-                    url: owner.avatarURL,
-                    referer: owner.mid > 0 ? "https://space.bilibili.com/\(owner.mid)" : "https://www.bilibili.com/"
-                ) { phase in
-                    Group {
-                        if case let .success(image) = phase {
-                            image.resizable().scaledToFill()
-                        } else {
-                            Image(systemName: "person.crop.circle.fill")
-                                .resizable()
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    .frame(width: 46, height: 46)
-                    .clipShape(Circle())
-                }
-
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(owner.name)
-                        .font(.headline)
-                        .foregroundStyle(.primary)
-                    Text("查看 UP 主空间")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Image(systemName: "chevron.right")
-                    .font(.footnote.weight(.semibold))
-                    .foregroundStyle(.tertiary)
-            }
-            .padding(12)
-            .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        }
-        .buttonStyle(.plain)
-        .disabled(owner.mid <= 0)
-    }
-
-    private func pageSection(_ pages: [FocusVideoPage]) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("分P · 共 \(pages.count) 条")
-                .font(.headline)
-            ScrollViewReader { proxy in
-                ScrollView(.horizontal, showsIndicators: false) {
-                    LazyHStack(spacing: 10) {
-                        ForEach(pages) { page in
-                            let isSelectedPage = viewModel.selectedPageCID == page.cid
-                            Button {
-                                viewModel.selectPage(page)
-                            } label: {
-                                VStack(alignment: .leading, spacing: 5) {
-                                    Text("P\(page.pageNumber)")
-                                        .font(.caption.weight(.semibold))
-                                    Text(page.title)
-                                        .font(.subheadline.weight(.medium))
-                                        .lineLimit(2)
-                                    Text(FocusNativeVideoFormatting.duration(page.duration))
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                }
-                                .foregroundStyle(isSelectedPage ? FocusSharedDesign.primary : .primary)
-                                .frame(width: 156, alignment: .leading)
-                                .padding(12)
-                                .background(
-                                    isSelectedPage
-                                        ? FocusSharedDesign.primary.opacity(0.12)
-                                        : Color(uiColor: .secondarySystemGroupedBackground),
-                                    in: RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                )
-                                .overlay {
-                                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                        .stroke(
-                                            isSelectedPage
-                                                ? FocusSharedDesign.primary.opacity(colorScheme == .dark ? 1 : 0.72)
-                                                : Color.clear,
-                                            lineWidth: colorScheme == .dark ? 2 : 1.5
-                                        )
-                                }
-                            }
-                            .buttonStyle(.plain)
-                            .id(page.cid)
-                        }
-                    }
-                }
-                .task(id: viewModel.selectedPageCID) {
-                    guard let selectedPageCID = viewModel.selectedPageCID else {
-                        return
-                    }
-                    await scrollToSelection(selectedPageCID, using: proxy)
-                }
-            }
-        }
-    }
-
-    private func episodeSection(
-        _ group: FocusVideoEpisodeGroup,
-        currentBVID: String,
-        currentCID: Int64
-    ) -> some View {
-        let currentEpisodeIndex = FocusNativeVideoSelection.currentEpisodeIndex(
-            in: group.episodes,
-            currentBVID: currentBVID,
-            currentCID: currentCID
-        )
-        let currentEpisodeID = currentEpisodeIndex.map { group.episodes[$0].id }
-
-        return VStack(alignment: .leading, spacing: 10) {
-            Text(group.title)
-                .font(.headline)
-            ScrollViewReader { proxy in
-                ScrollView(.horizontal, showsIndicators: false) {
-                    LazyHStack(spacing: 10) {
-                        ForEach(group.episodes) { episode in
-                            let isCurrentEpisode = episode.id == currentEpisodeID
-                            Button {
-                                guard !isCurrentEpisode,
-                                      let url = FocusNativeVideoSelection.episodeURL(for: episode)
-                                else {
-                                    return
-                                }
-                                onOpenVideo(url)
-                            } label: {
-                                VStack(alignment: .leading, spacing: 8) {
-                                    FocusRemoteImage(url: episode.coverURL, referer: "https://www.bilibili.com/video/\(episode.bvid)/") { phase in
-                                        Group {
-                                            if case let .success(image) = phase {
-                                                image.resizable().scaledToFill()
-                                            } else {
-                                                Color(uiColor: .tertiarySystemFill)
-                                                    .overlay { Image(systemName: "play.rectangle").foregroundStyle(.secondary) }
-                                            }
-                                        }
-                                        .frame(width: 170, height: 96)
-                                        .clipped()
-                                    }
-                                    Text(episode.title)
-                                        .font(.subheadline.weight(.medium))
-                                        .foregroundStyle(.primary)
-                                        .lineLimit(2)
-                                    if !episode.badge.isEmpty {
-                                        Text(episode.badge)
-                                            .font(.caption2.weight(.semibold))
-                                            .foregroundStyle(FocusSharedDesign.primary)
-                                    }
-                                }
-                                .frame(width: 170, alignment: .leading)
-                                .padding(10)
-                                .background(
-                                    isCurrentEpisode
-                                        ? FocusSharedDesign.primary.opacity(0.12)
-                                        : Color(uiColor: .secondarySystemGroupedBackground),
-                                    in: RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                )
-                                .overlay {
-                                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                        .stroke(
-                                            isCurrentEpisode
-                                                ? FocusSharedDesign.primary.opacity(colorScheme == .dark ? 1 : 0.72)
-                                                : Color.clear,
-                                            lineWidth: colorScheme == .dark ? 2 : 1.5
-                                        )
-                                }
-                            }
-                            .buttonStyle(.plain)
-                            .id(episode.id)
-                        }
-                    }
-                }
-                .task(id: currentEpisodeID) {
-                    guard let currentEpisodeID else {
-                        return
-                    }
-                    await scrollToSelection(currentEpisodeID, using: proxy)
-                }
-            }
-        }
-    }
-
-    private func scrollToSelection<ID: Hashable>(
-        _ id: ID,
-        using proxy: ScrollViewProxy
-    ) async {
-        // The first pass establishes the lazy stack's target. A second pass on the
-        // next layout window prevents distant items from being left just outside
-        // the viewport when a large episode list is materialized asynchronously.
-        await Task.yield()
-        guard !Task.isCancelled else {
-            return
-        }
-        proxy.scrollTo(id, anchor: .center)
-        try? await Task.sleep(nanoseconds: 50_000_000)
-        guard !Task.isCancelled else {
-            return
-        }
-        proxy.scrollTo(id, anchor: .center)
-    }
-
-    private func descriptionSection(_ summary: String) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(summary)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .lineLimit(isDescriptionExpanded ? nil : 3)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .textSelection(.enabled)
-
-            if summary.count > 120 {
-                Button(isDescriptionExpanded ? "收起" : "展开") {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        isDescriptionExpanded.toggle()
-                    }
-                }
-                .font(.subheadline.weight(.semibold))
-                .buttonStyle(.plain)
-                .foregroundStyle(FocusSharedDesign.primary)
-            }
-        }
-        .padding(14)
-        .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-    }
-
-    @ViewBuilder
-    private var commentsSection: some View {
-        if !viewModel.comments.isEmpty {
-            VStack(alignment: .leading, spacing: 14) {
-                Text("评论 · \(viewModel.comments.count)")
-                    .font(.headline)
-                ForEach(viewModel.comments) { comment in
-                    FocusNativeVideoCommentRow(comment: comment, onOpenURL: onOpenURL)
-                }
-            }
-        }
-    }
-}
-
-struct FocusNativeVideoControlDock: View {
-    @ObservedObject var viewModel: FocusNativeVideoViewModel
-
-    var body: some View {
-        HStack(spacing: 8) {
-            FocusVideoControlButton(
-                systemImage: viewModel.isPlaying ? "pause.fill" : "play.fill",
-                title: viewModel.isPlaying ? "暂停" : "播放",
-                accessibilityLabel: viewModel.isPlaying ? "暂停视频" : "播放视频",
-                action: viewModel.togglePlayback
-            )
-            FocusVideoControlButton(
-                systemImage: "speedometer",
-                title: FocusNativeVideoFormatting.rate(viewModel.playbackRate),
-                accessibilityLabel: "切换播放速度",
-                action: viewModel.cyclePlaybackRate
-            )
-            FocusVideoControlButton(
-                systemImage: "text.bubble",
-                title: viewModel.isDanmakuEnabled ? "开" : "关",
-                isActive: viewModel.isDanmakuEnabled,
-                accessibilityLabel: viewModel.isDanmakuEnabled ? "关闭弹幕" : "开启弹幕",
-                action: viewModel.toggleDanmaku
-            )
-            FocusVideoControlButton(
-                systemImage: "arrow.up.left.and.arrow.down.right",
-                title: "全屏",
-                accessibilityLabel: "进入全屏",
-                action: viewModel.requestFullscreen
-            )
-        }
-        .padding(8)
-        .frame(maxWidth: .infinity)
-        .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(FocusSharedDesign.chromePanelBackground.opacity(0.32))
-        )
-    }
-}
-
-private struct FocusNativeVideoActionBar: View {
-    @ObservedObject var viewModel: FocusNativeVideoViewModel
-    let statistics: FocusVideoStatistics
-
-    var body: some View {
-        HStack(spacing: 0) {
-            actionButton(
-                action: .like,
-                title: "点赞",
-                value: statistics.likes,
-                image: "BiliLike",
-                active: viewModel.interactionState.liked,
-                enabled: !viewModel.isLoadingInteractions,
-                handler: viewModel.toggleLike
-            )
-            Divider().frame(height: 42)
-            actionButton(
-                action: .coin,
-                title: "投币",
-                value: statistics.coins,
-                image: "BiliCoin",
-                active: viewModel.interactionState.coined,
-                enabled: !viewModel.isLoadingInteractions && !viewModel.interactionState.coined,
-                handler: viewModel.addCoin
-            )
-            Divider().frame(height: 42)
-            actionButton(
-                action: .favorite,
-                title: "收藏",
-                value: statistics.favorites,
-                image: "BiliFavorite",
-                active: viewModel.interactionState.favorited,
-                enabled: !viewModel.isLoadingInteractions,
-                handler: viewModel.toggleFavorite
-            )
-        }
-        .padding(.vertical, 5)
-        .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-    }
-
-    private func actionButton(
-        action: FocusNativeVideoViewModel.Action,
-        title: String,
-        value: Int64,
-        image: String,
-        active: Bool,
-        enabled: Bool,
-        handler: @escaping () -> Void
-    ) -> some View {
-        Button(action: handler) {
-            VStack(spacing: 5) {
-                if viewModel.actionsInFlight.contains(action) {
-                    ProgressView()
-                        .controlSize(.small)
-                        .frame(width: 24, height: 24)
-                } else {
-                    Image(image)
-                        .resizable()
-                        .renderingMode(.template)
-                        .scaledToFit()
-                        .frame(width: 24, height: 24)
-                }
-                Text("\(title) · \(FocusNativeVideoFormatting.count(value))")
-                    .font(.caption.weight(.medium))
-                    .lineLimit(1)
-            }
-            .foregroundStyle(active ? FocusSharedDesign.primary : .secondary)
-            .frame(maxWidth: .infinity, minHeight: 58)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .disabled(!enabled || viewModel.actionsInFlight.contains(action))
-        .accessibilityLabel("\(title)，\(FocusNativeVideoFormatting.count(value))")
-    }
-}
-
-private struct FocusNativeVideoCommentRow: View {
-    let comment: FocusVideoComment
-    let onOpenURL: (URL) -> Void
-
-    var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            FocusRemoteImage(url: comment.avatarURL, referer: "https://www.bilibili.com/") { phase in
-                Group {
-                    if case let .success(image) = phase {
-                        image.resizable().scaledToFill()
-                    } else {
-                        Image(systemName: "person.crop.circle.fill")
-                            .resizable()
-                            .foregroundStyle(.tertiary)
-                    }
-                }
-                .frame(width: 36, height: 36)
-                .clipShape(Circle())
-            }
-
-            VStack(alignment: .leading, spacing: 6) {
-                HStack {
-                    Text(comment.authorName)
-                        .font(.subheadline.weight(.semibold))
-                    Spacer()
-                    Text(FocusNativeVideoFormatting.relativeDate(comment.publishedAt))
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
-                FocusInlineRichText(
-                    runs: comment.contentRuns,
-                    font: .subheadline,
-                    onOpenURL: onOpenURL
-                )
-                .fixedSize(horizontal: false, vertical: true)
-                ForEach(comment.previewReplies.prefix(2)) { reply in
-                    HStack(alignment: .top, spacing: 2) {
-                        Text("\(reply.authorName)：")
-                            .font(.caption)
-                            .foregroundStyle(FocusSharedDesign.primary)
-                        FocusInlineRichText(
-                            runs: reply.contentRuns,
-                            font: .caption,
-                            foreground: .secondary,
-                            onOpenURL: onOpenURL
-                        )
-                    }
-                    .padding(.leading, 8)
-                }
-                HStack(spacing: 12) {
-                    if comment.likes > 0 {
-                        Label(FocusNativeVideoFormatting.count(comment.likes), systemImage: "hand.thumbsup")
-                    }
-                    if comment.replies > 0 {
-                        Text("\(FocusNativeVideoFormatting.count(comment.replies)) 回复")
-                    }
-                }
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-            }
-        }
-        .padding(12)
-        .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-    }
-}
-
-private struct FocusNativeDanmakuOverlay: View {
-    @ObservedObject var viewModel: FocusNativeVideoViewModel
-
-    var body: some View {
-        GeometryReader { geometry in
-            let laneHeight: CGFloat = 32
-            let usableHeight = geometry.size.height * 0.75
-            let laneCount = max(Int(usableHeight / laneHeight), 1)
-            let placements = FocusNativeDanmakuLayout.placements(
-                for: viewModel.danmakus,
-                laneCount: laneCount
-            )
-
-            TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !viewModel.isPlaying)) { _ in
-                let playbackMilliseconds = viewModel.isPlaying
-                    ? viewModel.danmakuPlaybackPositionMilliseconds
-                    : viewModel.playbackPositionMilliseconds
-                Canvas { context, size in
-                    for placement in placements {
-                        let elapsed = playbackMilliseconds - placement.danmaku.progressMilliseconds
-                        guard elapsed >= 0, elapsed < FocusNativeDanmakuLayout.displayMilliseconds else {
-                            continue
-                        }
-
-                        let color = FocusNativeDanmakuLayout.color(placement.danmaku.colorRGB)
-                        let fontScale = min(max(CGFloat(placement.danmaku.fontSize) / 25, 0.72), 1.44)
-                        let text = Text(placement.danmaku.content)
-                            .font(.system(size: 18 * fontScale, weight: .semibold))
-                            .foregroundColor(color.opacity(0.94))
-                        let resolvedText = context.resolve(text)
-                        let textSize = resolvedText.measure(
-                            in: CGSize(width: .greatestFiniteMagnitude, height: laneHeight)
-                        )
-                        let x: CGFloat
-                        switch placement.danmaku.mode {
-                        case .scrolling:
-                            let progress = CGFloat(elapsed) / CGFloat(FocusNativeDanmakuLayout.displayMilliseconds)
-                            x = size.width - progress * (size.width + textSize.width)
-                        case .top, .bottom:
-                            x = (size.width - textSize.width) / 2
-                        }
-                        let y: CGFloat
-                        switch placement.danmaku.mode {
-                        case .bottom:
-                            y = usableHeight - CGFloat(placement.lane + 1) * laneHeight
-                        case .scrolling, .top:
-                            y = CGFloat(placement.lane) * laneHeight
-                        }
-                        let shadowColor: Color = FocusNativeDanmakuLayout.isDark(color) ? .white : .black
-                        context.drawLayer { layer in
-                            layer.addFilter(
-                                .shadow(
-                                    color: shadowColor.opacity(0.95),
-                                    radius: 2,
-                                    x: 1,
-                                    y: 1
-                                )
-                            )
-                            layer.draw(
-                                resolvedText,
-                                at: CGPoint(x: x, y: max(y, 0)),
-                                anchor: .topLeading
-                            )
-                        }
-                    }
-                }
-            }
-        }
-        .opacity(viewModel.isDanmakuEnabled ? 1 : 0)
-        .clipped()
-        .accessibilityHidden(true)
-    }
-}
-
-private struct FocusNativeDanmakuStatusOverlay: View {
-    @ObservedObject var viewModel: FocusNativeVideoViewModel
-
-    @ViewBuilder
-    var body: some View {
-        if viewModel.isDanmakuEnabled {
-            switch viewModel.danmakuLoadState {
-            case .failed:
-                Button("弹幕加载失败 · 重试", action: viewModel.retryDanmaku)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .background(.black.opacity(0.62), in: Capsule())
-                    .buttonStyle(.plain)
-            case .closed:
-                Text("该视频未开启弹幕")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .background(.black.opacity(0.62), in: Capsule())
-            case .idle, .loading, .ready:
-                EmptyView()
-            }
-        }
-    }
-}
-
-enum FocusNativeDanmakuLayout {
-    static let displayMilliseconds: Int64 = 5_000
-
-    struct Placement {
-        let danmaku: FocusVideoDanmaku
-        let lane: Int
-    }
-
-    static func placements(
-        for danmakus: [FocusVideoDanmaku],
-        laneCount: Int
-    ) -> [Placement] {
-        guard laneCount > 0 else {
-            return []
-        }
-        var availableAt = Dictionary(
-            uniqueKeysWithValues: FocusVideoDanmakuMode.allCases.map {
-                ($0, Array(repeating: Int64(0), count: laneCount))
-            }
-        )
-        var result: [Placement] = []
-        for danmaku in danmakus {
-            guard var lanes = availableAt[danmaku.mode],
-                  let lane = lanes.firstIndex(where: { $0 <= danmaku.progressMilliseconds })
-            else {
-                continue
-            }
-            lanes[lane] = danmaku.progressMilliseconds + displayMilliseconds
-            availableAt[danmaku.mode] = lanes
-            result.append(Placement(danmaku: danmaku, lane: lane))
-        }
-        return result
-    }
-
-    static func color(_ rgb: Int?) -> Color {
-        let value = rgb ?? 0xffffff
-        return Color(
-            red: Double((value >> 16) & 0xff) / 255,
-            green: Double((value >> 8) & 0xff) / 255,
-            blue: Double(value & 0xff) / 255
-        )
-    }
-
-    static func isDark(_ color: Color) -> Bool {
-        guard let components = UIColor(color).cgColor.components else {
-            return false
-        }
-        let red = components.count > 0 ? components[0] : 1
-        let green = components.count > 1 ? components[1] : red
-        let blue = components.count > 2 ? components[2] : red
-        return (0.299 * red + 0.587 * green + 0.114 * blue) < 0.28
-    }
-}
-
-private extension FocusVideoDanmakuMode {
-    static var allCases: [FocusVideoDanmakuMode] {
-        [.scrolling, .top, .bottom]
-    }
-}
-
-private struct FocusNativePlayerSurface: UIViewControllerRepresentable {
-    let player: AVPlayer
-    let showsPlaybackControls: Bool
-
-    func makeUIViewController(context _: Context) -> AVPlayerViewController {
-        let controller = AVPlayerViewController()
-        controller.player = player
-        controller.showsPlaybackControls = showsPlaybackControls
-        controller.videoGravity = .resizeAspect
-        controller.allowsPictureInPicturePlayback = true
-        controller.canStartPictureInPictureAutomaticallyFromInline = true
-        controller.updatesNowPlayingInfoCenter = false
-        controller.entersFullScreenWhenPlaybackBegins = false
-        controller.exitsFullScreenWhenPlaybackEnds = false
-        controller.view.backgroundColor = .black
-        return controller
-    }
-
-    func updateUIViewController(_ controller: AVPlayerViewController, context _: Context) {
-        if controller.player !== player {
-            controller.player = player
-        }
-        controller.showsPlaybackControls = showsPlaybackControls
-        controller.videoGravity = .resizeAspect
-        controller.allowsPictureInPicturePlayback = true
-        controller.canStartPictureInPictureAutomaticallyFromInline = true
-        controller.updatesNowPlayingInfoCenter = false
-        controller.view.backgroundColor = .black
-    }
-
-    static func dismantleUIViewController(_ controller: AVPlayerViewController, coordinator _: Void) {
-        controller.player = nil
-    }
-}
-
-private struct FocusNativeVideoFullscreenView: View {
-    @ObservedObject var viewModel: FocusNativeVideoViewModel
-
-    var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
-            FocusNativePlayerSurface(player: viewModel.player, showsPlaybackControls: true)
-                .ignoresSafeArea()
-            FocusNativeDanmakuOverlay(viewModel: viewModel)
-                .ignoresSafeArea()
-                .allowsHitTesting(false)
-            FocusNativeDanmakuStatusOverlay(viewModel: viewModel)
-                .frame(maxHeight: .infinity, alignment: .top)
-                .padding(.top, 18)
-        }
-        .statusBarHidden(true)
-        .onDisappear {
-            FocusNativeVideoOrientation.update(to: .portrait)
-        }
-    }
-}
-
 enum FocusNativeVideoFullscreenPolicy {
     static func orientation(for detail: FocusVideoDetail) -> UIInterfaceOrientationMask {
         guard detail.width > 0, detail.height > 0 else {
@@ -2411,7 +2835,7 @@ enum FocusNativeVideoFullscreenPolicy {
 }
 
 @MainActor
-private enum FocusNativeVideoOrientation {
+enum FocusNativeVideoOrientation {
     static func update(to mask: UIInterfaceOrientationMask) {
         AppDelegate.orientationLock = mask
         guard let scene = activeWindowScene else {
@@ -2461,7 +2885,7 @@ private enum FocusNativeVideoOrientation {
     }
 }
 
-private enum FocusNativeVideoFormatting {
+enum FocusNativeVideoFormatting {
     static func count(_ value: Int64) -> String {
         switch value {
         case 100_000_000...:

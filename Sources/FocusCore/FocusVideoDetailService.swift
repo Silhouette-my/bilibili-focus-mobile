@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 
 public enum FocusVideoIdentifier: Equatable, Sendable {
@@ -227,6 +226,7 @@ public struct FocusVideoComment: Identifiable, Equatable, Sendable {
     public let message: String
     public let contentRuns: [FocusRichTextRun]
     public let likes: Int64
+    public let isLiked: Bool
     public let replies: Int64
     public let publishedAt: Int64
     public let previewReplies: [FocusVideoComment]
@@ -241,6 +241,7 @@ public struct FocusVideoComment: Identifiable, Equatable, Sendable {
         likes: Int64,
         replies: Int64,
         publishedAt: Int64,
+        isLiked: Bool = false,
         previewReplies: [FocusVideoComment] = []
     ) {
         self.id = id
@@ -250,9 +251,37 @@ public struct FocusVideoComment: Identifiable, Equatable, Sendable {
         self.message = message
         self.contentRuns = contentRuns ?? [.text(value: message)]
         self.likes = likes
+        self.isLiked = isLiked
         self.replies = replies
         self.publishedAt = publishedAt
         self.previewReplies = previewReplies
+    }
+}
+
+public struct FocusVideoCommentCursor: Equatable, Hashable, Sendable {
+    public let nextOffset: String
+
+    public init?(nextOffset: String?) {
+        guard let nextOffset, !nextOffset.isEmpty else {
+            return nil
+        }
+        self.nextOffset = nextOffset
+    }
+}
+
+public struct FocusVideoCommentsPage: Equatable, Sendable {
+    public let comments: [FocusVideoComment]
+    public let totalCount: Int64
+    public let nextCursor: FocusVideoCommentCursor?
+
+    public init(
+        comments: [FocusVideoComment],
+        totalCount: Int64,
+        nextCursor: FocusVideoCommentCursor?
+    ) {
+        self.comments = comments
+        self.totalCount = totalCount
+        self.nextCursor = nextCursor
     }
 }
 
@@ -341,6 +370,52 @@ public struct FocusVideoPlaybackSource: Equatable, Sendable {
     }
 }
 
+public struct FocusVideoPlaybackResume: Equatable, Sendable {
+    public let cid: Int64
+    public let positionMilliseconds: Int64
+
+    public init(cid: Int64, positionMilliseconds: Int64) {
+        self.cid = cid
+        self.positionMilliseconds = positionMilliseconds
+    }
+}
+
+public enum FocusVideoPlaybackResumePolicy {
+    public static func initialPositionMilliseconds(
+        resume: FocusVideoPlaybackResume,
+        selectedCID: Int64,
+        durationSeconds: Int64
+    ) -> Int64 {
+        guard
+            selectedCID > 0,
+            resume.cid == selectedCID,
+            resume.positionMilliseconds >= 5_000
+        else {
+            return 0
+        }
+
+        guard durationSeconds > 0 else {
+            return resume.positionMilliseconds
+        }
+        let (durationMilliseconds, overflow) = durationSeconds.multipliedReportingOverflow(by: 1_000)
+        guard
+            !overflow,
+            resume.positionMilliseconds < durationMilliseconds
+        else {
+            return 0
+        }
+
+        let tailThresholdMilliseconds = min(
+            15_000,
+            max(3_000, durationMilliseconds / 20)
+        )
+        guard durationMilliseconds - resume.positionMilliseconds > tailThresholdMilliseconds else {
+            return 0
+        }
+        return resume.positionMilliseconds
+    }
+}
+
 public actor FocusVideoDetailService {
     public enum ServiceError: Error, Equatable, Sendable, LocalizedError {
         case unsupportedURL
@@ -366,26 +441,29 @@ public actor FocusVideoDetailService {
 
     public static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
 
-    private static let wbiMixinTable = [
-        46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
-        27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13,
-        37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4,
-        22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 52, 34, 44,
-    ]
-
     private let cookieProvider: any CookieSnapshotProvider
     private let requestLoader: RequestLoader
-    private var cachedWBIKey: String?
-    private var cachedWBIKeyExpiration = Date.distantPast
+    private let wbiSigner: WBISigner
 
     public init(
         cookieProvider: any CookieSnapshotProvider,
         requestLoader: @escaping RequestLoader = { request in
-            try await URLSession.shared.data(for: request)
+            try await BiliAPINetwork.data(for: request)
         }
     ) {
         self.cookieProvider = cookieProvider
         self.requestLoader = requestLoader
+        wbiSigner = .shared
+    }
+
+    init(
+        cookieProvider: any CookieSnapshotProvider,
+        wbiSigner: WBISigner,
+        requestLoader: @escaping RequestLoader
+    ) {
+        self.cookieProvider = cookieProvider
+        self.requestLoader = requestLoader
+        self.wbiSigner = wbiSigner
     }
 
     public nonisolated static func requestedPageNumber(from url: URL) -> Int? {
@@ -411,9 +489,12 @@ public actor FocusVideoDetailService {
         }
 
         let cookies = await cookieProvider.loadCookies()
-        var components = URLComponents(string: "https://api.bilibili.com/x/web-interface/view")!
+        var components = URLComponents(
+            url: BiliAPIContractCatalog.require("video.info.info").url,
+            resolvingAgainstBaseURL: false
+        )!
         components.queryItems = [identifier.requestQueryItem]
-        let request = makeRequest(
+        let request = Self.makeRequest(
             url: components.url!,
             referer: url.absoluteString,
             cookies: cookies
@@ -427,22 +508,47 @@ public actor FocusVideoDetailService {
             return []
         }
 
+        var cursor: FocusVideoCommentCursor?
+        for index in 1 ... max(page, 1) {
+            let result = try await fetchCommentsPage(aid: aid, cursor: cursor)
+            if index == max(page, 1) {
+                return result.comments
+            }
+            guard let nextCursor = result.nextCursor else {
+                return []
+            }
+            cursor = nextCursor
+        }
+        return []
+    }
+
+    public func fetchCommentsPage(
+        aid: Int64,
+        cursor: FocusVideoCommentCursor? = nil
+    ) async throws -> FocusVideoCommentsPage {
+        guard aid > 0 else {
+            return FocusVideoCommentsPage(comments: [], totalCount: 0, nextCursor: nil)
+        }
+
         let cookies = await cookieProvider.loadCookies()
         let referer = "https://www.bilibili.com/video/av\(aid)/"
-        let query = try await signedWBIQuery(
+        let data = try await loadWBIData(
+            endpoint: BiliAPIContractCatalog.require(
+                "common.comment.reply_by_session_id"
+            ).url,
             parameters: [
                 "type": "1",
                 "oid": String(aid),
-                "pn": String(max(page, 1)),
-                "ps": "20",
-                "sort": "2",
+                "mode": "3",
+                "pagination_str": Self.commentPaginationString(
+                    offset: cursor?.nextOffset ?? ""
+                ),
+                "web_location": "1315875",
             ],
             referer: referer,
             cookies: cookies
         )
-        let url = URL(string: "https://api.bilibili.com/x/v2/reply/wbi/main?\(query)")!
-        let data = try await loadData(for: makeRequest(url: url, referer: referer, cookies: cookies))
-        return try Self.decodeCommentsResponse(data)
+        return try Self.decodeCommentsPageResponse(data)
     }
 
     public func fetchDanmakuView(aid: Int64, cid: Int64) async throws -> FocusVideoDanmakuView {
@@ -457,7 +563,7 @@ public actor FocusVideoDetailService {
         guard let url = components.url else {
             throw ServiceError.invalidResponse
         }
-        var request = makeRequest(url: url, referer: referer, cookies: cookies)
+        var request = Self.makeRequest(url: url, referer: referer, cookies: cookies)
         request.setValue("application/octet-stream, */*", forHTTPHeaderField: "Accept")
         let data = try await loadData(for: request)
         if let apiError = Self.binaryAPIError(data) {
@@ -480,51 +586,29 @@ public actor FocusVideoDetailService {
         }
         let cookies = await cookieProvider.loadCookies()
         let referer = "https://www.bilibili.com/video/av\(aid)/"
-        var lastError: ServiceError = .invalidResponse
-
-        for attempt in 0 ..< 3 {
-            let query = try await signedWBIQuery(
-                parameters: [
-                    "oid": String(cid),
-                    "type": "1",
-                    "pid": String(aid),
-                    "segment_index": String(segmentIndex),
-                    "web_location": "1550101",
-                ],
-                referer: referer,
-                cookies: cookies
-            )
-            guard let url = URL(string: "https://api.bilibili.com/x/v2/dm/wbi/web/seg.so?\(query)") else {
-                throw ServiceError.invalidResponse
-            }
-            var request = makeRequest(url: url, referer: referer, cookies: cookies)
-            request.setValue("application/octet-stream, */*", forHTTPHeaderField: "Accept")
-            let (data, response) = try await requestLoader(request)
-            guard let httpResponse = response as? HTTPURLResponse else {
-                throw ServiceError.invalidResponse
-            }
-            if httpResponse.statusCode == 403, attempt < 2 {
-                invalidateWBIKey()
-                continue
-            }
-            guard (200 ..< 300).contains(httpResponse.statusCode) else {
-                throw ServiceError.invalidResponse
-            }
-            if let apiError = Self.binaryAPIError(data) {
-                lastError = apiError
-                if case .api(code: -403, message: _) = apiError, attempt < 2 {
-                    invalidateWBIKey()
-                    continue
-                }
-                throw apiError
-            }
-            do {
-                return try Self.decodeDanmakuSegment(data)
-            } catch {
-                throw ServiceError.invalidResponse
-            }
+        let data = try await loadWBIData(
+            endpoint: BiliAPIContractCatalog.require(
+                "video.danmaku.get_danmaku"
+            ).url,
+            parameters: [
+                "oid": String(cid),
+                "type": "1",
+                "pid": String(aid),
+                "segment_index": String(segmentIndex),
+                "web_location": "1550101",
+            ],
+            referer: referer,
+            cookies: cookies,
+            accept: "application/octet-stream, */*"
+        )
+        if let apiError = Self.binaryAPIError(data) {
+            throw apiError
         }
-        throw lastError
+        do {
+            return try Self.decodeDanmakuSegment(data)
+        } catch {
+            throw ServiceError.invalidResponse
+        }
     }
 
     public func fetchPlayback(bvid: String, cid: Int64) async throws -> FocusVideoPlaybackSource {
@@ -537,7 +621,7 @@ public actor FocusVideoDetailService {
             "fourk": "1",
             "otype": "json",
         ]
-        let headers = Self.mediaHeaders(cookies: cookies, referer: referer)
+        let headers = Self.mediaHeaders(referer: referer)
 
         var progressiveParameters = baseParameters
         progressiveParameters["fnval"] = "0"
@@ -565,6 +649,29 @@ public actor FocusVideoDetailService {
             cookies: cookies
         )
         return try Self.decodePlaybackResponse(dashData, headers: headers)
+    }
+
+    public func fetchPlaybackResume(aid: Int64, cid: Int64) async throws -> FocusVideoPlaybackResume {
+        guard aid > 0, cid > 0 else {
+            throw ServiceError.invalidResponse
+        }
+
+        let cookies = await cookieProvider.loadCookies()
+        let referer = "https://www.bilibili.com/video/av\(aid)/"
+        let data = try await loadWBIData(
+            endpoint: BiliAPIContractCatalog.require(
+                "video.info.get_player_info"
+            ).url,
+            parameters: [
+                "aid": String(aid),
+                "cid": String(cid),
+                "isGaiaAvoided": "false",
+                "web_location": "1315873",
+            ],
+            referer: referer,
+            cookies: cookies
+        )
+        return try Self.decodePlaybackResumeResponse(data)
     }
 
     public nonisolated static func decodeDetailResponse(_ data: Data) throws -> FocusVideoDetail {
@@ -627,10 +734,38 @@ public actor FocusVideoDetailService {
     }
 
     public nonisolated static func decodeCommentsResponse(_ data: Data) throws -> [FocusVideoComment] {
+        try decodeCommentsPageResponse(data).comments
+    }
+
+    public nonisolated static func decodeCommentsPageResponse(
+        _ data: Data
+    ) throws -> FocusVideoCommentsPage {
         let root = try decodeRootObject(data)
         try validateAPIResponse(root)
         let replies = root.arrayValue(at: ["data", "replies"]) ?? []
-        return replies.compactMap { ($0 as? [String: Any]).flatMap(decodeComment(_:)) }
+        let comments = replies.compactMap {
+            ($0 as? [String: Any]).flatMap(decodeComment(_:))
+        }
+        let totalCount = root.int64Value(at: ["data", "cursor", "all_count"])
+            ?? root.int64Value(at: ["data", "page", "count"])
+            ?? Int64(comments.count)
+        let nextOffset = root.stringValue(
+            at: ["data", "cursor", "pagination_reply", "next_offset"]
+        )
+        return FocusVideoCommentsPage(
+            comments: comments,
+            totalCount: totalCount,
+            nextCursor: FocusVideoCommentCursor(nextOffset: nextOffset)
+        )
+    }
+
+    private nonisolated static func commentPaginationString(offset: String) -> String {
+        let data = try? JSONSerialization.data(
+            withJSONObject: ["offset": offset],
+            options: [.sortedKeys]
+        )
+        return data.flatMap { String(data: $0, encoding: .utf8) }
+            ?? #"{"offset":""}"#
     }
 
     private nonisolated static func decodeComment(_ reply: [String: Any]) -> FocusVideoComment? {
@@ -654,6 +789,7 @@ public actor FocusVideoDetailService {
             likes: reply.int64Value(at: ["like"]) ?? 0,
             replies: reply.int64Value(at: ["rcount"]) ?? 0,
             publishedAt: reply.int64Value(at: ["ctime"]) ?? 0,
+            isLiked: (reply.intValue(at: ["action"]) ?? 0) == 1,
             previewReplies: previewReplies
         )
     }
@@ -934,14 +1070,31 @@ public actor FocusVideoDetailService {
         )
     }
 
+    public nonisolated static func decodePlaybackResumeResponse(
+        _ data: Data
+    ) throws -> FocusVideoPlaybackResume {
+        let root = try decodeRootObject(data)
+        try validateAPIResponse(root)
+        guard let payload = root.dictionaryValue(at: ["data"]) else {
+            throw ServiceError.invalidResponse
+        }
+        return FocusVideoPlaybackResume(
+            cid: max(payload.int64Value(at: ["last_play_cid"]) ?? 0, 0),
+            positionMilliseconds: max(payload.int64Value(at: ["last_play_time"]) ?? 0, 0)
+        )
+    }
+
     private func loadPlayURLResponse(
         parameters: [String: String],
         referer: String,
         cookies: [HTTPCookie]
     ) async throws -> Data {
-        let query = try await signedWBIQuery(parameters: parameters, referer: referer, cookies: cookies)
-        let url = URL(string: "https://api.bilibili.com/x/player/wbi/playurl?\(query)")!
-        return try await loadData(for: makeRequest(url: url, referer: referer, cookies: cookies))
+        try await loadWBIData(
+            endpoint: BiliAPIContractCatalog.require("video.info.playurl").url,
+            parameters: parameters,
+            referer: referer,
+            cookies: cookies
+        )
     }
 
     private func loadUnsignedPlayURLResponse(
@@ -956,62 +1109,61 @@ public actor FocusVideoDetailService {
         guard let url = components.url else {
             throw ServiceError.invalidResponse
         }
-        return try await loadData(for: makeRequest(url: url, referer: referer, cookies: cookies))
+        return try await loadData(for: Self.makeRequest(url: url, referer: referer, cookies: cookies))
     }
 
-    private func signedWBIQuery(
+    private func loadWBIData(
+        endpoint: URL,
         parameters: [String: String],
         referer: String,
+        cookies: [HTTPCookie],
+        accept: String = "application/json, text/plain, */*"
+    ) async throws -> Data {
+        let navigationRequest = Self.makeRequest(
+            url: BiliAPIContractCatalog.require("credential.info.valid").url,
+            referer: referer,
+            cookies: cookies
+        )
+        let response: WBISigner.HTTPResponse
+        do {
+            response = try await wbiSigner.execute(
+                parameters: parameters,
+                navigationRequest: navigationRequest,
+                requestLoader: requestLoader
+            ) { signedQuery in
+                guard var components = URLComponents(
+                    url: endpoint,
+                    resolvingAgainstBaseURL: false
+                ) else {
+                    throw WBISigner.SigningError.invalidRequest
+                }
+                components.percentEncodedQuery = signedQuery
+                guard let url = components.url else {
+                    throw WBISigner.SigningError.invalidRequest
+                }
+                var request = Self.makeRequest(
+                    url: url,
+                    referer: referer,
+                    cookies: cookies
+                )
+                request.setValue(accept, forHTTPHeaderField: "Accept")
+                return request
+            }
+        } catch is WBISigner.SigningError {
+            throw ServiceError.invalidResponse
+        }
+
+        guard (200 ..< 300).contains(response.response.statusCode) else {
+            throw ServiceError.invalidResponse
+        }
+        return response.data
+    }
+
+    private nonisolated static func makeRequest(
+        url: URL,
+        referer: String,
         cookies: [HTTPCookie]
-    ) async throws -> String {
-        let key = try await wbiKey(referer: referer, cookies: cookies)
-        var signedParameters = parameters
-        signedParameters["wts"] = String(Int(Date().timeIntervalSince1970))
-        let query = signedParameters.keys.sorted().map { name in
-            let value = Self.encodedWBIValue(signedParameters[name] ?? "")
-            return "\(name)=\(value)"
-        }.joined(separator: "&")
-        return "\(query)&w_rid=\(Self.md5Hex(query + key))"
-    }
-
-    private func wbiKey(referer: String, cookies: [HTTPCookie]) async throws -> String {
-        if let cachedWBIKey, Date() < cachedWBIKeyExpiration {
-            return cachedWBIKey
-        }
-
-        let url = URL(string: "https://api.bilibili.com/x/web-interface/nav")!
-        let data = try await loadData(for: makeRequest(url: url, referer: referer, cookies: cookies))
-        let root = try Self.decodeRootObject(data)
-        try Self.validateAPIResponse(root)
-        guard
-            let imageURL = root.stringValue(at: ["data", "wbi_img", "img_url"]),
-            let subtitleURL = root.stringValue(at: ["data", "wbi_img", "sub_url"])
-        else {
-            throw ServiceError.invalidResponse
-        }
-
-        let imageKey = imageURL.split(separator: "/").last?.split(separator: ".").first.map(String.init) ?? ""
-        let subtitleKey = subtitleURL.split(separator: "/").last?.split(separator: ".").first.map(String.init) ?? ""
-        let rawCharacters = Array(imageKey + subtitleKey)
-        let mixed = Self.wbiMixinTable.compactMap { index in
-            rawCharacters.indices.contains(index) ? rawCharacters[index] : nil
-        }
-        let key = String(mixed.prefix(32))
-        guard key.count == 32 else {
-            throw ServiceError.invalidResponse
-        }
-
-        cachedWBIKey = key
-        cachedWBIKeyExpiration = Date().addingTimeInterval(30 * 60)
-        return key
-    }
-
-    private func invalidateWBIKey() {
-        cachedWBIKey = nil
-        cachedWBIKeyExpiration = .distantPast
-    }
-
-    private func makeRequest(url: URL, referer: String, cookies: [HTTPCookie]) -> URLRequest {
+    ) -> URLRequest {
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.timeoutInterval = 20
@@ -1033,16 +1185,12 @@ public actor FocusVideoDetailService {
         return data
     }
 
-    private nonisolated static func mediaHeaders(cookies: [HTTPCookie], referer: String) -> [String: String] {
-        var headers = [
+    private nonisolated static func mediaHeaders(referer: String) -> [String: String] {
+        [
             "User-Agent": userAgent,
             "Referer": referer,
             "Origin": "https://www.bilibili.com",
         ]
-        if let cookieHeader = HTTPCookie.requestHeaderFields(with: cookies)["Cookie"], !cookieHeader.isEmpty {
-            headers["Cookie"] = cookieHeader
-        }
-        return headers
     }
 
     private nonisolated static func decodeRootObject(_ data: Data) throws -> [String: Any] {
@@ -1173,18 +1321,6 @@ public actor FocusVideoDetailService {
         return URL(string: value)
     }
 
-    private nonisolated static func encodedWBIValue(_ value: String) -> String {
-        let filtered = value.filter { !"!'()*".contains($0) }
-        var allowed = CharacterSet.urlQueryAllowed
-        allowed.remove(charactersIn: ":#[]@!$&'()*+,;=/?%")
-        return filtered.addingPercentEncoding(withAllowedCharacters: allowed) ?? filtered
-    }
-
-    private nonisolated static func md5Hex(_ value: String) -> String {
-        Insecure.MD5.hash(data: Data(value.utf8))
-            .map { String(format: "%02x", $0) }
-            .joined()
-    }
 }
 
 private enum FocusProtobufError: Error {

@@ -2,10 +2,13 @@ package org.bilibilifocus.core.service
 
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
 import org.bilibilifocus.core.cookie.CookieProvider
-import org.bilibilifocus.core.crypto.md5Hex
+import org.bilibilifocus.core.model.CommentCursor
+import org.bilibilifocus.core.model.CommentPage
 import org.bilibilifocus.core.model.VideoAuthor
 import org.bilibilifocus.core.model.VideoComment
 import org.bilibilifocus.core.model.VideoDanmakuSegment
@@ -21,6 +24,7 @@ class VideoInfoService(
     private val cookieProvider: CookieProvider,
     private val httpClient: HttpClient,
     private val userAgent: String = "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+    private val wbiSigner: WbiSigner = WbiSigner(cookieProvider, httpClient, userAgent),
 ) {
     sealed class ServiceError(message: String) : Exception(message) {
         data object LoginRequired : ServiceError("需要登录")
@@ -29,25 +33,13 @@ class VideoInfoService(
     }
 
     private val json = Json { ignoreUnknownKeys = true }
-    private var wbiMixedKey: String? = null
 
-    private val wbiMixinTable = intArrayOf(
-        46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49,
-        33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40,
-        61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11,
-        36, 20, 52, 34, 44,
-    )
-
-    private suspend fun buildHeaders(): Map<String, String> {
-        val cookies = cookieProvider.loadCookies()
-        val headers = mutableMapOf(
+    private suspend fun buildHeaders(targetUrl: String): Map<String, String> {
+        val headers = mapOf(
             "User-Agent" to userAgent,
             "Referer" to "https://www.bilibili.com/",
         )
-        if (cookies.isNotEmpty()) {
-            headers["Cookie"] = cookies.joinToString("; ") { "${it.name}=${it.value}" }
-        }
-        return headers
+        return cookieProvider.attachCookies(headers, targetUrl)
     }
 
     private fun parseDataField(body: String): JsonObject {
@@ -61,60 +53,32 @@ class VideoInfoService(
         return root["data"] as? JsonObject ?: throw ServiceError.InvalidResponse
     }
 
-    private suspend fun ensureWbiKey() {
-        if (wbiMixedKey != null) return
-        val response = httpClient.get(
-            "https://api.bilibili.com/x/web-interface/nav",
-            buildHeaders(),
-        )
-        val root = json.parseToJsonElement(response.body) as? JsonObject
-            ?: throw ServiceError.InvalidResponse
-        val data = root["data"] as? JsonObject
-            ?: throw ServiceError.InvalidResponse
-        val wbiImg = data["wbi_img"] as? JsonObject
-            ?: throw ServiceError.InvalidResponse
-
-        val imgUrl = wbiImg["img_url"]?.jsonPrimitive?.content
-            ?: throw ServiceError.InvalidResponse
-        val subUrl = wbiImg["sub_url"]?.jsonPrimitive?.content
-            ?: throw ServiceError.InvalidResponse
-
-        val imgKey = imgUrl.substringAfterLast("/").substringBefore(".")
-        val subKey = subUrl.substringAfterLast("/").substringBefore(".")
-        val combined = imgKey + subKey
-
-        wbiMixedKey = buildString {
-            for (idx in wbiMixinTable) {
-                if (idx < combined.length) append(combined[idx])
+    private suspend fun executeWbiText(
+        endpoint: String,
+        parameters: Map<String, String>,
+    ): HttpResponse {
+        val result = try {
+            wbiSigner.execute(parameters) { signedQuery ->
+                val url = "$endpoint?$signedQuery"
+                val response = httpClient.get(url, buildHeaders(url))
+                val apiCode = runCatching {
+                    (json.parseToJsonElement(response.body) as? JsonObject)?.intValueAt("code")
+                }.getOrNull()
+                WbiRequestResult(response, response.statusCode, apiCode)
             }
-        }.take(32)
-    }
-
-    private fun invalidateWbiKey() {
-        wbiMixedKey = null
-    }
-
-    private suspend fun signWbi(vararg params: Pair<String, String>): String {
-        ensureWbiKey()
-        val key = wbiMixedKey ?: return ""
-
-        val wts = currentEpochSeconds().toString()
-        val all = params.toMutableList()
-        all.add("wts" to wts)
-        all.sortBy { it.first }
-
-        val raw = all.joinToString("&") { "${it.first}=${it.second}" } + key
-        val wrid = md5Hex(raw)
-
-        return all.joinToString("&") { "${it.first}=${it.second}" } + "&w_rid=$wrid"
+        } catch (_: WbiSigner.SigningUnavailable) {
+            throw ServiceError.InvalidResponse
+        }
+        return result.value
     }
 
     suspend fun fetchVideoInfo(id: String): VideoInfo {
         val param = if (id.startsWith("av")) "aid=${id.removePrefix("av")}" else "bvid=$id"
+        val url = "${BiliApiContractCatalog.require("video.info.info").url}?$param"
         val data = parseDataField(
             httpClient.get(
-                "https://api.bilibili.com/x/web-interface/view?$param",
-                buildHeaders(),
+                url,
+                buildHeaders(url),
             ).body
         )
 
@@ -127,12 +91,16 @@ class VideoInfoService(
             ?: emptyList()
 
         val cid = data["cid"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0
+        val aid = data["aid"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0
         val pages = parsePages(data)
         val episodeGroups = parseEpisodeGroups(data)
+        val bvid = data["bvid"]?.jsonPrimitive?.content ?: id
+        val playbackProgress = parsePlaybackProgress(data)
+            ?: fetchPlaybackProgress(aid = aid, cid = cid)
 
         return VideoInfo(
-            bvid = data["bvid"]?.jsonPrimitive?.content ?: id,
-            aid = data["aid"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0,
+            bvid = bvid,
+            aid = aid,
             cid = cid,
             title = data["title"]?.jsonPrimitive?.content ?: "",
             description = data["desc"]?.jsonPrimitive?.content ?: "",
@@ -159,24 +127,66 @@ class VideoInfoService(
             playerURL = null,
             width = dimension?.get("width")?.jsonPrimitive?.content?.toIntOrNull() ?: 0,
             height = dimension?.get("height")?.jsonPrimitive?.content?.toIntOrNull() ?: 0,
+            lastPlaybackCid = playbackProgress?.cid,
+            lastPlaybackPositionMillis = playbackProgress?.positionMillis ?: 0,
         )
+    }
+
+    private suspend fun fetchPlaybackProgress(
+        aid: Long,
+        cid: Long,
+    ): PlaybackProgress? {
+        if (aid <= 0 || cid <= 0) return null
+        return try {
+            val response = executeWbiText(
+                endpoint = BiliApiContractCatalog.require("video.info.get_player_info").url,
+                parameters = mapOf(
+                    "aid" to aid.toString(),
+                    "cid" to cid.toString(),
+                    "isGaiaAvoided" to "false",
+                    "web_location" to "1315873",
+                ),
+            )
+            if (response.statusCode !in 200..299) return null
+            val data = parseDataField(response.body)
+            parsePlaybackProgress(data)
+        } catch (_: Exception) {
+            // Resume metadata is optional. A signed-out account or a temporary
+            // player-info failure must not prevent the video detail from loading.
+            null
+        }
+    }
+
+    private fun parsePlaybackProgress(data: JsonObject): PlaybackProgress? {
+        val lastCid = data["last_play_cid"]
+            ?.jsonPrimitive
+            ?.content
+            ?.toLongOrNull()
+            ?.takeIf { it > 0 }
+            ?: return null
+        val positionMillis = data["last_play_time"]
+            ?.jsonPrimitive
+            ?.content
+            ?.toLongOrNull()
+            ?.coerceAtLeast(0)
+            ?: return null
+        return PlaybackProgress(lastCid, positionMillis)
     }
 
     suspend fun fetchPlayerUrl(bvid: String, cid: Long): String? {
         return try {
-            val signed = signWbi(
-                "bvid" to bvid,
-                "cid" to cid.toString(),
-                "qn" to "80",
-                "fnval" to "4048",
-                "fourk" to "1",
+            val response = executeWbiText(
+                endpoint = BiliApiContractCatalog.require("video.info.playurl").url,
+                parameters = mapOf(
+                    "bvid" to bvid,
+                    "cid" to cid.toString(),
+                    "qn" to "80",
+                    "fnval" to "4048",
+                    "fourk" to "1",
+                ),
             )
-            val data = parseDataField(
-                httpClient.get(
-                    "https://api.bilibili.com/x/player/wbi/playurl?$signed",
-                    buildHeaders(),
-                ).body
-            )
+            if (response.statusCode !in 200..299) throw ServiceError.InvalidResponse
+            val data = parseDataField(response.body)
 
             // Try durl (progressive FLV/MP4) first
             val durl = data["durl"] as? kotlinx.serialization.json.JsonArray
@@ -197,35 +207,58 @@ class VideoInfoService(
         }
     }
 
+    /**
+     * Source-compatible first-page API. Further pages require the opaque
+     * offset returned by [fetchCommentPage], not a numeric page index.
+     */
     suspend fun fetchComments(oid: Long, page: Int = 1): Pair<List<VideoComment>, Int> {
+        if (page < 1) return emptyList<VideoComment>() to 0
+        val result = fetchCommentPage(oid)
+        return result.comments to result.totalCount.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+    }
+
+    suspend fun fetchCommentPage(
+        oid: Long,
+        cursor: CommentCursor = CommentCursor(),
+    ): CommentPage {
         return try {
-            val signed = signWbi(
-                "type" to "1",
-                "oid" to oid.toString(),
-                "pn" to page.toString(),
-                "ps" to "20",
-                "sort" to "2",
+            val pagination = buildJsonObject {
+                put("offset", cursor.nextOffset.orEmpty())
+            }.toString()
+            val response = executeWbiText(
+                endpoint = BiliApiContractCatalog.require("common.comment.reply_by_session_id").url,
+                parameters = mapOf(
+                    "type" to "1",
+                    "oid" to oid.toString(),
+                    "mode" to "3",
+                    "pagination_str" to pagination,
+                    "web_location" to "1315875",
+                ),
             )
-            val data = parseDataField(
-                httpClient.get(
-                    "https://api.bilibili.com/x/v2/reply/wbi/main?$signed",
-                    buildHeaders(),
-                ).body
-            )
+            if (response.statusCode !in 200..299) throw ServiceError.InvalidResponse
+            val data = parseDataField(response.body)
             val replies = data["replies"] as? kotlinx.serialization.json.JsonArray
             val comments = replies?.mapNotNull { parseComment(it as? JsonObject) } ?: emptyList()
-            val total = data["page"]?.let { it as? JsonObject }?.get("count")
-                ?.jsonPrimitive?.content?.toIntOrNull() ?: 0
-            comments to total
+            val total = data.longValueAt("cursor", "all_count")
+                ?: data.longValueAt("page", "count")
+                ?: 0L
+            val nextOffset = data.stringValueAt("cursor", "pagination_reply", "next_offset")
+                ?.takeIf(String::isNotBlank)
+            CommentPage(
+                comments = comments,
+                totalCount = total,
+                cursor = CommentCursor(nextOffset),
+            )
         } catch (_: Exception) {
-            emptyList<VideoComment>() to 0
+            CommentPage(emptyList(), 0L, CommentCursor())
         }
     }
 
     suspend fun fetchDanmakuView(aid: Long, cid: Long): VideoDanmakuView {
+        val url = "https://api.bilibili.com/x/v2/dm/web/view?type=1&oid=$cid&pid=$aid"
         val response = httpClient.getBytes(
-            "https://api.bilibili.com/x/v2/dm/web/view?type=1&oid=$cid&pid=$aid",
-            buildHeaders() + mapOf("Accept" to "application/octet-stream, */*"),
+            url,
+            buildHeaders(url) + mapOf("Accept" to "application/octet-stream, */*"),
         )
         if (response.statusCode !in 200..299) throw ServiceError.InvalidResponse
         parseBinaryApiError(response.body)?.let { throw it }
@@ -242,42 +275,40 @@ class VideoInfoService(
         segmentIndex: Int,
     ): VideoDanmakuSegment {
         require(segmentIndex > 0) { "segmentIndex 必须从 1 开始" }
-        var lastError: ServiceError = ServiceError.InvalidResponse
-        repeat(3) { attempt ->
-            val signed = signWbi(
-                "oid" to cid.toString(),
-                "type" to "1",
-                "pid" to aid.toString(),
-                "segment_index" to segmentIndex.toString(),
-                "web_location" to "1550101",
-            )
-            val response = httpClient.getBytes(
-                "https://api.bilibili.com/x/v2/dm/wbi/web/seg.so?$signed",
-                buildHeaders() + mapOf("Accept" to "application/octet-stream, */*"),
-            )
-            if (response.statusCode == 403 && attempt < 2) {
-                invalidateWbiKey()
-                return@repeat
+        val endpoint = BiliApiContractCatalog.require("video.danmaku.get_danmaku").url
+        val result = try {
+            wbiSigner.execute(
+                mapOf(
+                    "oid" to cid.toString(),
+                    "type" to "1",
+                    "pid" to aid.toString(),
+                    "segment_index" to segmentIndex.toString(),
+                    "web_location" to "1550101",
+                ),
+            ) { signedQuery ->
+                val url = "$endpoint?$signedQuery"
+                val response = httpClient.getBytes(
+                    url,
+                    buildHeaders(url) + mapOf("Accept" to "application/octet-stream, */*"),
+                )
+                WbiRequestResult(
+                    value = response,
+                    httpStatusCode = response.statusCode,
+                    apiCode = parseBinaryApiError(response.body)?.code,
+                )
             }
-            if (response.statusCode !in 200..299) throw ServiceError.InvalidResponse
-
-            val apiError = parseBinaryApiError(response.body)
-            if (apiError != null) {
-                lastError = apiError
-                if (apiError.code == -403 && attempt < 2) {
-                    invalidateWbiKey()
-                    return@repeat
-                }
-                throw apiError
-            }
-
-            return try {
-                VideoDanmakuDecoder.decodeSegment(response.body)
-            } catch (_: ProtobufDecodingException) {
-                throw ServiceError.InvalidResponse
-            }
+        } catch (_: WbiSigner.SigningUnavailable) {
+            throw ServiceError.InvalidResponse
         }
-        throw lastError
+        val response = result.value
+        if (response.statusCode !in 200..299) throw ServiceError.InvalidResponse
+
+        parseBinaryApiError(response.body)?.let { throw it }
+        return try {
+            VideoDanmakuDecoder.decodeSegment(response.body)
+        } catch (_: ProtobufDecodingException) {
+            throw ServiceError.InvalidResponse
+        }
     }
 
     private fun parseBinaryApiError(bytes: ByteArray): ServiceError.Api? {
@@ -400,5 +431,10 @@ class VideoInfoService(
             return null
         }
     }
+
+    private data class PlaybackProgress(
+        val cid: Long,
+        val positionMillis: Long,
+    )
 
 }

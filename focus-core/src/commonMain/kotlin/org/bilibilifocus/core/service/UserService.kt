@@ -6,7 +6,6 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import org.bilibilifocus.core.cookie.CookieProvider
-import org.bilibilifocus.core.crypto.md5Hex
 import org.bilibilifocus.core.model.UserArticle
 import org.bilibilifocus.core.model.UserCollectionPage
 import org.bilibilifocus.core.model.UserContentCollection
@@ -18,6 +17,7 @@ class UserService(
     private val cookieProvider: CookieProvider,
     private val httpClient: HttpClient,
     private val userAgent: String = "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+    private val wbiSigner: WbiSigner = WbiSigner(cookieProvider, httpClient, userAgent),
 ) {
     sealed class ServiceError(message: String) : Exception(message) {
         data object InvalidResponse : ServiceError("接口返回无效数据")
@@ -26,12 +26,11 @@ class UserService(
     }
 
     private val json = Json { ignoreUnknownKeys = true }
-    private val keyCache = WBIKeyCache()
 
     suspend fun fetchUserInfo(mid: Long): UserProfile {
-        val query = signedWbiQuery(mapOf("mid" to mid.toString(), "w_webid" to ""))
-        val payload = requestObject(
-            url = "https://api.bilibili.com/x/space/wbi/acc/info?$query",
+        val payload = requestWbiObject(
+            endpoint = BiliApiContractCatalog.require("user.info.info").url,
+            parameters = mapOf("mid" to mid.toString(), "w_webid" to ""),
             referer = "https://space.bilibili.com/$mid",
         ) ?: throw ServiceError.InvalidResponse
         requireSuccessful(payload)
@@ -52,7 +51,7 @@ class UserService(
 
     suspend fun fetchRelationInfo(mid: Long): Pair<Long, Long> {
         val payload = requestObject(
-            url = "https://api.bilibili.com/x/relation/stat?vmid=$mid",
+            url = BiliApiContractCatalog.require("user.info.relation_stat").url + "?vmid=$mid",
             referer = "https://space.bilibili.com/$mid",
         ) ?: return 0L to 0L
         val data = payload.dictionaryValueAt("data") ?: return 0L to 0L
@@ -65,8 +64,9 @@ class UserService(
     suspend fun fetchUserVideoPage(mid: Long, page: Int = 1, pageSize: Int = 12): UserVideoPage {
         val ps = pageSize.coerceIn(1, 50)
         val pn = page.coerceAtLeast(1)
-        val query = signedWbiQuery(
-            mapOf(
+        val payload = requestWbiObject(
+            endpoint = BiliApiContractCatalog.require("user.info.video").url,
+            parameters = mapOf(
                 "mid" to mid.toString(),
                 "ps" to ps.toString(),
                 "pn" to pn.toString(),
@@ -75,10 +75,7 @@ class UserService(
                 "order" to "pubdate",
                 "order_avoided" to "true",
                 "platform" to "web",
-            )
-        )
-        val payload = requestObject(
-            url = "https://api.bilibili.com/x/space/wbi/arc/search?$query",
+            ),
             referer = "https://space.bilibili.com/$mid",
         ) ?: return UserVideoPage(0, emptyList(), null)
         if (payload.intValueAt("code") != 0) return UserVideoPage(0, emptyList(), null)
@@ -94,15 +91,13 @@ class UserService(
     }
 
     suspend fun fetchUserCollections(mid: Long): List<UserContentCollection> {
-        val query = signedWbiQuery(
-            mapOf(
+        val payload = requestWbiObject(
+            endpoint = BiliApiContractCatalog.require("user.info.channel_list").url,
+            parameters = mapOf(
                 "mid" to mid.toString(),
                 "page_num" to "1",
                 "page_size" to "10",
-            )
-        )
-        val payload = requestObject(
-            url = "https://api.bilibili.com/x/polymer/web-space/seasons_series_list?$query",
+            ),
             referer = "https://space.bilibili.com/$mid",
         ) ?: return emptyList()
         if (payload.intValueAt("code") != 0) return emptyList()
@@ -117,16 +112,14 @@ class UserService(
     }
 
     suspend fun fetchUserArticles(mid: Long): List<UserArticle> {
-        val query = signedWbiQuery(
-            mapOf(
+        val payload = requestWbiObject(
+            endpoint = BiliApiContractCatalog.require("user.info.article").url,
+            parameters = mapOf(
                 "mid" to mid.toString(),
                 "pn" to "1",
                 "ps" to "8",
                 "sort" to "publish_time",
-            )
-        )
-        val payload = requestObject(
-            url = "https://api.bilibili.com/x/space/wbi/article?$query",
+            ),
             referer = "https://space.bilibili.com/$mid",
         ) ?: return emptyList()
         if (payload.intValueAt("code") != 0) return emptyList()
@@ -168,8 +161,8 @@ class UserService(
     ): UserCollectionPage {
         val pn = page.coerceAtLeast(1)
         val ps = pageSize.coerceIn(1, 50)
-        val query = when (collection.kind) {
-            UserContentCollection.Kind.SEASON -> signedWbiQuery(
+        val parameters = when (collection.kind) {
+            UserContentCollection.Kind.SEASON ->
                 mapOf(
                     "mid" to collection.ownerMid.toString(),
                     "season_id" to collection.rawId.toString(),
@@ -177,8 +170,7 @@ class UserService(
                     "page_num" to pn.toString(),
                     "page_size" to ps.toString(),
                 )
-            )
-            UserContentCollection.Kind.SERIES -> signedWbiQuery(
+            UserContentCollection.Kind.SERIES ->
                 mapOf(
                     "mid" to collection.ownerMid.toString(),
                     "series_id" to collection.rawId.toString(),
@@ -186,14 +178,16 @@ class UserService(
                     "ps" to ps.toString(),
                     "sort" to "desc",
                 )
-            )
         }
         val endpoint = when (collection.kind) {
-            UserContentCollection.Kind.SEASON -> "https://api.bilibili.com/x/polymer/web-space/seasons_archives_list"
-            UserContentCollection.Kind.SERIES -> "https://api.bilibili.com/x/series/archives"
+            UserContentCollection.Kind.SEASON ->
+                BiliApiContractCatalog.require("user.info.channel_video_season").url
+            UserContentCollection.Kind.SERIES ->
+                BiliApiContractCatalog.require("user.info.channel_video_series").url
         }
-        val payload = requestObject(
-            url = "$endpoint?$query",
+        val payload = requestWbiObject(
+            endpoint = endpoint,
+            parameters = parameters,
             referer = "https://space.bilibili.com/${collection.ownerMid}",
         ) ?: return UserCollectionPage(collection, emptyList(), null)
         if (payload.intValueAt("code") != 0) return UserCollectionPage(collection, emptyList(), null)
@@ -269,24 +263,39 @@ class UserService(
         )
     }
 
-    private suspend fun signedWbiQuery(parameters: Map<String, String>): String {
-        val mixinKey = keyCache.mixinKey()
-        val values = parameters + ("wts" to currentEpochSeconds().toString())
-        val query = values.toSortedMap().entries.joinToString("&") { (key, rawValue) ->
-            val sanitized = rawValue.filterNot { it in "!'()*" }
-            "$key=$sanitized"
+    private suspend fun requestWbiObject(
+        endpoint: String,
+        parameters: Map<String, String>,
+        referer: String,
+    ): JsonObject? {
+        val result = try {
+            wbiSigner.execute(parameters) { signedQuery ->
+                val url = "$endpoint?$signedQuery"
+                val response = httpClient.get(url, buildHeaders(url, referer))
+                val payload = parseObject(response.body)
+                WbiRequestResult(
+                    value = payload,
+                    httpStatusCode = response.statusCode,
+                    apiCode = payload?.intValueAt("code"),
+                )
+            }
+        } catch (_: WbiSigner.SigningUnavailable) {
+            throw ServiceError.SigningUnavailable
         }
-        return "$query&w_rid=${md5Hex(query + mixinKey)}"
+        if (result.httpStatusCode !in 200..299) return null
+        return result.value
     }
 
     private suspend fun requestObject(url: String, referer: String): JsonObject? {
-        val response = httpClient.get(url, buildHeaders(referer))
+        val response = httpClient.get(url, buildHeaders(url, referer))
         if (response.statusCode !in 200..299) return null
-        return try {
-            json.parseToJsonElement(response.body) as? JsonObject
-        } catch (_: Exception) {
-            null
-        }
+        return parseObject(response.body)
+    }
+
+    private fun parseObject(body: String): JsonObject? = try {
+        json.parseToJsonElement(body) as? JsonObject
+    } catch (_: Exception) {
+        null
     }
 
     private fun requireSuccessful(payload: JsonObject) {
@@ -341,64 +350,13 @@ class UserService(
         else -> null
     }
 
-    private suspend fun buildHeaders(referer: String): Map<String, String> {
-        val cookies = cookieProvider.loadCookies()
+    private suspend fun buildHeaders(targetUrl: String, referer: String): Map<String, String> {
         val headers = mapOf(
             "User-Agent" to userAgent,
             "Referer" to referer,
             "Accept" to "application/json, text/plain, */*",
         )
-        return cookieProvider.attachCookies(headers, cookies)
+        return cookieProvider.attachCookies(headers, targetUrl)
     }
 
-    private fun JsonObject.longValueAt(vararg path: String): Long? =
-        stringValueAt(*path)?.toLongOrNull()
-
-    private inner class WBIKeyCache {
-        private var cachedKey: String? = null
-        private var expiresAt: Long = 0
-
-        suspend fun mixinKey(): String {
-            val now = currentEpochSeconds() * 1000
-            if (cachedKey != null && now < expiresAt) return cachedKey!!
-
-            val response = httpClient.get(
-                "https://api.bilibili.com/x/web-interface/nav",
-                buildHeaders("https://www.bilibili.com/"),
-            )
-            if (response.statusCode !in 200..299) throw ServiceError.SigningUnavailable
-
-            val payload = try {
-                json.parseToJsonElement(response.body) as? JsonObject
-            } catch (_: Exception) {
-                null
-            } ?: throw ServiceError.SigningUnavailable
-            if (payload.intValueAt("code") != 0) throw ServiceError.SigningUnavailable
-
-            val imgURL = payload.stringValueAt("data", "wbi_img", "img_url")
-                ?: throw ServiceError.SigningUnavailable
-            val subURL = payload.stringValueAt("data", "wbi_img", "sub_url")
-                ?: throw ServiceError.SigningUnavailable
-            val rawKey = imgURL.substringAfterLast("/").substringBefore(".") +
-                subURL.substringAfterLast("/").substringBefore(".")
-            if (rawKey.isEmpty()) throw ServiceError.SigningUnavailable
-
-            cachedKey = buildString {
-                for (index in WBI_SHUFFLE_TABLE) {
-                    if (index < rawKey.length) append(rawKey[index])
-                }
-            }.take(32)
-            expiresAt = now + 30 * 60 * 1000
-            return cachedKey!!
-        }
-    }
-
-    companion object {
-        private val WBI_SHUFFLE_TABLE = intArrayOf(
-            46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
-            27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13,
-            37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4,
-            22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 52, 34, 44,
-        )
-    }
 }

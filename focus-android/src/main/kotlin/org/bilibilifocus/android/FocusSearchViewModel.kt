@@ -1,6 +1,7 @@
 package org.bilibilifocus.android
 
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -12,22 +13,38 @@ import kotlinx.coroutines.launch
 import org.bilibilifocus.core.model.SearchQuery
 import org.bilibilifocus.core.model.SearchResultFilter
 import org.bilibilifocus.core.model.SearchResultItem
+import org.bilibilifocus.core.model.SearchResultPage
 import org.bilibilifocus.core.model.SearchResultSection
 import org.bilibilifocus.core.model.SearchVideoSortOption
 import org.bilibilifocus.core.service.SearchResultService
 
-class FocusSearchViewModel(
-    private val service: SearchResultService,
+internal fun interface SearchPageFetcher {
+    suspend fun fetchPage(
+        query: SearchQuery,
+        filter: SearchResultFilter,
+        page: Int,
+        videoSort: SearchVideoSortOption,
+    ): SearchResultPage
+}
+
+class FocusSearchViewModel internal constructor(
+    private val pageFetcher: SearchPageFetcher,
+    dispatcher: CoroutineDispatcher,
 ) {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main + kotlinx.coroutines.CoroutineExceptionHandler { _, e ->
-        _state.value = SearchUiState.Failed(e.message ?: "搜索失败")
-    })
+    constructor(service: SearchResultService) : this(
+        pageFetcher = SearchPageFetcher { query, filter, page, videoSort ->
+            service.fetchPage(query, filter, page, videoSort)
+        },
+        dispatcher = Dispatchers.Main,
+    )
+
+    private val scope = CoroutineScope(SupervisorJob() + dispatcher)
     private var searchJob: Job? = null
     private var loadMoreJob: Job? = null
 
     private var currentQuery: SearchQuery? = null
-    private var currentPage: Int = 1
-    private var hasMorePages: Boolean = false
+    private var nextVideoPage: Int? = null
+    private var requestGeneration: Long = 0
     var selectedFilter: SearchResultFilter = SearchResultFilter.ALL
         private set
     var selectedVideoSort: SearchVideoSortOption = SearchVideoSortOption.DEFAULT
@@ -45,62 +62,17 @@ class FocusSearchViewModel(
 
         val query = SearchQuery(trimmed)
         currentQuery = query
-        currentPage = 1
         selectedFilter = SearchResultFilter.ALL
         selectedVideoSort = SearchVideoSortOption.DEFAULT
-
-        searchJob?.cancel()
-        searchJob = scope.launch {
-            _state.value = SearchUiState.Loading
-            try {
-                val page = service.fetchPage(query)
-                val sections = page.sections
-                hasMorePages = page.nextPage != null
-                _state.value = if (sections.isEmpty()) {
-                    SearchUiState.Empty
-                } else {
-                    SearchUiState.Loaded(sections)
-                }
-            } catch (e: SearchResultService.ServiceError) {
-                if (e == SearchResultService.ServiceError.SigningUnavailable) {
-                    _state.value = SearchUiState.LoginRequired
-                } else {
-                    _state.value = SearchUiState.Failed(e.message ?: "搜索失败")
-                }
-            } catch (e: Exception) {
-                _state.value = SearchUiState.Failed(e.message ?: "搜索失败")
-            }
-        }
+        loadFirstPage(query, SearchResultFilter.ALL, SearchVideoSortOption.DEFAULT)
     }
 
     fun selectFilter(filter: SearchResultFilter) {
         if (filter == selectedFilter) return
         selectedFilter = filter
-        currentPage = 1
 
         val query = currentQuery ?: return
-        searchJob?.cancel()
-        searchJob = scope.launch {
-            _state.value = SearchUiState.Loading
-            try {
-                val page = service.fetchPage(query, filter, 1, selectedVideoSort)
-                hasMorePages = page.nextPage != null
-                val sections = page.sections
-                _state.value = if (sections.isEmpty()) {
-                    SearchUiState.Empty
-                } else {
-                    SearchUiState.Loaded(sections)
-                }
-            } catch (e: SearchResultService.ServiceError) {
-                if (e == SearchResultService.ServiceError.SigningUnavailable) {
-                    _state.value = SearchUiState.LoginRequired
-                } else {
-                    _state.value = SearchUiState.Failed(e.message ?: "搜索失败")
-                }
-            } catch (e: Exception) {
-                _state.value = SearchUiState.Failed(e.message ?: "搜索失败")
-            }
-        }
+        loadFirstPage(query, filter, selectedVideoSort)
     }
 
     fun selectVideoSort(sort: SearchVideoSortOption) {
@@ -108,54 +80,35 @@ class FocusSearchViewModel(
         selectedVideoSort = sort
 
         val query = currentQuery ?: return
-        searchJob?.cancel()
-        searchJob = scope.launch {
-            _state.value = SearchUiState.Loading
-            try {
-                val page = service.fetchPage(query, selectedFilter, 1, selectedVideoSort)
-                hasMorePages = page.nextPage != null
-                val sections = page.sections
-                _state.value = if (sections.isEmpty()) {
-                    SearchUiState.Empty
-                } else {
-                    SearchUiState.Loaded(sections)
-                }
-            } catch (e: SearchResultService.ServiceError) {
-                if (e == SearchResultService.ServiceError.SigningUnavailable) {
-                    _state.value = SearchUiState.LoginRequired
-                } else {
-                    _state.value = SearchUiState.Failed(e.message ?: "搜索失败")
-                }
-            } catch (e: Exception) {
-                _state.value = SearchUiState.Failed(e.message ?: "搜索失败")
-            }
-        }
+        loadFirstPage(query, selectedFilter, selectedVideoSort)
     }
 
     fun loadMoreIfNeeded(currentItemID: String) {
         val sections = (_state.value as? SearchUiState.Loaded)?.sections ?: return
-        if (!hasMorePages) return
         if (_isLoadingMore.value) return
 
         val videoSection = sections.find { it.filter == SearchResultFilter.VIDEO } ?: return
         val index = videoSection.items.indexOfLast { it.id == currentItemID }
         if (index < 0 || index < videoSection.items.size - 4) return
 
-        currentPage++
         val query = currentQuery ?: return
-        val filter = selectedFilter
-        val page = currentPage
+        val page = nextVideoPage ?: return
         val sort = selectedVideoSort
+        val generation = requestGeneration
 
         _isLoadingMore.value = true
         loadMoreJob?.cancel()
         loadMoreJob = scope.launch {
             try {
-                val newPage = service.fetchPage(query, filter, page, sort)
-                hasMorePages = newPage.nextPage != null
-                val mergedVideoItems = videoSection.items + newPage.sections
-                    .flatMap { it.items }
+                val newPage = pageFetcher.fetchPage(query, SearchResultFilter.VIDEO, page, sort)
+                if (generation != requestGeneration) return@launch
+                nextVideoPage = newPage.nextPage
+                val incomingVideoItems = newPage.sections
+                    .firstOrNull { it.filter == SearchResultFilter.VIDEO }
+                    ?.items
+                    .orEmpty()
                     .filter { it.kind == SearchResultItem.Kind.VIDEO }
+                val mergedVideoItems = (videoSection.items + incomingVideoItems)
                     .distinctBy { it.id }
                 val mergedSection = SearchResultSection(
                     filter = SearchResultFilter.VIDEO,
@@ -166,9 +119,51 @@ class FocusSearchViewModel(
                 }
                 _state.value = SearchUiState.Loaded(mergedSections)
             } catch (_: Exception) {
-                currentPage--
             } finally {
-                _isLoadingMore.value = false
+                if (generation == requestGeneration) {
+                    _isLoadingMore.value = false
+                }
+            }
+        }
+    }
+
+    private fun loadFirstPage(
+        query: SearchQuery,
+        filter: SearchResultFilter,
+        videoSort: SearchVideoSortOption,
+    ) {
+        requestGeneration++
+        val generation = requestGeneration
+        searchJob?.cancel()
+        loadMoreJob?.cancel()
+        _isLoadingMore.value = false
+        nextVideoPage = null
+
+        searchJob = scope.launch {
+            _state.value = SearchUiState.Loading
+            try {
+                val page = pageFetcher.fetchPage(query, filter, 1, videoSort)
+                if (generation != requestGeneration) return@launch
+                nextVideoPage = when (filter) {
+                    SearchResultFilter.ALL, SearchResultFilter.VIDEO -> page.nextPage
+                    else -> null
+                }
+                _state.value = if (page.sections.isEmpty()) {
+                    SearchUiState.Empty
+                } else {
+                    SearchUiState.Loaded(page.sections)
+                }
+            } catch (e: SearchResultService.ServiceError) {
+                if (generation != requestGeneration) return@launch
+                if (e == SearchResultService.ServiceError.SigningUnavailable) {
+                    _state.value = SearchUiState.LoginRequired
+                } else {
+                    _state.value = SearchUiState.Failed(e.message ?: "搜索失败")
+                }
+            } catch (e: Exception) {
+                if (generation == requestGeneration) {
+                    _state.value = SearchUiState.Failed(e.message ?: "搜索失败")
+                }
             }
         }
     }

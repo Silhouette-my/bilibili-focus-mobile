@@ -24,13 +24,14 @@ class FavoriteService(
     private val json = Json { ignoreUnknownKeys = true }
 
     suspend fun fetchFolders(mid: Long): List<FavFolder> {
-        val url = "https://api.bilibili.com/x/v3/fav/folder/created/list-all?up_mid=$mid&web_location=333.1387"
+        val url = BiliApiContractCatalog.require("favorite-list.info.list_list").url +
+            "?up_mid=$mid&web_location=333.1387"
         val data = getData(url)
         val list = data.arrayValueAt("list") ?: emptyList()
         return list.mapNotNull { element ->
             val dict = element as? JsonObject ?: return@mapNotNull null
             FavFolder(
-                id = dict.intValueAt("id")?.toLong() ?: return@mapNotNull null,
+                id = dict.longValueAt("id") ?: return@mapNotNull null,
                 title = dict.stringValueAt("title") ?: "",
                 mediaCount = dict.intValueAt("media_count") ?: 0,
                 coverURL = dict.stringValueAt("cover") ?: "",
@@ -40,7 +41,7 @@ class FavoriteService(
 
     suspend fun fetchFolderContents(mediaId: Long, page: Int = 1): List<FavResource> {
         val pn = page.coerceAtLeast(1)
-        val url = "https://api.bilibili.com/x/v3/fav/resource/list" +
+        val url = BiliApiContractCatalog.require("favorite-list.info.list_content").url +
             "?media_id=$mediaId&pn=$pn&ps=20&order=mtime&type=0&tid=0&platform=web&web_location=333.1387"
         val data = getData(url)
         val medias = data.arrayValueAt("medias") ?: emptyList()
@@ -51,15 +52,15 @@ class FavoriteService(
                 title = dict.stringValueAt("title") ?: "",
                 coverURL = dict.stringValueAt("cover") ?: "",
                 upperName = dict.stringValueAt("upper", "name") ?: "",
-                duration = formatSeconds(dict.intValueAt("duration") ?: 0),
-                playCount = dict.intValueAt("cnt_info", "play")?.toLong() ?: 0L,
+                duration = formatSeconds(dict.longValueAt("duration") ?: 0L),
+                playCount = dict.longValueAt("cnt_info", "play") ?: 0L,
             )
         }
     }
 
     /** 发请求并校验通用返回结构，成功返回 data 对象。*/
     private suspend fun getData(url: String): JsonObject {
-        val response = httpClient.get(url, buildHeaders())
+        val response = httpClient.get(url, buildHeaders(url))
         if (response.statusCode !in 200..299) throw ServiceError.InvalidResponse
 
         val payload = json.parseToJsonElement(response.body) as? JsonObject
@@ -70,7 +71,7 @@ class FavoriteService(
         return payload.dictionaryValueAt("data") ?: throw ServiceError.InvalidResponse
     }
 
-    private fun formatSeconds(total: Int): String {
+    private fun formatSeconds(total: Long): String {
         if (total <= 0) return ""
         val h = total / 3600
         val m = (total % 3600) / 60
@@ -82,13 +83,12 @@ class FavoriteService(
         }
     }
 
-    private suspend fun buildHeaders(): Map<String, String> {
-        val cookies = cookieProvider.loadCookies()
+    private suspend fun buildHeaders(targetUrl: String): Map<String, String> {
         val headers = mutableMapOf(
             "User-Agent" to userAgent,
             "Referer" to "https://www.bilibili.com/",
             "Accept" to "application/json, text/plain, */*",
         )
-        return cookieProvider.attachCookies(headers, cookies)
+        return cookieProvider.attachCookies(headers, targetUrl)
     }
 }

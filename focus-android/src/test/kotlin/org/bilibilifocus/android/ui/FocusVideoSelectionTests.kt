@@ -1,13 +1,51 @@
 package org.bilibilifocus.android.ui
 
 import android.content.pm.ActivityInfo
+import org.bilibilifocus.android.ui.video.FocusPhysicalOrientation
+import org.bilibilifocus.android.ui.video.FocusVideoFullscreenPolicy
+import org.bilibilifocus.android.ui.video.FocusVideoRotationPolicy
+import org.bilibilifocus.android.ui.video.currentVideoEpisodeIndex
+import org.bilibilifocus.android.ui.video.parseRequestedCid
+import org.bilibilifocus.android.ui.video.requestedLandscapeOrientation
+import org.bilibilifocus.android.ui.video.resolveActivePage
+import org.bilibilifocus.android.ui.video.videoEpisodeURL
+import org.bilibilifocus.core.model.VideoAuthor
 import org.bilibilifocus.core.model.VideoEpisode
+import org.bilibilifocus.core.model.VideoInfo
+import org.bilibilifocus.core.model.VideoPage
+import org.bilibilifocus.core.model.VideoStats
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class FocusVideoSelectionTests {
+    @Test
+    fun `server resume selects the last page unless the url explicitly selects one`() {
+        val info = videoInfo()
+
+        assertEquals(
+            202,
+            resolveActivePage(
+                info = info,
+                selectedCid = null,
+                requestedPageNumber = null,
+                requestedPageCid = null,
+                resumeCid = 202,
+            )?.cid,
+        )
+        assertEquals(
+            101,
+            resolveActivePage(
+                info = info,
+                selectedCid = null,
+                requestedPageNumber = 1,
+                requestedPageCid = null,
+                resumeCid = 202,
+            )?.cid,
+        )
+    }
+
     @Test
     fun `physical rotation keeps clockwise and counterclockwise landscape distinct`() {
         assertEquals(FocusPhysicalOrientation.Portrait, FocusPhysicalOrientation.fromDegrees(0))
@@ -135,4 +173,31 @@ class FocusVideoSelectionTests {
             parseRequestedCid(videoEpisodeURL(repeatedBvidEpisodes[87])),
         )
     }
+
+    private fun videoInfo() = VideoInfo(
+        bvid = "BV1TEST00001",
+        aid = 42,
+        cid = 101,
+        title = "测试视频",
+        description = "",
+        coverURL = "",
+        duration = 180,
+        publishDate = 0,
+        author = VideoAuthor(name = "测试UP", mid = 7, avatarURL = ""),
+        stats = VideoStats(
+            views = 0,
+            likes = 0,
+            coins = 0,
+            favorites = 0,
+            shares = 0,
+            danmaku = 0,
+            comments = 0,
+        ),
+        pages = listOf(
+            VideoPage(pageNumber = 1, cid = 101, title = "P1", duration = 90),
+            VideoPage(pageNumber = 2, cid = 202, title = "P2", duration = 90),
+        ),
+        lastPlaybackCid = 202,
+        lastPlaybackPositionMillis = 87_000,
+    )
 }

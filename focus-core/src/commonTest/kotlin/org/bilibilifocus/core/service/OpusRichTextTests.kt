@@ -19,10 +19,12 @@ class OpusRichTextTests {
             },
             httpClient = object : HttpClient {
                 override suspend fun get(url: String, headers: Map<String, String>): HttpResponse {
-                    val body = if (url.contains("/opus/detail")) {
-                        """{"code":0,"data":{"item":{"basic":{"comment_id_str":"123"},"modules":{"module_author":{"name":"作者"}}}}}"""
-                    } else {
-                        """
+                    val body = when {
+                        url.contains("/opus/detail") ->
+                            """{"code":0,"data":{"item":{"basic":{"comment_id_str":"123"},"modules":{"module_author":{"name":"作者"}}}}}"""
+                        url.contains("/x/web-interface/nav") ->
+                            """{"code":0,"data":{"wbi_img":{"img_url":"https://i0.hdslb.com/abcdefghijklmnopqrstuvwxyz012345.png","sub_url":"https://i0.hdslb.com/ABCDEFGHIJKLMNOPQRSTUVWXYZ012345.png"}}}"""
+                        else -> """
                         {"code":0,"data":{"item":{"modules":{
                           "module_author":{"name":"作者","mid":42,"face":"//i0.hdslb.com/a.jpg"},
                           "module_dynamic":{

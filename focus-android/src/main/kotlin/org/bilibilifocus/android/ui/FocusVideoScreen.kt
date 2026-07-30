@@ -1,53 +1,29 @@
 package org.bilibilifocus.android.ui
 
-import android.content.res.Configuration
 import android.content.pm.ActivityInfo
-import android.view.OrientationEventListener
-import android.view.View
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.ScrollState
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.ui.res.painterResource
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.OpenInFull
-import androidx.compose.material.icons.filled.Pause
-import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.outlined.Speed
-import androidx.compose.material.icons.outlined.Chat
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
@@ -56,7 +32,6 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -66,68 +41,53 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Shadow
-import androidx.compose.ui.graphics.luminance
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.rememberTextMeasurer
-import androidx.compose.ui.text.drawText
-import androidx.compose.ui.text.AnnotatedString
-import androidx.compose.ui.text.TextLayoutResult
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
-import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
-import androidx.media3.ui.AspectRatioFrameLayout
-import androidx.media3.ui.PlayerView
-import coil.compose.AsyncImage
-import coil.request.ImageRequest
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 import org.bilibilifocus.android.AndroidCookieProvider
-import org.bilibilifocus.android.FocusVideoViewModel
 import org.bilibilifocus.android.FocusPictureInPicturePolicy
-import org.bilibilifocus.android.R
-import org.bilibilifocus.android.VideoDanmakuLoadStatus
-import org.bilibilifocus.android.VideoDanmakuUiState
+import org.bilibilifocus.android.FocusVideoViewModel
 import org.bilibilifocus.android.VideoUiState
+import org.bilibilifocus.android.playback.FocusPlaybackAccountScopeProvider
 import org.bilibilifocus.android.playback.FocusPlaybackConnection
+import org.bilibilifocus.android.playback.FocusPlaybackProgressStore
 import org.bilibilifocus.android.playback.FocusPlaybackRequest
-import org.bilibilifocus.core.model.VideoComment
-import org.bilibilifocus.core.model.VideoDanmaku
-import org.bilibilifocus.core.model.VideoDanmakuMode
-import org.bilibilifocus.core.model.VideoEpisode
-import org.bilibilifocus.core.model.VideoEpisodeGroup
-import org.bilibilifocus.core.model.VideoInfo
-import org.bilibilifocus.core.model.VideoInteractionState
-import org.bilibilifocus.core.model.VideoPage
+import org.bilibilifocus.android.playback.FocusPlaybackResumePolicy
+import org.bilibilifocus.android.ui.video.AuthorCard
+import org.bilibilifocus.android.ui.video.CommentItem
+import org.bilibilifocus.android.ui.video.DanmakuFullscreenButton
+import org.bilibilifocus.android.ui.video.ExpandableDescription
+import org.bilibilifocus.android.ui.video.FocusVideoDeviceType
+import org.bilibilifocus.android.ui.video.FocusVideoFullscreenPolicy
+import org.bilibilifocus.android.ui.video.FocusVideoRotationPolicy
+import org.bilibilifocus.android.ui.video.PhoneFullscreenRotationEffect
+import org.bilibilifocus.android.ui.video.PlayerSurface
+import org.bilibilifocus.android.ui.video.VideoActionBar
+import org.bilibilifocus.android.ui.video.VideoControlDock
+import org.bilibilifocus.android.ui.video.VideoDanmakuOverlay
+import org.bilibilifocus.android.ui.video.VideoDanmakuStatusBanner
+import org.bilibilifocus.android.ui.video.VideoEpisodeSections
+import org.bilibilifocus.android.ui.video.VideoPageSection
+import org.bilibilifocus.android.ui.video.VideoTitleSection
+import org.bilibilifocus.android.ui.video.findActivity
+import org.bilibilifocus.android.ui.video.nextSpeed
+import org.bilibilifocus.android.ui.video.parseRequestedCid
+import org.bilibilifocus.android.ui.video.parseRequestedPage
+import org.bilibilifocus.android.ui.video.requestedLandscapeOrientation
+import org.bilibilifocus.android.ui.video.resolveActivePage
+import org.bilibilifocus.android.ui.video.setSystemBarsHidden
 import org.bilibilifocus.core.service.KtorHttpClient
 import org.bilibilifocus.core.service.VideoActionService
 import org.bilibilifocus.core.service.VideoInfoService
-
-private val SPEEDS = floatArrayOf(1f, 1.25f, 1.5f, 2f)
-private const val DANMAKU_DISPLAY_MILLIS = 5_000L
 
 @androidx.annotation.OptIn(UnstableApi::class)
 @OptIn(ExperimentalMaterial3Api::class)
@@ -143,6 +103,8 @@ fun FocusVideoScreen(
     viewModel: FocusVideoViewModel? = null,
     scrollState: ScrollState = rememberScrollState(),
     playbackConnection: FocusPlaybackConnection,
+    playbackAccountScopeProvider: FocusPlaybackAccountScopeProvider,
+    playbackProgressStore: FocusPlaybackProgressStore,
     playerSurfaceRevision: Int,
     isInPictureInPictureMode: Boolean,
 ) {
@@ -189,6 +151,8 @@ fun FocusVideoScreen(
     val isPlaying = playbackState.isPlaying
     val playbackSpeed = playbackState.playbackSpeed
     var selectedPageCid by remember(url) { mutableStateOf<Long?>(null) }
+    var playbackAccountScope by remember(url) { mutableStateOf<String?>(null) }
+    var didResolvePlaybackAccountScope by remember(url) { mutableStateOf(false) }
     var videoAspectRatio by remember { mutableStateOf(playbackState.videoAspectRatio) }
     var playbackPositionMillis by remember { mutableLongStateOf(0L) }
     var fullscreenLandscapeOrientation by remember {
@@ -222,12 +186,19 @@ fun FocusVideoScreen(
     }
     LaunchedEffect(info, initialPageNumber, initialPageCid) {
         val resolvedInfo = info ?: return@LaunchedEffect
+        val accountScope = playbackAccountScopeProvider.currentSnapshot()?.scope
+        playbackAccountScope = accountScope
+        didResolvePlaybackAccountScope = true
         if (selectedPageCid != null && resolvedInfo.pages.any { it.cid == selectedPageCid }) return@LaunchedEffect
+        val localResumeCid = accountScope?.let { scope ->
+            playbackProgressStore.latestProgress(scope, resolvedInfo.bvid)?.cid
+        }
         selectedPageCid = resolveActivePage(
             info = resolvedInfo,
             selectedCid = null,
             requestedPageNumber = initialPageNumber,
             requestedPageCid = initialPageCid,
+            resumeCid = localResumeCid ?: resolvedInfo.lastPlaybackCid,
         )?.cid
     }
 
@@ -236,6 +207,10 @@ fun FocusVideoScreen(
         selectedCid = selectedPageCid,
         requestedPageNumber = initialPageNumber,
         requestedPageCid = initialPageCid,
+        resumeCid = playbackAccountScope?.let { scope ->
+            playbackProgressStore.latestProgress(scope, info?.bvid.orEmpty())?.cid
+        }
+            ?: info?.lastPlaybackCid,
     )
 
     LaunchedEffect(player) {
@@ -263,9 +238,27 @@ fun FocusVideoScreen(
         }
     }
 
-    LaunchedEffect(info?.bvid, activePage?.cid) {
+    LaunchedEffect(
+        info?.bvid,
+        activePage?.cid,
+        playbackAccountScope,
+        didResolvePlaybackAccountScope,
+    ) {
+        if (!didResolvePlaybackAccountScope) return@LaunchedEffect
         val resolvedInfo = info ?: return@LaunchedEffect
         val resolvedPage = activePage ?: return@LaunchedEffect
+        val localProgress = playbackAccountScope?.let { scope ->
+            playbackProgressStore
+                .progress(scope, resolvedInfo.bvid, resolvedPage.cid)
+                ?.positionMillis
+        }
+        val serverProgress = resolvedInfo.lastPlaybackPositionMillis
+            .takeIf { resolvedInfo.lastPlaybackCid == resolvedPage.cid }
+        val startPositionMillis = FocusPlaybackResumePolicy.resolvePositionMillis(
+            localPositionMillis = localProgress,
+            serverPositionMillis = serverProgress,
+            durationMillis = resolvedPage.duration.coerceAtLeast(0) * 1_000,
+        )
         playbackConnection.load(
             FocusPlaybackRequest(
                 bvid = resolvedInfo.bvid,
@@ -279,7 +272,8 @@ fun FocusVideoScreen(
                 author = resolvedInfo.author.name,
                 artworkUrl = resolvedInfo.coverURL,
                 durationSeconds = resolvedPage.duration,
-                startPositionMillis = 0,
+                accountScope = playbackAccountScope,
+                startPositionMillis = startPositionMillis,
                 autoPlay = true,
             ),
         )
@@ -708,1032 +702,5 @@ fun FocusVideoScreen(
                 }
             }
         }
-    }
-}
-
-@Composable
-private fun VideoControlDock(
-    isPlaying: Boolean,
-    playbackSpeed: Float,
-    onTogglePlay: () -> Unit,
-    onChangeSpeed: () -> Unit,
-    danmakuEnabled: Boolean,
-    onToggleDanmaku: () -> Unit,
-    onToggleFullscreen: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    val isDarkTheme = MaterialTheme.colorScheme.background.luminance() < 0.5f
-    Box(
-        modifier = modifier
-            .fillMaxWidth()
-            .background(
-                brush = Brush.verticalGradient(
-                    colors = if (isDarkTheme) {
-                        listOf(
-                            Color.Transparent,
-                            Color.Black.copy(alpha = 0.10f),
-                            Color.Black.copy(alpha = 0.22f),
-                            Color.Black.copy(alpha = 0.34f),
-                        )
-                    } else {
-                        listOf(
-                            Color.Transparent,
-                            Color.White.copy(alpha = 0.08f),
-                            Color.White.copy(alpha = 0.20f),
-                            Color.White.copy(alpha = 0.34f),
-                        )
-                    },
-                ),
-            )
-            .navigationBarsPadding()
-            .padding(start = 16.dp, end = 16.dp, top = 2.dp, bottom = 2.dp),
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(24.dp))
-                .background(
-                    if (isDarkTheme) {
-                        Color(0xC8262C36)
-                    } else {
-                        Color.White.copy(alpha = 0.72f)
-                    }
-                )
-                .border(
-                    width = 1.dp,
-                    color = if (isDarkTheme) {
-                        Color.White.copy(alpha = 0.10f)
-                    } else {
-                        Color(0x241A1D24)
-                    },
-                    shape = RoundedCornerShape(24.dp),
-                )
-                .padding(horizontal = 10.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            DockButton(
-                icon = if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
-                text = if (isPlaying) "暂停" else "播放",
-                onClick = onTogglePlay,
-                modifier = Modifier.weight(1f),
-            )
-            DockButton(
-                icon = Icons.Outlined.Speed,
-                text = "${trimSpeed(playbackSpeed)}x",
-                onClick = onChangeSpeed,
-                modifier = Modifier.weight(1f),
-            )
-            DockButton(
-                icon = Icons.Outlined.Chat,
-                text = if (danmakuEnabled) "开" else "关",
-                onClick = onToggleDanmaku,
-                active = danmakuEnabled,
-                modifier = Modifier.weight(1f),
-            )
-            DockButton(
-                icon = Icons.Filled.OpenInFull,
-                text = "全屏",
-                onClick = onToggleFullscreen,
-                modifier = Modifier.weight(1f),
-            )
-        }
-    }
-}
-
-@Composable
-private fun VideoActionBar(
-    interactionState: VideoInteractionState,
-    info: VideoInfo,
-    onToggleLike: () -> Unit,
-    onCoin: () -> Unit,
-    onToggleFavorite: () -> Unit,
-) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(18.dp))
-            .background(
-                MaterialTheme.colorScheme.surfaceVariant.copy(
-                    alpha = if (MaterialTheme.colorScheme.background.luminance() < 0.5f) 0.72f else 0.86f,
-                )
-            )
-            .padding(horizontal = 6.dp, vertical = 4.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        ActionMetricButton(
-            painter = painterResource(R.drawable.ic_bili_like),
-            value = formatCount(info.stats.likes),
-            active = interactionState.liked,
-            onClick = onToggleLike,
-            enabled = !interactionState.loading,
-            modifier = Modifier.weight(1f),
-        )
-        VerticalDivider()
-        ActionMetricButton(
-            painter = painterResource(R.drawable.ic_bili_coin),
-            value = formatCount(info.stats.coins),
-            active = interactionState.coined,
-            onClick = onCoin,
-            enabled = !interactionState.loading && !interactionState.coined,
-            modifier = Modifier.weight(1f),
-        )
-        VerticalDivider()
-        ActionMetricButton(
-            painter = painterResource(R.drawable.ic_bili_fav),
-            value = formatCount(info.stats.favorites),
-            active = interactionState.favorited,
-            onClick = onToggleFavorite,
-            enabled = !interactionState.loading,
-            modifier = Modifier.weight(1f),
-        )
-    }
-}
-
-@Composable
-private fun DockButton(
-    icon: androidx.compose.ui.graphics.vector.ImageVector,
-    text: String,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier,
-    enabled: Boolean = true,
-    active: Boolean = false,
-) {
-    val isDarkTheme = MaterialTheme.colorScheme.background.luminance() < 0.5f
-    val containerColor = when {
-        active -> MaterialTheme.colorScheme.primary.copy(alpha = if (isDarkTheme) 0.22f else 0.18f)
-        isDarkTheme -> Color(0xFF343A43)
-        else -> Color.White.copy(alpha = 0.90f)
-    }
-    val contentColor = when {
-        active -> MaterialTheme.colorScheme.primary
-        isDarkTheme -> Color.White
-        else -> Color(0xFF2E3138)
-    }
-
-    TextButton(
-        onClick = onClick,
-        enabled = enabled,
-        modifier = modifier
-            .clip(RoundedCornerShape(16.dp))
-            .background(containerColor),
-        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
-        colors = ButtonDefaults.textButtonColors(
-            contentColor = contentColor,
-            disabledContentColor = if (isDarkTheme) Color.White.copy(alpha = 0.42f) else Color(0xFF8E95A1),
-        ),
-    ) {
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Icon(icon, contentDescription = null, modifier = Modifier.size(20.dp))
-            Text(
-                text,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                style = MaterialTheme.typography.labelLarge,
-                fontWeight = FontWeight.SemiBold,
-            )
-        }
-    }
-}
-
-@Composable
-private fun VideoDanmakuOverlay(
-    state: VideoDanmakuUiState,
-    enabled: Boolean,
-    playbackPositionMillis: Long,
-    modifier: Modifier = Modifier,
-) {
-    if (!enabled || state.danmakus.isEmpty()) return
-    val textMeasurer = rememberTextMeasurer()
-    val density = LocalDensity.current
-
-    BoxWithConstraints(modifier = modifier) {
-        val lineHeightPx = with(density) { 32.dp.toPx() }
-        val usableHeightPx = with(density) { maxHeight.toPx() } * 0.75f
-        val laneCount = (usableHeightPx / lineHeightPx).toInt().coerceAtLeast(1)
-        val prepared = remember(state.danmakus, laneCount, textMeasurer) {
-            val availableAt = VideoDanmakuMode.entries.associateWith { LongArray(laneCount) }.toMutableMap()
-            state.danmakus.mapNotNull { danmaku ->
-                val lanes = availableAt.getValue(danmaku.mode)
-                val lane = lanes.indexOfFirst { it <= danmaku.progressMillis }
-                if (lane < 0) return@mapNotNull null
-                lanes[lane] = danmaku.progressMillis + DANMAKU_DISPLAY_MILLIS
-                val color = danmakuColor(danmaku.colorRgb)
-                val shadowColor = if (color.luminance() < 0.28f) Color.White else Color.Black
-                val scale = (danmaku.fontSize / 25f).coerceIn(0.72f, 1.44f)
-                val layout = textMeasurer.measure(
-                    text = AnnotatedString(danmaku.content),
-                    style = TextStyle(
-                        color = color.copy(alpha = 0.94f),
-                        fontSize = (18f * scale).sp,
-                        fontWeight = FontWeight.SemiBold,
-                        shadow = Shadow(
-                            color = shadowColor.copy(alpha = 0.95f),
-                            offset = Offset(1.5f, 1.5f),
-                            blurRadius = 2.5f,
-                        ),
-                    ),
-                    maxLines = 1,
-                )
-                PreparedDanmaku(danmaku, lane, layout)
-            }
-        }
-
-        Canvas(modifier = Modifier.fillMaxSize()) {
-            val time = playbackPositionMillis
-            prepared.forEach { preparedDanmaku ->
-                val elapsed = time - preparedDanmaku.danmaku.progressMillis
-                if (elapsed !in 0L until DANMAKU_DISPLAY_MILLIS) return@forEach
-                val textWidth = preparedDanmaku.layout.size.width.toFloat()
-                val x = when (preparedDanmaku.danmaku.mode) {
-                    VideoDanmakuMode.SCROLLING -> {
-                        val progress = elapsed.toFloat() / DANMAKU_DISPLAY_MILLIS
-                        size.width - progress * (size.width + textWidth)
-                    }
-                    VideoDanmakuMode.TOP, VideoDanmakuMode.BOTTOM -> (size.width - textWidth) / 2f
-                }
-                val y = when (preparedDanmaku.danmaku.mode) {
-                    VideoDanmakuMode.BOTTOM -> usableHeightPx - (preparedDanmaku.lane + 1) * lineHeightPx
-                    VideoDanmakuMode.SCROLLING, VideoDanmakuMode.TOP -> preparedDanmaku.lane * lineHeightPx
-                }
-                drawText(
-                    textLayoutResult = preparedDanmaku.layout,
-                    topLeft = Offset(x, y.coerceAtLeast(0f)),
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun VideoDanmakuStatusBanner(
-    state: VideoDanmakuUiState,
-    enabled: Boolean,
-    onRetry: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    if (!enabled) return
-    when (state.status) {
-        VideoDanmakuLoadStatus.FAILED -> TextButton(
-            onClick = onRetry,
-            modifier = modifier
-                .padding(top = 8.dp)
-                .background(Color.Black.copy(alpha = 0.62f), RoundedCornerShape(14.dp)),
-        ) {
-            Text("弹幕加载失败 · 重试", color = Color.White)
-        }
-        VideoDanmakuLoadStatus.CLOSED -> Text(
-            text = state.message ?: "该视频未开启弹幕",
-            color = Color.White,
-            style = MaterialTheme.typography.labelMedium,
-            modifier = modifier
-                .padding(top = 12.dp)
-                .background(Color.Black.copy(alpha = 0.62f), RoundedCornerShape(12.dp))
-                .padding(horizontal = 12.dp, vertical = 7.dp),
-        )
-        else -> Unit
-    }
-}
-
-@Composable
-private fun DanmakuFullscreenButton(
-    enabled: Boolean,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    IconButton(
-        onClick = onClick,
-        modifier = modifier
-            .background(Color.Black.copy(alpha = 0.52f), CircleShape),
-    ) {
-        Icon(
-            imageVector = Icons.Outlined.Chat,
-            contentDescription = if (enabled) "关闭弹幕" else "开启弹幕",
-            tint = if (enabled) MaterialTheme.colorScheme.primary else Color.White,
-        )
-    }
-}
-
-private data class PreparedDanmaku(
-    val danmaku: VideoDanmaku,
-    val lane: Int,
-    val layout: TextLayoutResult,
-)
-
-private fun danmakuColor(rgb: Int?): Color {
-    val value = rgb ?: 0xffffff
-    return Color(
-        red = ((value shr 16) and 0xff) / 255f,
-        green = ((value shr 8) and 0xff) / 255f,
-        blue = (value and 0xff) / 255f,
-        alpha = 1f,
-    )
-}
-
-@Composable
-private fun ActionMetricButton(
-    painter: Painter,
-    value: String,
-    active: Boolean,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier,
-    enabled: Boolean = true,
-) {
-    TextButton(
-        onClick = onClick,
-        enabled = enabled,
-        modifier = modifier,
-        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp),
-        colors = ButtonDefaults.textButtonColors(
-            contentColor = if (active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
-            disabledContentColor = MaterialTheme.colorScheme.outline,
-        ),
-    ) {
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Icon(
-                painter = painter,
-                contentDescription = null,
-                modifier = Modifier.size(22.dp),
-            )
-            Text(
-                value,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                style = MaterialTheme.typography.titleSmall,
-                fontWeight = FontWeight.SemiBold,
-            )
-        }
-    }
-}
-
-@Composable
-private fun VerticalDivider() {
-    Box(
-        modifier = Modifier
-            .width(1.dp)
-            .height(20.dp)
-            .background(MaterialTheme.colorScheme.outlineVariant),
-    )
-}
-
-@Composable
-private fun VideoPageSection(
-    pages: List<VideoPage>,
-    selectedCid: Long?,
-    onSelect: (VideoPage) -> Unit,
-) {
-    val selectedIndex = pages.indexOfFirst { it.cid == selectedCid }.coerceAtLeast(0)
-    val listState = rememberLazyListState(initialFirstVisibleItemIndex = selectedIndex)
-
-    LaunchedEffect(pages, selectedCid) {
-        val currentIndex = pages.indexOfFirst { it.cid == selectedCid }
-        if (currentIndex >= 0) {
-            listState.scrollToItem(currentIndex)
-        }
-    }
-
-    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        Text("分 P", style = MaterialTheme.typography.titleMedium)
-        LazyRow(
-            state = listState,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            items(pages, key = { it.cid }) { page ->
-                val selected = page.cid == selectedCid
-                val chipShape = RoundedCornerShape(10.dp)
-                FilterChip(
-                    selected = selected,
-                    onClick = { onSelect(page) },
-                    label = {
-                        val label = buildString {
-                            append("P${page.pageNumber}")
-                            if (page.title.isNotBlank()) append(" ${page.title}")
-                        }
-                        Text(
-                            label,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            textAlign = TextAlign.Center,
-                        )
-                    },
-                    colors = FilterChipDefaults.filterChipColors(
-                        selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
-                        selectedLabelColor = MaterialTheme.colorScheme.onPrimaryContainer,
-                    ),
-                    shape = chipShape,
-                    modifier = Modifier.then(
-                        if (selected) {
-                            Modifier.border(2.dp, MaterialTheme.colorScheme.primary, chipShape)
-                        } else {
-                            Modifier
-                        }
-                    ),
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun VideoEpisodeSections(
-    groups: List<VideoEpisodeGroup>,
-    currentBvid: String,
-    currentCid: Long,
-    onOpenVideo: (String) -> Unit,
-) {
-    Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-        groups.forEach { group ->
-            VideoEpisodeGroupRow(
-                group = group,
-                currentBvid = currentBvid,
-                currentCid = currentCid,
-                onOpenVideo = onOpenVideo,
-            )
-        }
-    }
-}
-
-@Composable
-private fun VideoEpisodeGroupRow(
-    group: VideoEpisodeGroup,
-    currentBvid: String,
-    currentCid: Long,
-    onOpenVideo: (String) -> Unit,
-) {
-    val currentIndex = currentVideoEpisodeIndex(group.episodes, currentBvid, currentCid)
-    val listState = remember(group, currentBvid, currentCid) {
-        LazyListState(firstVisibleItemIndex = currentIndex.coerceAtLeast(0))
-    }
-
-    LaunchedEffect(group.episodes, currentBvid, currentCid, currentIndex) {
-        if (currentIndex >= 0) {
-            withFrameNanos { }
-            listState.scrollToItem(currentIndex)
-            withFrameNanos { }
-            if (listState.layoutInfo.visibleItemsInfo.none { it.index == currentIndex }) {
-                listState.scrollToItem(currentIndex)
-            }
-        }
-    }
-
-    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        Text(group.title, style = MaterialTheme.typography.titleMedium)
-        LazyRow(
-            state = listState,
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            itemsIndexed(
-                items = group.episodes,
-                key = { _, episode -> "${group.title}-${episode.bvid}-${episode.cid}" },
-            ) { index, episode ->
-                val selected = index == currentIndex
-                EpisodeCard(
-                    episode = episode,
-                    selected = selected,
-                    onClick = {
-                        if (!selected) {
-                            onOpenVideo(videoEpisodeURL(episode))
-                        }
-                    },
-                )
-            }
-        }
-    }
-}
-
-internal fun currentVideoEpisodeIndex(
-    episodes: List<VideoEpisode>,
-    currentBvid: String,
-    currentCid: Long? = null,
-): Int {
-    if (currentCid != null && currentCid > 0) {
-        val exactMatch = episodes.indexOfFirst {
-            it.bvid == currentBvid && it.cid == currentCid
-        }
-        if (exactMatch >= 0) return exactMatch
-
-        val caseInsensitiveMatch = episodes.indexOfFirst {
-            it.cid == currentCid && it.bvid.equals(currentBvid, ignoreCase = true)
-        }
-        if (caseInsensitiveMatch >= 0) return caseInsensitiveMatch
-
-        val cidMatch = episodes.indexOfFirst { it.cid == currentCid }
-        if (cidMatch >= 0) return cidMatch
-    }
-
-    val exactIndex = episodes.indexOfFirst { it.bvid == currentBvid }
-    return if (exactIndex >= 0) {
-        exactIndex
-    } else {
-        episodes.indexOfFirst { it.bvid.equals(currentBvid, ignoreCase = true) }
-    }
-}
-
-internal fun videoEpisodeURL(episode: VideoEpisode): String = buildString {
-    append("https://www.bilibili.com/video/")
-    append(episode.bvid)
-    append('/')
-    if (episode.cid > 0) {
-        append("?cid=")
-        append(episode.cid)
-    }
-}
-
-@Composable
-private fun EpisodeCard(
-    episode: VideoEpisode,
-    selected: Boolean,
-    onClick: () -> Unit,
-) {
-    val cardShape = RoundedCornerShape(14.dp)
-    ElevatedCard(
-        onClick = onClick,
-        shape = cardShape,
-        colors = CardDefaults.elevatedCardColors(
-            containerColor = if (selected) {
-                MaterialTheme.colorScheme.primaryContainer
-            } else {
-                MaterialTheme.colorScheme.surface
-            }
-        ),
-        elevation = CardDefaults.elevatedCardElevation(defaultElevation = 1.dp),
-        modifier = Modifier
-            .size(width = 156.dp, height = 88.dp)
-            .then(
-                if (selected) {
-                    Modifier.border(2.dp, MaterialTheme.colorScheme.primary, cardShape)
-                } else {
-                    Modifier
-                }
-            ),
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(12.dp),
-            verticalArrangement = Arrangement.Center,
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-            Text(
-                episode.title,
-                style = MaterialTheme.typography.labelLarge,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-                textAlign = TextAlign.Center,
-            )
-            if (episode.badgeText.isNotBlank()) {
-                Text(
-                    episode.badgeText,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.primary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    textAlign = TextAlign.Center,
-                )
-            }
-        }
-    }
-}
-
-@androidx.annotation.OptIn(UnstableApi::class)
-@Composable
-private fun PlayerSurface(
-    player: Player?,
-    showController: Boolean,
-    onToggleFullscreen: () -> Unit,
-    attachmentKey: Int,
-    modifier: Modifier = Modifier,
-) {
-    AndroidView(
-        factory = { ctx ->
-            PlayerView(ctx).apply {
-                useController = showController
-                resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
-                setShowNextButton(false)
-                setShowPreviousButton(false)
-                setBackgroundColor(android.graphics.Color.BLACK)
-                setFullscreenButtonClickListener { onToggleFullscreen() }
-            }
-        },
-        update = { view ->
-            view.useController = showController
-            view.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
-            if (view.tag != attachmentKey || view.player !== player) {
-                view.player = null
-                view.player = player
-                view.tag = attachmentKey
-            }
-            view.setFullscreenButtonClickListener { onToggleFullscreen() }
-        },
-        onRelease = { view ->
-            view.player = null
-        },
-        modifier = modifier,
-    )
-}
-
-@Composable
-private fun PhoneFullscreenRotationEffect(
-    enabled: Boolean,
-    ignoreInitialOrientation: Boolean,
-    onInitialOrientationConsumed: () -> Unit,
-    onLandscape: (FocusPhysicalOrientation) -> Unit,
-    onPortrait: () -> Unit,
-) {
-    val context = LocalContext.current
-    val scope = rememberCoroutineScope()
-    val currentIgnoreInitialOrientation by rememberUpdatedState(ignoreInitialOrientation)
-    val currentOnInitialOrientationConsumed by rememberUpdatedState(onInitialOrientationConsumed)
-    val currentOnLandscape by rememberUpdatedState(onLandscape)
-    val currentOnPortrait by rememberUpdatedState(onPortrait)
-
-    DisposableEffect(context, enabled) {
-        if (!enabled) return@DisposableEffect onDispose { }
-
-        var lastOrientation: FocusPhysicalOrientation? = null
-        var debounceJob: Job? = null
-        val listener = object : OrientationEventListener(context.applicationContext) {
-            override fun onOrientationChanged(orientation: Int) {
-                val resolvedOrientation = FocusPhysicalOrientation.fromDegrees(orientation) ?: return
-                if (resolvedOrientation == lastOrientation) return
-                val isInitialOrientation = lastOrientation == null
-                lastOrientation = resolvedOrientation
-
-                if (isInitialOrientation) {
-                    currentOnInitialOrientationConsumed()
-                    // OrientationEventListener 启用后会立即上报当前方向。从 PiP
-                    // 返回时这只是设备当前姿态的快照，不应被当作一次新旋转。
-                    if (currentIgnoreInitialOrientation ||
-                        resolvedOrientation == FocusPhysicalOrientation.Portrait
-                    ) {
-                        return
-                    }
-                }
-
-                debounceJob?.cancel()
-                debounceJob = scope.launch {
-                    delay(180)
-                    when (resolvedOrientation) {
-                        FocusPhysicalOrientation.LandscapeClockwise,
-                        FocusPhysicalOrientation.LandscapeCounterClockwise
-                        -> currentOnLandscape(resolvedOrientation)
-                        FocusPhysicalOrientation.Portrait -> currentOnPortrait()
-                    }
-                }
-            }
-        }
-
-        if (listener.canDetectOrientation()) listener.enable()
-        onDispose {
-            debounceJob?.cancel()
-            listener.disable()
-        }
-    }
-}
-
-private enum class FocusVideoDeviceType {
-    Phone,
-    Tablet;
-
-    companion object {
-        fun fromSmallestWidth(smallestScreenWidthDp: Int): FocusVideoDeviceType =
-            if (smallestScreenWidthDp < 600) Phone else Tablet
-    }
-}
-
-internal object FocusVideoFullscreenPolicy {
-    private const val DEFAULT_ASPECT_RATIO = 16f / 9f
-
-    fun aspectRatio(width: Int, height: Int): Float =
-        if (width > 0 && height > 0) width.toFloat() / height else DEFAULT_ASPECT_RATIO
-
-    fun isPortrait(aspectRatio: Float): Boolean =
-        aspectRatio.isFinite() && aspectRatio > 0f && aspectRatio <= 1f
-
-    fun shouldFitToWidth(containerAspectRatio: Float, videoAspectRatio: Float): Boolean =
-        containerAspectRatio.isFinite() &&
-            videoAspectRatio.isFinite() &&
-            containerAspectRatio > 0f &&
-            videoAspectRatio > 0f &&
-            containerAspectRatio <= videoAspectRatio
-}
-
-internal object FocusVideoRotationPolicy {
-    fun shouldObservePhysicalOrientation(
-        isPhone: Boolean,
-        isVideoLoaded: Boolean,
-        prefersPortraitFullscreen: Boolean,
-        isInPictureInPictureMode: Boolean,
-    ): Boolean = isPhone &&
-        isVideoLoaded &&
-        !prefersPortraitFullscreen &&
-        !isInPictureInPictureMode
-
-    fun shouldCompleteFullscreenExit(
-        isPhone: Boolean,
-        isCompletingFullscreenExit: Boolean,
-        configurationOrientation: Int,
-        isInPictureInPictureMode: Boolean,
-    ): Boolean = isPhone &&
-        isCompletingFullscreenExit &&
-        configurationOrientation == Configuration.ORIENTATION_PORTRAIT &&
-        !isInPictureInPictureMode
-
-    fun shouldApplyActivityOrientation(isInPictureInPictureMode: Boolean): Boolean =
-        !isInPictureInPictureMode
-}
-
-internal enum class FocusPhysicalOrientation {
-    Portrait,
-    LandscapeClockwise,
-    LandscapeCounterClockwise;
-
-    companion object {
-        fun fromDegrees(degrees: Int): FocusPhysicalOrientation? = when {
-            degrees == OrientationEventListener.ORIENTATION_UNKNOWN -> null
-            degrees in 315..359 || degrees in 0..44 -> Portrait
-            degrees in 45..134 -> LandscapeClockwise
-            degrees in 225..314 -> LandscapeCounterClockwise
-            // 与 iOS 保持一致：倒置和设备平放时不触发全屏切换。
-            else -> null
-        }
-    }
-}
-
-internal fun FocusPhysicalOrientation.requestedLandscapeOrientation(): Int = when (this) {
-    FocusPhysicalOrientation.LandscapeClockwise -> ActivityInfo.SCREEN_ORIENTATION_REVERSE_LANDSCAPE
-    FocusPhysicalOrientation.LandscapeCounterClockwise -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
-    FocusPhysicalOrientation.Portrait -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
-}
-
-private fun android.content.Context.findActivity(): android.app.Activity? {
-    var ctx: android.content.Context? = this
-    while (ctx is android.content.ContextWrapper) {
-        if (ctx is android.app.Activity) return ctx
-        ctx = ctx.baseContext
-    }
-    return null
-}
-
-private fun setSystemBarsHidden(activity: android.app.Activity?, hidden: Boolean) {
-    val window = activity?.window ?: return
-    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
-        val controller = window.insetsController
-        val bars = android.view.WindowInsets.Type.statusBars() or android.view.WindowInsets.Type.navigationBars()
-        if (hidden) {
-            controller?.hide(bars)
-            controller?.systemBarsBehavior = android.view.WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-        } else {
-            controller?.show(bars)
-        }
-    } else {
-        @Suppress("DEPRECATION")
-        window.decorView.systemUiVisibility = if (hidden) {
-            View.SYSTEM_UI_FLAG_FULLSCREEN or
-                View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
-                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
-                View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
-                View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or
-                View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-        } else {
-            View.SYSTEM_UI_FLAG_VISIBLE
-        }
-    }
-}
-
-@Composable
-private fun StatItem(value: String, label: String) {
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        Text(value, style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurface)
-        Text(label, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-    }
-}
-
-@Composable
-private fun VideoTitleSection(info: VideoInfo) {
-    val titleStyle = MaterialTheme.typography.titleMedium
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text(
-            text = info.title,
-            style = titleStyle.copy(fontSize = titleStyle.fontSize * 1.2f),
-        )
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(14.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(
-                text = "${formatCount(info.stats.views)}播放",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Text(
-                text = "${formatCount(info.stats.danmaku)}弹幕",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            if (info.publishDate > 0) {
-                Text(
-                    text = formatPublishDate(info.publishDate),
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun AuthorCard(info: VideoInfo, onClick: () -> Unit = {}) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(12.dp))
-            .background(MaterialTheme.colorScheme.surfaceVariant)
-            .clickable { onClick() }
-            .padding(12.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        AsyncImage(
-            model = ImageRequest.Builder(LocalContext.current)
-                .data(info.author.avatarURL)
-                .crossfade(true)
-                .build(),
-            contentDescription = null,
-            modifier = Modifier.size(44.dp).clip(CircleShape),
-            contentScale = ContentScale.Crop,
-        )
-        Column(modifier = Modifier.weight(1f)) {
-            Text(info.author.name, style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text("UID: ${info.author.mid}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-    }
-}
-
-@Composable
-private fun ExpandableDescription(desc: String) {
-    var expanded by remember(desc) { mutableStateOf(true) }
-
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(12.dp))
-            .background(MaterialTheme.colorScheme.surfaceVariant)
-            .padding(12.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        Text(
-            text = desc,
-            style = MaterialTheme.typography.bodyMedium,
-            maxLines = if (expanded) Int.MAX_VALUE else 3,
-            overflow = TextOverflow.Ellipsis,
-        )
-        if (desc.length > 120) {
-            Text(
-                text = if (expanded) "收起" else "展开",
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.primary,
-                modifier = Modifier.clickable { expanded = !expanded },
-            )
-        }
-    }
-}
-
-@Composable
-private fun CommentItem(comment: VideoComment, onOpenURL: (String) -> Unit) {
-    val contentStyle = MaterialTheme.typography.bodyMedium.let {
-        it.copy(fontSize = it.fontSize * 1.15f)
-    }
-    val replyStyle = MaterialTheme.typography.bodySmall.let {
-        it.copy(fontSize = it.fontSize * 1.15f)
-    }
-    val authorStyle = MaterialTheme.typography.labelMedium.let {
-        it.copy(fontSize = it.fontSize * 1.15f)
-    }
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 6.dp),
-        verticalArrangement = Arrangement.spacedBy(6.dp),
-    ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            AsyncImage(
-                model = ImageRequest.Builder(LocalContext.current)
-                    .data(comment.avatarURL)
-                    .crossfade(true)
-                    .build(),
-                contentDescription = null,
-                modifier = Modifier.size(28.dp).clip(CircleShape),
-                contentScale = ContentScale.Crop,
-            )
-            Text(comment.authorName, style = authorStyle, color = MaterialTheme.colorScheme.primary)
-            Spacer(modifier = Modifier.weight(1f))
-            Text(
-                formatTimeAgo(comment.publishTime),
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Text("${comment.likeCount}赞", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-        FocusRichText(comment.contentRuns, style = contentStyle, onOpenURL = onOpenURL)
-
-        comment.replies.take(3).forEach { reply ->
-            Row(modifier = Modifier.padding(start = 36.dp, top = 4.dp)) {
-                Text("${reply.authorName}: ", style = replyStyle, color = MaterialTheme.colorScheme.primary)
-                FocusRichText(
-                    reply.contentRuns,
-                    style = replyStyle.copy(color = MaterialTheme.colorScheme.onSurfaceVariant),
-                    modifier = Modifier.weight(1f),
-                    onOpenURL = onOpenURL,
-                )
-            }
-        }
-    }
-}
-
-private fun resolveActivePage(
-    info: VideoInfo?,
-    selectedCid: Long?,
-    requestedPageNumber: Int?,
-    requestedPageCid: Long?,
-): VideoPage? {
-    if (info == null) return null
-    return info.pages.firstOrNull { it.cid == selectedCid }
-        ?: requestedPageNumber?.let { pageNumber ->
-            info.pages.firstOrNull { it.pageNumber == pageNumber }
-        }
-        ?: requestedPageCid?.let { cid ->
-            info.pages.firstOrNull { it.cid == cid }
-        }
-        ?: info.pages.firstOrNull { it.cid == info.cid }
-        ?: info.pages.firstOrNull()
-        ?: VideoPage(
-            pageNumber = 1,
-            cid = info.cid,
-            title = "正片",
-            duration = info.duration,
-        )
-}
-
-private fun parseRequestedPage(url: String): Int? {
-    return Regex("""[?&]p=(\d+)""", RegexOption.IGNORE_CASE)
-        .find(url.replace("&amp;", "&", ignoreCase = true))
-        ?.groupValues
-        ?.getOrNull(1)
-        ?.toIntOrNull()
-        ?.takeIf { it > 0 }
-}
-
-internal fun parseRequestedCid(url: String): Long? {
-    return Regex("""[?&]cid=(\d+)""", RegexOption.IGNORE_CASE)
-        .find(url.replace("&amp;", "&", ignoreCase = true))
-        ?.groupValues
-        ?.getOrNull(1)
-        ?.toLongOrNull()
-        ?.takeIf { it > 0 }
-}
-
-private fun nextSpeed(current: Float): Float {
-    val currentIndex = SPEEDS.indexOfFirst { kotlin.math.abs(it - current) < 0.01f }
-    return if (currentIndex == -1 || currentIndex == SPEEDS.lastIndex) SPEEDS.first() else SPEEDS[currentIndex + 1]
-}
-
-private fun trimSpeed(speed: Float): String {
-    return if (speed % 1f == 0f) speed.toInt().toString() else speed.toString()
-}
-
-private fun formatCount(count: Long): String = when {
-    count >= 100_000_000L -> {
-        "%.1f亿".format(count / 100_000_000.0).replace(".0亿", "亿")
-    }
-    count >= 10000L -> {
-        "%.1f万".format(count / 10_000.0).replace(".0万", "万")
-    }
-    else -> count.toString()
-}
-
-private fun formatPublishDate(timestamp: Long): String =
-    java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.CHINA)
-        .format(java.util.Date(timestamp * 1000))
-
-private fun formatTimeAgo(ts: Long): String {
-    val now = System.currentTimeMillis() / 1000
-    val diff = now - ts
-    return when {
-        diff < 60 -> "刚刚"
-        diff < 3600 -> "${diff / 60}分钟前"
-        diff < 86400 -> "${diff / 3600}小时前"
-        diff < 2592000 -> "${diff / 86400}天前"
-        else -> java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.getDefault())
-            .format(java.util.Date(ts * 1000))
     }
 }

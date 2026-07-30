@@ -15,10 +15,16 @@ enum FocusWebSettingsUpdate: Equatable {
         previousDarkMode: Bool,
         currentDarkMode: Bool
     ) -> FocusWebSettingsUpdate {
+#if DEBUG
+        let debugLoggingChanged = previous.debugMode != current.debugMode
+#else
+        let debugLoggingChanged = false
+#endif
         let pageRulesChanged = previous.redirectEnabled != current.redirectEnabled
             || previous.playerMaskEnabled != current.playerMaskEnabled
             || previous.searchMaskEnabled != current.searchMaskEnabled
             || previous.dynamicMaskEnabled != current.dynamicMaskEnabled
+            || debugLoggingChanged
         if pageRulesChanged {
             return .pageRules
         }
@@ -64,9 +70,11 @@ struct FocusWebView: UIViewRepresentable {
         webView.isOpaque = false
         webView.backgroundColor = isDarkMode ? UIColor(red: 0.06, green: 0.07, blue: 0.09, alpha: 1) : UIColor(red: 0.965, green: 0.969, blue: 0.98, alpha: 1)
         webView.scrollView.backgroundColor = webView.backgroundColor
+#if DEBUG
         if #available(iOS 16.4, *) {
             webView.isInspectable = true
         }
+#endif
         webView.navigationDelegate = context.coordinator
         webView.uiDelegate = context.coordinator
         context.coordinator.installScripts(
@@ -145,11 +153,25 @@ struct FocusWebView: UIViewRepresentable {
             self.viewModel = viewModel
         }
 
+#if DEBUG
+        private static let debugBridgeScript = """
+        (() => {
+          window.__FOCUS_DEBUG_SINK__ = (payload) => {
+            try {
+              window.webkit?.messageHandlers?.logDebug?.postMessage(payload);
+            } catch (_) {}
+          };
+        })();
+        """
+#endif
+
         func tearDown(webView: WKWebView) {
             let controller = webView.configuration.userContentController
             webView.evaluateJavaScript("window.__FOCUS_NATIVE_PLAYER_BRIDGE__?.teardown?.(); window.__FOCUS_NATIVE_PLAYER_BRIDGE__ = null;")
             controller.removeScriptMessageHandler(forName: "getConfig")
+#if DEBUG
             controller.removeScriptMessageHandler(forName: "logDebug")
+#endif
             controller.removeScriptMessageHandler(forName: "playerState")
             controller.removeAllUserScripts()
             webView.navigationDelegate = nil
@@ -168,16 +190,29 @@ struct FocusWebView: UIViewRepresentable {
             let controller = webView.configuration.userContentController
             controller.removeAllUserScripts()
             controller.removeScriptMessageHandler(forName: "getConfig")
+#if DEBUG
             controller.removeScriptMessageHandler(forName: "logDebug")
+#endif
             controller.removeScriptMessageHandler(forName: "playerState")
             controller.add(self, name: "getConfig")
+#if DEBUG
             controller.add(self, name: "logDebug")
+#endif
             controller.add(self, name: "playerState")
 
             let bootstrapAppearanceScript = FocusWebAppearance.bootstrapCSS(isDarkMode: isDarkMode)
             let appearanceScript = FocusWebAppearance.script(isDarkMode: isDarkMode)
             let documentStartScript = try? FocusScriptBuilder.makeUserScript(for: .documentStart, settings: settings)
             let documentEndScript = try? FocusScriptBuilder.makeUserScript(for: .documentEnd, settings: settings)
+#if DEBUG
+            controller.addUserScript(
+                WKUserScript(
+                    source: Self.debugBridgeScript,
+                    injectionTime: .atDocumentStart,
+                    forMainFrameOnly: true
+                )
+            )
+#endif
             controller.addUserScript(
                 WKUserScript(
                     source: bootstrapAppearanceScript,
@@ -407,11 +442,18 @@ struct FocusWebView: UIViewRepresentable {
             switch message.name {
             case "getConfig":
                 guard let webView = viewModel.webView else { return }
-                let data = try? JSONEncoder().encode(viewModel.settingsStore.settings)
+                let data = try? JSONEncoder().encode(
+                    viewModel.settingsStore.settings.effectiveRuntimeSettings
+                )
                 let configJSON = data.map { String(decoding: $0, as: UTF8.self) } ?? "{}"
                 webView.evaluateJavaScript("window.__FOCUS_CONFIG__ = \(configJSON);")
+#if DEBUG
             case "logDebug":
+                guard viewModel.settingsStore.settings.debugLoggingEnabledForCurrentBuild else {
+                    return
+                }
                 print("[Focus Debug]", message.body)
+#endif
             case "playerState":
                 viewModel.handlePlayerStateMessage(message.body, from: message.webView)
             default:

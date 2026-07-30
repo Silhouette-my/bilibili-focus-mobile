@@ -104,6 +104,7 @@ struct FocusVerifier {
 
     private static func verifyNavigationPolicy() throws {
         let policy = FocusNavigationPolicy(settings: .defaults)
+        let canonicalVideoURL = URL(string: "https://www.bilibili.com/video/BV1xx411c7mD/")!
 
         guard policy.decision(for: URL(string: "bilibili://video/123")!) == .cancel else {
             throw VerificationError("custom scheme should be blocked")
@@ -111,14 +112,18 @@ struct FocusVerifier {
 
         guard
             policy.decision(for: URL(string: "https://www.bilibili.com/video/BV1xx411c7mD")!)
-            == .allow
+            == .redirect(canonicalVideoURL)
         else {
-            throw VerificationError("desktop video URL should stay on desktop playback page")
+            throw VerificationError("desktop video URL should canonicalize its trailing slash")
+        }
+
+        guard policy.decision(for: canonicalVideoURL) == .allow else {
+            throw VerificationError("canonical desktop video URL should be allowed")
         }
 
         guard
             policy.decision(for: URL(string: "https://m.bilibili.com/video/BV1xx411c7mD")!)
-            == .redirect(URL(string: "https://www.bilibili.com/video/BV1xx411c7mD")!)
+            == .redirect(canonicalVideoURL)
         else {
             throw VerificationError("mobile video URL should canonicalize to desktop playback page")
         }
@@ -158,8 +163,11 @@ struct FocusVerifier {
             throw VerificationError("video dynamic should canonicalize to desktop playback URL")
         }
 
-        guard cards[1].kind == .image, cards[1].targetURL.absoluteString == "https://t.bilibili.com/456" else {
-            throw VerificationError("image dynamic should fall back to dynamic detail URL")
+        guard
+            cards[1].kind == .image,
+            cards[1].targetURL.absoluteString == "https://www.bilibili.com/opus/456"
+        else {
+            throw VerificationError("image dynamic should canonicalize to desktop opus URL")
         }
 
         print("pass: dynamic card decoding")

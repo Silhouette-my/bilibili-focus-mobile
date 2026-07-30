@@ -8,6 +8,8 @@ public struct FocusSettings: Codable, Equatable, Sendable {
     public var redirectEnabled: Bool
     public var playerMaskEnabled: Bool
     public var nativeDanmakuEnabled: Bool
+    public var nativeSubtitleEnabled: Bool
+    public var nativeSubtitleLanguageCode: String
     public var searchMaskEnabled: Bool
     public var dynamicMaskEnabled: Bool
     public var debugMode: Bool
@@ -21,6 +23,8 @@ public struct FocusSettings: Codable, Equatable, Sendable {
         redirectEnabled: Bool = true,
         playerMaskEnabled: Bool = true,
         nativeDanmakuEnabled: Bool = true,
+        nativeSubtitleEnabled: Bool = true,
+        nativeSubtitleLanguageCode: String = "",
         searchMaskEnabled: Bool = true,
         dynamicMaskEnabled: Bool = true,
         debugMode: Bool = false,
@@ -33,6 +37,8 @@ public struct FocusSettings: Codable, Equatable, Sendable {
         self.redirectEnabled = redirectEnabled
         self.playerMaskEnabled = playerMaskEnabled
         self.nativeDanmakuEnabled = nativeDanmakuEnabled
+        self.nativeSubtitleEnabled = nativeSubtitleEnabled
+        self.nativeSubtitleLanguageCode = nativeSubtitleLanguageCode
         self.searchMaskEnabled = searchMaskEnabled
         self.dynamicMaskEnabled = dynamicMaskEnabled
         self.debugMode = debugMode
@@ -48,6 +54,8 @@ public struct FocusSettings: Codable, Equatable, Sendable {
         case redirectEnabled
         case playerMaskEnabled
         case nativeDanmakuEnabled
+        case nativeSubtitleEnabled
+        case nativeSubtitleLanguageCode
         case searchMaskEnabled
         case dynamicMaskEnabled
         case debugMode
@@ -63,6 +71,11 @@ public struct FocusSettings: Codable, Equatable, Sendable {
         redirectEnabled = try container.decodeIfPresent(Bool.self, forKey: .redirectEnabled) ?? true
         playerMaskEnabled = try container.decodeIfPresent(Bool.self, forKey: .playerMaskEnabled) ?? true
         nativeDanmakuEnabled = try container.decodeIfPresent(Bool.self, forKey: .nativeDanmakuEnabled) ?? true
+        nativeSubtitleEnabled = try container.decodeIfPresent(Bool.self, forKey: .nativeSubtitleEnabled) ?? true
+        nativeSubtitleLanguageCode = try container.decodeIfPresent(
+            String.self,
+            forKey: .nativeSubtitleLanguageCode
+        ) ?? ""
         searchMaskEnabled = try container.decodeIfPresent(Bool.self, forKey: .searchMaskEnabled) ?? true
         dynamicMaskEnabled = try container.decodeIfPresent(Bool.self, forKey: .dynamicMaskEnabled) ?? true
         debugMode = try container.decodeIfPresent(Bool.self, forKey: .debugMode) ?? false
@@ -89,6 +102,20 @@ public struct FocusSettings: Codable, Equatable, Sendable {
             return nil
         }
         return "#\(digits.uppercased())"
+    }
+
+    public var debugLoggingEnabledForCurrentBuild: Bool {
+#if DEBUG
+        debugMode
+#else
+        false
+#endif
+    }
+
+    public var effectiveRuntimeSettings: FocusSettings {
+        var settings = self
+        settings.debugMode = debugLoggingEnabledForCurrentBuild
+        return settings
     }
 
     public static func load(from userDefaults: UserDefaults) -> FocusSettings {

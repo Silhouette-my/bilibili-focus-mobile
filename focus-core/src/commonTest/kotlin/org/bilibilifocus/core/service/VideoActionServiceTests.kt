@@ -32,6 +32,33 @@ class VideoActionServiceTests {
         assertEquals("https://www.bilibili.com", http.lastHeaders["Origin"])
     }
 
+    @Test
+    fun `explicit history cookie snapshot is used without a second provider read`() = runTest {
+        val http = RecordingHttpClient()
+        val service = VideoActionService(
+            cookieProvider = object : CookieProvider {
+                override suspend fun loadCookies(): List<Cookie> =
+                    error("CookieProvider must not be read after scope validation")
+            },
+            httpClient = http,
+        )
+        val validatedCookies = listOf(
+            Cookie("SESSDATA", "validated-session", ".bilibili.com"),
+            Cookie("bili_jct", "validated-csrf", ".bilibili.com"),
+        )
+
+        service.reportWatchHistory(
+            aid = 42,
+            cid = 4201,
+            progressSeconds = 12,
+            cookies = validatedCookies,
+        )
+
+        assertTrue(http.lastHeaders["Cookie"]?.contains("SESSDATA=validated-session") == true)
+        assertTrue(http.lastHeaders["Cookie"]?.contains("bili_jct=validated-csrf") == true)
+        assertTrue("csrf=validated-csrf" in http.lastBody)
+    }
+
     private class RecordingHttpClient : HttpClient {
         var lastUrl = ""
         var lastBody = ""

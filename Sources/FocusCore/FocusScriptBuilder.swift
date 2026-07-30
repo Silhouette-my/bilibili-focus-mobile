@@ -9,7 +9,7 @@ public enum FocusScriptBuilder {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
 
-        let configJSON = try encode(settings, with: encoder)
+        let configJSON = try encode(settings.effectiveRuntimeSettings, with: encoder)
         let rulesJSON = try encode(rules, with: encoder)
 
         return FocusScriptSource.runtimeTemplate

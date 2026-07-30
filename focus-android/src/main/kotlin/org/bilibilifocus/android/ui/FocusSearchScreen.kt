@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -44,6 +45,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -51,10 +53,12 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
+import kotlinx.coroutines.flow.distinctUntilChanged
 import org.bilibilifocus.android.AndroidCookieProvider
 import org.bilibilifocus.android.FocusSearchViewModel
 import org.bilibilifocus.android.SearchUiState
@@ -77,6 +81,7 @@ fun FocusSearchScreen(
 ) {
     var searchQuery by remember { mutableStateOf("") }
     val state by viewModel.state.collectAsState()
+    val isLoadingMore by viewModel.isLoadingMore.collectAsState()
     val resolvedResultColumns = resultColumns.coerceAtLeast(1)
 
     // 从动态页搜索框带入的查询：自动填入并搜索一次
@@ -171,7 +176,31 @@ fun FocusSearchScreen(
             }
 
             is SearchUiState.Loaded -> {
+                val listState = rememberLazyListState()
+                val videoSection = s.sections.firstOrNull { it.filter == SearchResultFilter.VIDEO }
+                val loadMoreThreshold = with(LocalDensity.current) { 240.dp.roundToPx() }
+
+                LaunchedEffect(listState, videoSection?.items?.lastOrNull()?.id) {
+                    val currentSection = videoSection ?: return@LaunchedEffect
+                    val lastItemID = currentSection.items.lastOrNull()?.id ?: return@LaunchedEffect
+                    snapshotFlow {
+                        val layoutInfo = listState.layoutInfo
+                        val visibleSection = layoutInfo.visibleItemsInfo
+                            .firstOrNull { it.key == currentSection.id }
+                        visibleSection != null &&
+                            visibleSection.offset + visibleSection.size <=
+                            layoutInfo.viewportEndOffset + loadMoreThreshold
+                    }
+                        .distinctUntilChanged()
+                        .collect { reachedEnd ->
+                            if (reachedEnd) {
+                                viewModel.loadMoreIfNeeded(lastItemID)
+                            }
+                        }
+                }
+
                 LazyColumn(
+                    state = listState,
                     modifier = Modifier.fillMaxSize(),
                     contentPadding = PaddingValues(
                         start = 16.dp,
@@ -187,6 +216,7 @@ fun FocusSearchScreen(
                             onOpenItem = onOpenItem,
                             onOpenPreview = { item -> onOpenItem(item) },
                             resultColumns = resolvedResultColumns,
+                            isLoadingMore = isLoadingMore && section.filter == SearchResultFilter.VIDEO,
                         )
                     }
                     item { Spacer(modifier = Modifier.height(8.dp)) }
@@ -240,6 +270,7 @@ private fun FocusSearchSection(
     onOpenItem: (SearchResultItem) -> Unit,
     onOpenPreview: (SearchResultItem) -> Unit,
     resultColumns: Int,
+    isLoadingMore: Boolean,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Text(
@@ -349,6 +380,19 @@ private fun FocusSearchSection(
             }
 
             else -> {}
+        }
+
+        if (isLoadingMore) {
+            Box(
+                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(24.dp),
+                    strokeWidth = 2.dp,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
         }
     }
 }

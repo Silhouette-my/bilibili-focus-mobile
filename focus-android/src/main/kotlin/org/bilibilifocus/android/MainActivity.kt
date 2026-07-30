@@ -79,6 +79,7 @@ class MainActivity : ComponentActivity() {
                     Box(modifier = Modifier.fillMaxSize()) {
                         FocusApp(
                             settingsViewModel = settingsViewModel,
+                            appGraph = (application as FocusApplication).appGraph,
                             playbackConnection = playbackConnection,
                             playerSurfaceRevision = playerSurfaceRevision,
                             isInPictureInPictureMode = pictureInPictureMode.value,

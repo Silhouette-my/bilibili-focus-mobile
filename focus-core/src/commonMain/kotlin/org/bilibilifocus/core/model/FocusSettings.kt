@@ -8,6 +8,8 @@ data class FocusSettings(
     val redirectEnabled: Boolean = true,
     val playerMaskEnabled: Boolean = true,
     val nativeDanmakuEnabled: Boolean = true,
+    val nativeSubtitleEnabled: Boolean = true,
+    val nativeSubtitleLanguageCode: String = "",
     val searchMaskEnabled: Boolean = true,
     val dynamicMaskEnabled: Boolean = true,
     val debugMode: Boolean = false,
