@@ -18,9 +18,8 @@ class AndroidCookieProvider : CookieProvider {
 
     override suspend fun loadCookies(): List<Cookie> = withContext(Dispatchers.Main) {
         val manager = CookieManager.getInstance()
-        // Flush to ensure cookies are synced from persistent storage
-        manager.flush()
-
+        // getCookie reads WebView's current cookie store. flush writes to disk
+        // and can block, so persistence belongs to the login mutation path.
         buildAndroidCookieSnapshot(
             BILIBILI_COOKIE_SNAPSHOT_URLS.map { url ->
                 AndroidCookieHeaderSnapshot(

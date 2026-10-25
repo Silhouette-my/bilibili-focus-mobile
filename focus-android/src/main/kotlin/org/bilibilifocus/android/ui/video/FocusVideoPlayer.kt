@@ -86,10 +86,13 @@ internal fun PhoneFullscreenRotationEffect(
 
                 if (isInitialOrientation) {
                     currentOnInitialOrientationConsumed()
-                    // OrientationEventListener 启用后会立即上报当前方向。从 PiP
-                    // 返回时这只是设备当前姿态的快照，不应被当作一次新旋转。
-                    if (currentIgnoreInitialOrientation ||
-                        resolvedOrientation == FocusPhysicalOrientation.Portrait
+                    // Listener activation reports a posture snapshot. Ignore this event
+                    // after PiP/window mode; it is not a new physical rotation.
+                    if (FocusVideoRotationPolicy.shouldIgnoreInitialOrientationEvent(
+                            isInitialOrientation = isInitialOrientation,
+                            ignoreInitialOrientation = currentIgnoreInitialOrientation,
+                            orientation = resolvedOrientation,
+                        )
                     ) {
                         return
                     }
@@ -144,28 +147,46 @@ internal object FocusVideoFullscreenPolicy {
 }
 
 internal object FocusVideoRotationPolicy {
+    fun shouldArmInitialOrientationIgnore(
+        isInPictureInPictureMode: Boolean,
+        isInMultiWindowMode: Boolean,
+    ): Boolean = isInPictureInPictureMode || isInMultiWindowMode
+
+    fun shouldIgnoreInitialOrientationEvent(
+        isInitialOrientation: Boolean,
+        ignoreInitialOrientation: Boolean,
+        orientation: FocusPhysicalOrientation,
+    ): Boolean = isInitialOrientation &&
+        (ignoreInitialOrientation || orientation == FocusPhysicalOrientation.Portrait)
+
     fun shouldObservePhysicalOrientation(
         isPhone: Boolean,
         isVideoLoaded: Boolean,
         prefersPortraitFullscreen: Boolean,
         isInPictureInPictureMode: Boolean,
+        isInMultiWindowMode: Boolean = false,
     ): Boolean = isPhone &&
         isVideoLoaded &&
         !prefersPortraitFullscreen &&
-        !isInPictureInPictureMode
+        !isInPictureInPictureMode &&
+        !isInMultiWindowMode
 
     fun shouldCompleteFullscreenExit(
         isPhone: Boolean,
         isCompletingFullscreenExit: Boolean,
         configurationOrientation: Int,
         isInPictureInPictureMode: Boolean,
-    ): Boolean = isPhone &&
-        isCompletingFullscreenExit &&
-        configurationOrientation == Configuration.ORIENTATION_PORTRAIT &&
-        !isInPictureInPictureMode
+        isInMultiWindowMode: Boolean = false,
+    ): Boolean = isCompletingFullscreenExit &&
+        !isInPictureInPictureMode &&
+        (isInMultiWindowMode || (
+            isPhone && configurationOrientation == Configuration.ORIENTATION_PORTRAIT
+        ))
 
-    fun shouldApplyActivityOrientation(isInPictureInPictureMode: Boolean): Boolean =
-        !isInPictureInPictureMode
+    fun shouldApplyActivityOrientation(
+        isInPictureInPictureMode: Boolean,
+        isInMultiWindowMode: Boolean = false,
+    ): Boolean = !isInPictureInPictureMode && !isInMultiWindowMode
 }
 
 internal enum class FocusPhysicalOrientation {

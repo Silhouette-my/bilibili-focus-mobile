@@ -5,6 +5,16 @@ import org.bilibilifocus.core.model.FocusSettings
 
 class FocusRouter(private val settings: FocusSettings = FocusSettings.DEFAULTS) {
 
+    constructor(
+        redirectEnabled: Boolean,
+        defaultEntry: FocusEntry,
+    ) : this(
+        FocusSettings(
+            redirectEnabled = redirectEnabled,
+            defaultEntry = defaultEntry,
+        )
+    )
+
     sealed interface Decision {
         data object Allow : Decision
         data class Redirect(val entry: FocusEntry) : Decision

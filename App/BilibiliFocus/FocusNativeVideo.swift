@@ -43,7 +43,23 @@ final class FocusNativeVideoViewModel: ObservableObject {
     typealias SubtitlePreferenceChange = @MainActor (Bool, String) -> Void
     typealias PlaybackReadyWaiter = @MainActor (AVPlayerItem) async throws -> Void
     typealias InitialPlaybackSeeker = @MainActor (AVQueuePlayer, Int64) async throws -> Void
+    typealias PlaybackItemFactory = @MainActor (FocusVideoPlaybackSource) async throws -> [AVPlayerItem]
     typealias AccountScopeProvider = @Sendable () async -> FocusPlaybackAccountScope
+
+    /// Route-local list metadata only. Never substitutes for fetched detail,
+    /// player readiness or the first-frame diagnostic.
+    struct RoutePreview: Equatable {
+        let title: String
+        let coverURL: URL?
+    }
+
+    enum PlaybackPreparationError: Error, LocalizedError {
+        case readinessTimedOut
+
+        var errorDescription: String? {
+            "播放器准备超时，请重试播放。"
+        }
+    }
 
     enum State: Equatable {
         case idle
@@ -91,9 +107,11 @@ final class FocusNativeVideoViewModel: ObservableObject {
     }
 
     @Published private(set) var state: State = .idle
+    @Published private(set) var routePreview: RoutePreview?
     @Published private(set) var comments: [FocusVideoComment] = []
     @Published private(set) var commentTotalCount: Int64 = 0
     @Published private(set) var isLoadingMoreComments = false
+    @Published private(set) var commentsErrorMessage: String?
     @Published private(set) var interactionState = FocusVideoInteractionState()
     @Published private(set) var isLoadingInteractions = false
     @Published private(set) var actionsInFlight: Set<Action> = []
@@ -104,6 +122,9 @@ final class FocusNativeVideoViewModel: ObservableObject {
     @Published private(set) var isPlaying = false
     @Published private(set) var playbackRate: Float = 1
     @Published private(set) var playbackPositionMilliseconds: Int64 = 0
+    @Published private(set) var availableQualities: [FocusVideoQuality] = []
+    @Published private(set) var selectedQuality = 80
+    @Published private(set) var qualityDescription = "自动清晰度"
     @Published private(set) var danmakus: [FocusVideoDanmaku] = []
     @Published private(set) var danmakuLoadState: DanmakuLoadState = .idle
     @Published private(set) var isDanmakuEnabled: Bool
@@ -136,6 +157,8 @@ final class FocusNativeVideoViewModel: ObservableObject {
     private var loadTask: Task<Void, Never>?
     private var commentsTask: Task<Void, Never>?
     private var commentsNextCursor: FocusVideoCommentCursor?
+    private var consumedCommentCursors: Set<FocusVideoCommentCursor> = []
+    private var isCommentsPaginationActive = false
     private var commentReplyTasks: [Int64: Task<Void, Never>] = [:]
     private var commentLikeTasks: [Int64: Task<Void, Never>] = [:]
     private var interactionTask: Task<Void, Never>?
@@ -174,6 +197,8 @@ final class FocusNativeVideoViewModel: ObservableObject {
     private var shouldResumeAfterActivation = false
     private var shouldResumeAfterAudioInterruption = false
     private var isReplacingPlayerItem = false
+    private var playbackRateBeforeTemporaryChange: Float?
+    private var preparedMediaDurationMilliseconds: Int64?
     private var isPlaybackSessionActive = false
     nonisolated(unsafe) private var audioInterruptionObserver: NSObjectProtocol?
     nonisolated(unsafe) private var audioRouteChangeObserver: NSObjectProtocol?
@@ -192,13 +217,23 @@ final class FocusNativeVideoViewModel: ObservableObject {
     private let subtitlePreferenceChange: SubtitlePreferenceChange
     private let playbackReadyWaiter: PlaybackReadyWaiter
     private let initialPlaybackSeeker: InitialPlaybackSeeker
+    private let playbackItemFactory: PlaybackItemFactory
+    private let resumeBudgetNanoseconds: UInt64
+    private let resumeBudgetSleeper: FocusAsyncDeadline.Sleeper
+    private(set) var playbackDiagnosticID = UUID()
+    private var requestSessionVersion: UInt64?
+    private var firstFrameSpan: BiliPerformanceSpan?
+    private var videoStartupSpan: BiliPerformanceSpan?
+    private var videoStartupID = UUID()
+    private var activeSurfaces: Set<UUID> = []
+    private var readySurface: (surface: UUID, item: ObjectIdentifier, request: UUID, fullscreen: Bool)?
     private(set) var isCompletingPortraitExit = false
 
     var navigationTitle: String {
         if case let .loaded(detail) = state {
             return detail.title
         }
-        return "视频"
+        return routePreview?.title.nilIfBlank ?? "视频"
     }
 
     var currentURL: URL? {
@@ -219,6 +254,25 @@ final class FocusNativeVideoViewModel: ObservableObject {
         return detail.pages.first(where: { $0.cid == selectedPageCID })
             ?? detail.pages.first(where: { $0.cid == detail.cid })
             ?? detail.pages.first
+    }
+
+    var playbackDurationMilliseconds: Int64 {
+        if let item = player.currentItem, item.duration.isNumeric {
+            let seconds = item.duration.seconds
+            if seconds.isFinite, seconds > 0 { return Int64(seconds * 1_000) }
+        }
+        if let preparedMediaDurationMilliseconds { return preparedMediaDurationMilliseconds }
+        return max(activePage?.duration ?? detail?.duration ?? 0, 0) * 1_000
+    }
+
+    var hasPlaybackEnded: Bool {
+        hasPreparedPlayer && !isLoadingPlayback && player.currentItem == nil
+    }
+
+    private var isPlaybackRequested: Bool {
+        FocusNativePlaybackLifecyclePolicy.isPlaybackRequested(
+            rate: player.rate, timeControlStatus: player.timeControlStatus
+        )
     }
 
     var showsPlaybackControls: Bool {
@@ -266,7 +320,10 @@ final class FocusNativeVideoViewModel: ObservableObject {
         portraitFullscreenRequest: PortraitFullscreenRequest? = nil,
         portraitTransition: PortraitTransition? = nil,
         playbackReadyWaiter: PlaybackReadyWaiter? = nil,
-        initialPlaybackSeeker: InitialPlaybackSeeker? = nil
+        initialPlaybackSeeker: InitialPlaybackSeeker? = nil,
+        playbackItemFactory: PlaybackItemFactory? = nil,
+        resumeBudgetNanoseconds: UInt64 = 2_000_000_000,
+        resumeBudgetSleeper: @escaping FocusAsyncDeadline.Sleeper = { try await Task.sleep(nanoseconds: $0) }
     ) {
         self.detailService = detailService
         self.actionService = actionService
@@ -296,6 +353,9 @@ final class FocusNativeVideoViewModel: ObservableObject {
         self.initialPlaybackSeeker = initialPlaybackSeeker ?? { player, milliseconds in
             try await Self.seek(player, toMilliseconds: milliseconds)
         }
+        self.playbackItemFactory = playbackItemFactory ?? FocusNativePlaybackFactory.makeItems
+        self.resumeBudgetNanoseconds = resumeBudgetNanoseconds
+        self.resumeBudgetSleeper = resumeBudgetSleeper
         let player = AVQueuePlayer()
         player.actionAtItemEnd = .advance
         player.automaticallyWaitsToMinimizeStalling = true
@@ -308,7 +368,10 @@ final class FocusNativeVideoViewModel: ObservableObject {
                 guard let self else {
                     return
                 }
-                self.isPlaying = player.timeControlStatus == .playing
+                self.isPlaying = player.rate > 0 && player.timeControlStatus == .playing
+                if self.hasPlaybackEnded {
+                    self.playbackPositionMilliseconds = self.playbackDurationMilliseconds
+                }
                 self.updateNowPlayingInfo()
                 if player.timeControlStatus != .playing, !self.isReplacingPlayerItem {
                     self.queueWatchHistoryReport(force: true)
@@ -320,10 +383,14 @@ final class FocusNativeVideoViewModel: ObservableObject {
                 return
             }
             Task { @MainActor [weak self] in
-                guard let self else {
+                // The callback may have been queued by a positive rate just
+                // before pause(). Re-read once on the actor; zero is transport
+                // state, not a new user-selected playback speed.
+                let rate = player.rate
+                guard let self, rate > 0 else {
                     return
                 }
-                self.playbackRate = player.rate
+                self.playbackRate = rate
                 self.updateNowPlayingInfo()
             }
         }
@@ -394,8 +461,24 @@ final class FocusNativeVideoViewModel: ObservableObject {
         player.removeAllItems()
     }
 
+    func reconcileSessionVersion(_ version: UInt64) {
+        guard version == detailService.sessionVersion, requestSessionVersion != version else { return }
+        requestSessionVersion = version
+        // Only unfinished setup needs replacement. Unchanged credentials must
+        // not interrupt an already-running media item.
+        if case .loading = state { reload() }
+        else if isLoadingPlayback && !hasPreparedPlayer { reload() }
+    }
+
+    func seedRoutePreview(_ preview: RoutePreview?, for url: URL) {
+        open(url)
+        routePreview = preview
+    }
+
     func activate(url: URL) {
         open(url)
+        if !hasPreparedPlayer, videoStartupSpan == nil { beginVideoStartup() }
+        isCommentsPaginationActive = true
         retryPendingWatchHistoryReports()
         activatePlaybackSession()
         loadIfNeeded()
@@ -431,7 +514,10 @@ final class FocusNativeVideoViewModel: ObservableObject {
         queueWatchHistoryReport(force: true)
         activePlaybackAccountScope = nil
         cancelTasks()
+        finishVideoStartup(outcome: .cancelled)
+        beginVideoStartup()
         sourceURL = canonicalURL
+        routePreview = nil
         requestedPageNumber = FocusVideoDetailService.requestedPageNumber(from: canonicalURL)
         requestedPageCID = FocusVideoDetailService.requestedPageCID(from: canonicalURL)
         shouldResolveInitialResumePage = requestedPageNumber == nil && requestedPageCID == nil
@@ -439,12 +525,17 @@ final class FocusNativeVideoViewModel: ObservableObject {
         comments = []
         commentTotalCount = 0
         commentsNextCursor = nil
+        consumedCommentCursors.removeAll()
+        commentsErrorMessage = nil
         isLoadingMoreComments = false
         resetCommentInteractionSession()
         interactionState = FocusVideoInteractionState()
         isLoadingInteractions = false
         actionsInFlight = []
         selectedPageCID = nil
+        availableQualities = []
+        selectedQuality = 80
+        qualityDescription = "自动清晰度"
         resetDanmakuSession()
         resetSubtitleSession()
         playerErrorMessage = nil
@@ -471,10 +562,13 @@ final class FocusNativeVideoViewModel: ObservableObject {
         queueWatchHistoryReport(force: true)
         activePlaybackAccountScope = nil
         cancelTasks()
+        if videoStartupSpan == nil { beginVideoStartup() }
         state = .loading
         comments = []
         commentTotalCount = 0
         commentsNextCursor = nil
+        consumedCommentCursors.removeAll()
+        commentsErrorMessage = nil
         isLoadingMoreComments = false
         resetCommentInteractionSession()
         interactionState = FocusVideoInteractionState()
@@ -490,6 +584,9 @@ final class FocusNativeVideoViewModel: ObservableObject {
         player.removeAllItems()
 
         let generation = loadGeneration
+        requestSessionVersion = detailService.sessionVersion
+        let detailDiagnosticID = videoStartupID
+        let detailSpan = BiliPerformanceStore.shared.begin(.videoDetail, correlationID: detailDiagnosticID)
         loadTask = Task { [weak self, detailService] in
             guard let self else {
                 return
@@ -503,8 +600,10 @@ final class FocusNativeVideoViewModel: ObservableObject {
                 let detail = try await detailService.fetchDetail(for: sourceURL)
                 try Task.checkCancellation()
                 guard loadGeneration == generation else {
+                    BiliPerformanceStore.shared.end(detailSpan, outcome: .stale)
                     return
                 }
+                BiliPerformanceStore.shared.end(detailSpan)
                 state = .loaded(detail)
                 let requestedPage = requestedPageNumber.flatMap { number in
                     detail.pages.first(where: { $0.pageNumber == number })
@@ -519,23 +618,29 @@ final class FocusNativeVideoViewModel: ObservableObject {
                 configureNowPlayingMetadata(for: detail)
                 configureDanmaku(for: detail, playbackPositionMilliseconds: 0)
                 configureSubtitles(for: detail)
-                preparePlayback()
+                preparePlayback(correlationID: detailDiagnosticID)
                 loadComments(for: detail)
                 loadInteractions(for: detail)
             } catch is CancellationError {
+                BiliPerformanceStore.shared.end(detailSpan, outcome: .cancelled)
                 return
             } catch {
+                BiliPerformanceStore.shared.end(detailSpan, outcome: .failure)
                 guard !Task.isCancelled, loadGeneration == generation else {
                     return
                 }
                 state = .failed(error.localizedDescription)
+                finishVideoStartup(outcome: .failure)
             }
         }
     }
 
     func suspend() {
+        endTemporaryPlaybackRate()
+        isCommentsPaginationActive = false
+        finishVideoStartup(outcome: .cancelled)
         queueWatchHistoryReport(force: true)
-        shouldResumeAfterActivation = player.timeControlStatus == .playing
+        shouldResumeAfterActivation = isPlaybackRequested
         shouldResumeAfterAudioInterruption = false
         let wasPreparingPlayback = playbackTask != nil || isLoadingPlayback
         cancelLoadTask()
@@ -567,6 +672,7 @@ final class FocusNativeVideoViewModel: ObservableObject {
     }
 
     func handleAppDidEnterBackground() {
+        endTemporaryPlaybackRate()
         queueWatchHistoryReport(force: true)
         if FocusNativePlaybackLifecyclePolicy.shouldPauseForApplicationBackground(
             isPlaying: player.timeControlStatus == .playing
@@ -610,9 +716,10 @@ final class FocusNativeVideoViewModel: ObservableObject {
             return
         }
 
-        if player.timeControlStatus == .playing {
+        if isPlaybackRequested {
             queueWatchHistoryReport(force: true)
             player.pause()
+            isPlaying = false
             return
         }
 
@@ -630,11 +737,62 @@ final class FocusNativeVideoViewModel: ObservableObject {
         let rates: [Float] = [1, 1.25, 1.5, 2]
         let currentIndex = rates.firstIndex(where: { abs($0 - playbackRate) < 0.01 }) ?? 0
         let nextRate = rates[(currentIndex + 1) % rates.count]
-        playbackRate = nextRate
-        player.defaultRate = nextRate
-        if player.timeControlStatus == .playing {
-            player.rate = nextRate
+        setPlaybackRate(nextRate)
+    }
+
+    func setPlaybackRate(_ rate: Float) {
+        guard rate.isFinite, rate >= 0.5, rate <= 3 else { return }
+        playbackRateBeforeTemporaryChange = nil
+        applyPlaybackRate(rate)
+    }
+
+    func beginTemporaryPlaybackRate(_ rate: Float = 2) {
+        guard hasPreparedPlayer, isPlaybackRequested,
+              playbackRateBeforeTemporaryChange == nil else { return }
+        playbackRateBeforeTemporaryChange = playbackRate
+        applyPlaybackRate(max(playbackRate, rate))
+    }
+
+    func endTemporaryPlaybackRate() {
+        guard let previous = playbackRateBeforeTemporaryChange else { return }
+        playbackRateBeforeTemporaryChange = nil
+        applyPlaybackRate(previous)
+    }
+
+    private func applyPlaybackRate(_ rate: Float) {
+        playbackRate = rate
+        player.defaultRate = rate
+        if isPlaybackRequested {
+            player.rate = rate
         }
+        updateNowPlayingInfo()
+    }
+
+    func seek(toMilliseconds position: Int64) {
+        guard hasPreparedPlayer, !isLoadingPlayback, let item = player.currentItem else { return }
+        let target = min(max(position, 0), playbackDurationMilliseconds)
+        let generation = playbackGeneration
+        item.cancelPendingSeeks()
+        playbackPositionMilliseconds = target
+        updateDanmakuPosition(target)
+        player.seek(to: CMTime(value: target, timescale: 1_000), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak item] finished in
+            Task { @MainActor [weak self, weak item] in
+                guard let self, finished, playbackGeneration == generation,
+                      player.currentItem === item else { return }
+                queueWatchHistoryReport(force: true)
+                updateNowPlayingInfo()
+            }
+        }
+    }
+
+    func selectQuality(_ quality: FocusVideoQuality) {
+        guard !isLoadingPlayback, quality.id != selectedQuality,
+              availableQualities.contains(where: { $0.id == quality.id }) else { return }
+        let position = currentPlaybackMilliseconds
+        let shouldPlay = isPlaybackRequested
+        queueWatchHistoryReport(force: true)
+        selectedQuality = quality.id
+        preparePlayback(initialPosition: position, startsPlaying: shouldPlay)
     }
 
     func toggleDanmaku() {
@@ -737,8 +895,20 @@ final class FocusNativeVideoViewModel: ObservableObject {
             .joined(separator: "\n")
     }
 
+    func commentDidAppear(_ commentID: Int64) {
+        guard commentsErrorMessage == nil,
+              comments.suffix(4).contains(where: { $0.id == commentID }) else { return }
+        loadMoreComments()
+    }
+
+    func retryComments() {
+        if comments.isEmpty, let detail { loadComments(for: detail) }
+        else { loadMoreComments() }
+    }
+
     func loadMoreComments() {
         guard
+            isCommentsPaginationActive,
             commentsTask == nil,
             let detail,
             let cursor = commentsNextCursor,
@@ -748,6 +918,7 @@ final class FocusNativeVideoViewModel: ObservableObject {
         }
 
         let generation = commentsGeneration
+        commentsErrorMessage = nil
         isLoadingMoreComments = true
         commentsTask = Task {
             [weak self, detailService, accountScopeProvider] in
@@ -801,9 +972,13 @@ final class FocusNativeVideoViewModel: ObservableObject {
                     contentsOf: page.comments.filter { seen.insert($0.id).inserted }
                 )
                 commentTotalCount = max(commentTotalCount, page.totalCount)
-                commentsNextCursor = page.nextCursor == cursor ? nil : page.nextCursor
-            } catch {
+                consumedCommentCursors.insert(cursor)
+                commentsNextCursor = page.nextCursor.flatMap { consumedCommentCursors.contains($0) ? nil : $0 }
+            } catch is CancellationError {
                 return
+            } catch {
+                guard commentsGeneration == generation, !Task.isCancelled else { return }
+                commentsErrorMessage = error.localizedDescription
             }
         }
     }
@@ -1123,7 +1298,10 @@ final class FocusNativeVideoViewModel: ObservableObject {
         }
     }
 
-    private func preparePlayback() {
+    private func preparePlayback(
+        correlationID: UUID? = nil, initialPosition: Int64? = nil,
+        startsPlaying: Bool = true
+    ) {
         guard let detail else {
             return
         }
@@ -1131,15 +1309,25 @@ final class FocusNativeVideoViewModel: ObservableObject {
             ?? detail.pages.first(where: { $0.cid == detail.cid })?.cid
             ?? detail.pages.first?.cid
             ?? detail.cid
-        let mayResolveResumePage = shouldResolveInitialResumePage
+        // Only a multi-part video needs history before choosing a stream CID.
+        // Single-part videos can fetch the stream while history is still loading.
+        let mayResolveResumePage = shouldResolveInitialResumePage && detail.pages.count > 1
+        let requestedQuality = selectedQuality
 
+        endTemporaryPlaybackRate()
         cancelPlaybackTask()
+        playbackDiagnosticID = correlationID ?? (videoStartupSpan == nil ? UUID() : videoStartupID)
+        requestSessionVersion = detailService.sessionVersion
+        let diagnosticID = playbackDiagnosticID
+        firstFrameSpan = BiliPerformanceStore.shared.begin(.firstFrame, correlationID: diagnosticID)
+        readySurface = nil
         activePlaybackAccountScope = nil
         let generation = playbackGeneration
         isReplacingPlayerItem = true
         player.pause()
         player.removeAllItems()
         playbackPositionMilliseconds = 0
+        preparedMediaDurationMilliseconds = nil
         isLoadingPlayback = true
         hasPreparedPlayer = false
         playerErrorMessage = nil
@@ -1151,7 +1339,6 @@ final class FocusNativeVideoViewModel: ObservableObject {
                 playbackProgressStore,
                 playbackProgressWriteCoordinator,
                 accountScopeProvider,
-                playbackReadyWaiter,
                 initialPlaybackSeeker,
             ] in
             guard let self else {
@@ -1163,22 +1350,24 @@ final class FocusNativeVideoViewModel: ObservableObject {
                 }
             }
             do {
-                let accountScope = await accountScopeProvider()
+                async let sessionVersionRequest = detailService.prepareSessionVersion()
+                async let accountScopeRequest = accountScopeProvider()
+                let (sessionVersion, accountScope) = await (sessionVersionRequest, accountScopeRequest)
                 try Task.checkCancellation()
-                guard playbackGeneration == generation else {
+                guard playbackGeneration == generation, detailService.sessionVersion == sessionVersion else {
                     return
                 }
-                await playbackProgressWriteCoordinator.waitForPendingWrites()
-                try Task.checkCancellation()
-                guard playbackGeneration == generation else {
-                    return
-                }
-
                 var playbackCID = cid
                 var localResume: FocusPlaybackProgressEntry?
                 var serverResume: FocusVideoPlaybackResume?
-                let source: FocusVideoPlaybackSource
-                if mayResolveResumePage {
+                if initialPosition != nil {
+                    try await prepareMedia(
+                        bvid: detail.bvid, cid: cid, quality: requestedQuality, generation: generation,
+                        sessionVersion: sessionVersion, diagnosticID: diagnosticID
+                    )
+                } else if mayResolveResumePage {
+                    await playbackProgressWriteCoordinator.waitForPendingWrites()
+                    try Task.checkCancellation()
                     let storedResume = await playbackProgressStore.recentProgress(
                         accountScope: accountScope,
                         aid: detail.aid,
@@ -1203,10 +1392,7 @@ final class FocusNativeVideoViewModel: ObservableObject {
                             updateNowPlayingInfo()
                             configureDanmaku(for: detail, playbackPositionMilliseconds: 0)
                         } else {
-                            serverResume = try? await detailService.fetchPlaybackResume(
-                                aid: detail.aid,
-                                cid: cid
-                            )
+                            serverResume = try await boundedServerResume(aid: detail.aid, cid: cid, diagnosticID: diagnosticID)
                             try Task.checkCancellation()
                             guard playbackGeneration == generation else {
                                 return
@@ -1222,12 +1408,21 @@ final class FocusNativeVideoViewModel: ObservableObject {
                             }
                         }
                     }
-                    source = try await detailService.fetchPlayback(
-                        bvid: detail.bvid,
-                        cid: playbackCID
+                    try await prepareMedia(
+                        bvid: detail.bvid, cid: playbackCID, quality: requestedQuality, generation: generation,
+                        sessionVersion: sessionVersion, diagnosticID: diagnosticID
                     )
                 } else {
-                    async let sourceRequest = detailService.fetchPlayback(bvid: detail.bvid, cid: cid)
+                    shouldResolveInitialResumePage = false
+                    async let mediaReady: Void = prepareMedia(
+                        bvid: detail.bvid, cid: cid, quality: requestedQuality, generation: generation,
+                        sessionVersion: sessionVersion, diagnosticID: diagnosticID
+                    )
+                    // The CID is already known. A previous route's progress
+                    // write must finish before reading resume, not before CDN
+                    // preparation; both branches still join before playback.
+                    await playbackProgressWriteCoordinator.waitForPendingWrites()
+                    try Task.checkCancellation()
                     localResume = await playbackProgressStore.recentProgress(
                         accountScope: accountScope,
                         aid: detail.aid,
@@ -1246,45 +1441,19 @@ final class FocusNativeVideoViewModel: ObservableObject {
                         localResume = nil
                     }
                     if localResume == nil {
-                        serverResume = try? await detailService.fetchPlaybackResume(
-                            aid: detail.aid,
-                            cid: cid
-                        )
+                        serverResume = try await boundedServerResume(aid: detail.aid, cid: cid, diagnosticID: diagnosticID)
                     }
-                    source = try await sourceRequest
+                    try await mediaReady
                 }
                 try Task.checkCancellation()
                 guard playbackGeneration == generation else {
                     return
                 }
-                let items = try await FocusNativePlaybackFactory.makeItems(for: source)
-                try Task.checkCancellation()
-                guard playbackGeneration == generation else {
-                    return
-                }
-                guard !items.isEmpty else {
-                    throw FocusVideoDetailService.ServiceError.noStream
-                }
-
-                player.removeAllItems()
-                var previousItem: AVPlayerItem?
-                for item in items where player.canInsert(item, after: previousItem) {
-                    player.insert(item, after: previousItem)
-                    previousItem = item
-                }
-                guard let firstItem = player.currentItem else {
-                    throw FocusVideoDetailService.ServiceError.noStream
-                }
-
-                try await playbackReadyWaiter(firstItem)
-                try Task.checkCancellation()
-                guard playbackGeneration == generation else {
-                    return
-                }
+                guard detailService.sessionVersion == sessionVersion else { throw CancellationError() }
 
                 let durationSeconds = detail.pages.first(where: { $0.cid == playbackCID })?.duration
                     ?? detail.duration
-                let initialPositionMilliseconds =
+                let initialPositionMilliseconds = initialPosition ??
                     FocusPlaybackResumeResolver.initialPositionMilliseconds(
                         local: localResume,
                         server: serverResume,
@@ -1301,14 +1470,17 @@ final class FocusNativeVideoViewModel: ObservableObject {
                     updateDanmakuPosition(initialPositionMilliseconds)
                 }
 
+                guard detailService.sessionVersion == sessionVersion else { throw CancellationError() }
                 activePlaybackAccountScope = accountScope
                 isLoadingPlayback = false
                 hasPreparedPlayer = true
+                finishFirstFrameIfPresentable()
                 configureAudioSession()
                 player.defaultRate = playbackRate
                 isReplacingPlayerItem = false
                 updateNowPlayingInfo()
-                player.playImmediately(atRate: playbackRate)
+                if startsPlaying { player.playImmediately(atRate: playbackRate) }
+                else { player.pause() }
                 queueWatchHistoryReport(force: true)
             } catch is CancellationError {
                 return
@@ -1319,9 +1491,175 @@ final class FocusNativeVideoViewModel: ObservableObject {
                 isLoadingPlayback = false
                 hasPreparedPlayer = false
                 isReplacingPlayerItem = false
+                if let firstFrameSpan { BiliPerformanceStore.shared.end(firstFrameSpan, outcome: .failure) }
+                firstFrameSpan = nil
+                finishVideoStartup(outcome: .failure)
                 playerErrorMessage = error.localizedDescription
             }
         }
+    }
+
+    private func prepareMedia(
+        bvid: String, cid: Int64, quality: Int, generation: UInt64, sessionVersion: UInt64, diagnosticID: UUID
+    ) async throws {
+        let urlSpan = BiliPerformanceStore.shared.begin(.playbackURL, correlationID: diagnosticID)
+        let source: FocusVideoPlaybackSource
+        do {
+            source = try await detailService.fetchPlayback(bvid: bvid, cid: cid, quality: quality)
+            BiliPerformanceStore.shared.end(urlSpan)
+        } catch {
+            BiliPerformanceStore.shared.end(urlSpan, outcome: error is CancellationError ? .cancelled : .failure)
+            throw error
+        }
+        try Task.checkCancellation()
+        guard playbackGeneration == generation, detailService.sessionVersion == sessionVersion else { throw CancellationError() }
+        availableQualities = source.availableQualities
+        selectedQuality = source.quality ?? quality
+        qualityDescription = source.qualityDescription
+
+        let streams = [source.stream] + source.fallbackStreams
+        let started = ContinuousClock.now
+        let totalBudget: UInt64 = 30_000_000_000
+        for (index, stream) in streams.enumerated() {
+            try Task.checkCancellation()
+            let elapsed = started.duration(to: .now).components
+            let elapsedNanoseconds = UInt64(elapsed.seconds) * 1_000_000_000 + UInt64(elapsed.attoseconds / 1_000_000_000)
+            guard elapsedNanoseconds < totalBudget else { throw PlaybackPreparationError.readinessTimedOut }
+            // Give each remaining address a chance inside the original 30s
+            // startup budget, rather than waiting 30s again for every CDN.
+            let attemptBudget = (totalBudget - elapsedNanoseconds) / UInt64(streams.count - index)
+            let candidate = FocusVideoPlaybackSource(
+                stream: stream, headers: source.headers, qualityDescription: source.qualityDescription
+            )
+            do {
+                try await FocusAsyncDeadline.value(timeoutNanoseconds: attemptBudget) { [weak self] in
+                    guard let self else { throw CancellationError() }
+                    try await self.prepareMediaCandidate(
+                        candidate, generation: generation, sessionVersion: sessionVersion, diagnosticID: diagnosticID
+                    )
+                }
+                return
+            } catch {
+                try Task.checkCancellation()
+                guard playbackGeneration == generation, detailService.sessionVersion == sessionVersion else { throw CancellationError() }
+                guard index + 1 < streams.count, Self.canTryBackupStream(after: error) else {
+                    if error is FocusAsyncDeadlineError { throw PlaybackPreparationError.readinessTimedOut }
+                    throw error
+                }
+            }
+        }
+    }
+
+    private static func canTryBackupStream(after error: Error) -> Bool {
+        if error is FocusAsyncDeadlineError || error is PlaybackPreparationError { return true }
+        let failure = error as NSError
+        if failure.domain == NSURLErrorDomain {
+            return [URLError.timedOut, .cannotFindHost, .cannotConnectToHost, .networkConnectionLost,
+                    .dnsLookupFailed, .badServerResponse, .resourceUnavailable, .cannotLoadFromNetwork]
+                .contains(URLError.Code(rawValue: failure.code))
+        }
+        if failure.domain == AVFoundationErrorDomain {
+            return [AVError.failedToLoadMediaData, .serverIncorrectlyConfigured, .fileFormatNotRecognized,
+                    .contentIsUnavailable].contains(AVError.Code(rawValue: failure.code))
+        }
+        if let underlying = failure.userInfo[NSUnderlyingErrorKey] as? Error {
+            return canTryBackupStream(after: underlying)
+        }
+        return false
+    }
+
+    private func prepareMediaCandidate(
+        _ source: FocusVideoPlaybackSource, generation: UInt64, sessionVersion: UInt64, diagnosticID: UUID
+    ) async throws {
+        let mediaSpan = BiliPerformanceStore.shared.begin(.mediaPreparation, correlationID: diagnosticID)
+        let items: [AVPlayerItem]
+        do {
+            items = try await playbackItemFactory(source)
+            try Task.checkCancellation()
+            guard playbackGeneration == generation, detailService.sessionVersion == sessionVersion else { throw CancellationError() }
+            guard !items.isEmpty else { throw FocusVideoDetailService.ServiceError.noStream }
+            player.removeAllItems()
+            var previous: AVPlayerItem?
+            for item in items where player.canInsert(item, after: previous) {
+                player.insert(item, after: previous)
+                previous = item
+            }
+            BiliPerformanceStore.shared.end(mediaSpan)
+        } catch {
+            BiliPerformanceStore.shared.end(mediaSpan, outcome: error is CancellationError ? .cancelled : .failure)
+            throw error
+        }
+        guard let firstItem = player.currentItem else { throw FocusVideoDetailService.ServiceError.noStream }
+        let readySpan = BiliPerformanceStore.shared.begin(.playerReady, correlationID: diagnosticID)
+        do {
+            try await playbackReadyWaiter(firstItem)
+            try Task.checkCancellation()
+            guard playbackGeneration == generation, detailService.sessionVersion == sessionVersion,
+                  player.currentItem === firstItem else { throw CancellationError() }
+            let durationSeconds = firstItem.duration.seconds
+            if durationSeconds.isFinite, durationSeconds > 0 {
+                preparedMediaDurationMilliseconds = Int64(durationSeconds * 1_000)
+            }
+            BiliPerformanceStore.shared.end(readySpan)
+        } catch {
+            BiliPerformanceStore.shared.end(readySpan, outcome: error is CancellationError ? .cancelled : .failure)
+            throw error
+        }
+    }
+
+    private func boundedServerResume(aid: Int64, cid: Int64, diagnosticID: UUID) async throws -> FocusVideoPlaybackResume? {
+        let span = BiliPerformanceStore.shared.begin(.resumeLookup, correlationID: diagnosticID)
+        do {
+            let resume = try await FocusAsyncDeadline.value(
+                timeoutNanoseconds: resumeBudgetNanoseconds, sleeper: resumeBudgetSleeper
+            ) { [detailService] in try await detailService.fetchPlaybackResume(aid: aid, cid: cid) }
+            BiliPerformanceStore.shared.end(span)
+            return resume
+        } catch is CancellationError {
+            BiliPerformanceStore.shared.end(span, outcome: .cancelled)
+            throw CancellationError()
+        } catch FocusAsyncDeadlineError.timedOut {
+            BiliPerformanceStore.shared.end(span, outcome: .timedOut)
+            return nil
+        } catch {
+            BiliPerformanceStore.shared.end(span, outcome: .fallback)
+            return nil
+        }
+    }
+
+    func activatePresentationSurface(_ id: UUID) { activeSurfaces.insert(id) }
+    func deactivatePresentationSurface(_ id: UUID) {
+        activeSurfaces.remove(id)
+        if readySurface?.surface == id { readySurface = nil }
+    }
+    func recordSurfaceReadiness(surface: UUID, itemID: ObjectIdentifier?, isReady: Bool, requestID: UUID,
+                                isFullscreenSurface: Bool = false) {
+        guard requestID == playbackDiagnosticID, activeSurfaces.contains(surface),
+              isFullscreenSurface == isFullscreen,
+              let itemID, player.currentItem.map(ObjectIdentifier.init) == itemID else { return }
+        if isReady { readySurface = (surface, itemID, requestID, isFullscreenSurface) }
+        else if readySurface?.surface == surface { readySurface = nil }
+        finishFirstFrameIfPresentable()
+    }
+    private func finishFirstFrameIfPresentable() {
+        guard hasPreparedPlayer, !isLoadingPlayback, let readySurface,
+              readySurface.request == playbackDiagnosticID, readySurface.fullscreen == isFullscreen,
+              activeSurfaces.contains(readySurface.surface),
+              player.currentItem.map(ObjectIdentifier.init) == readySurface.item,
+              let span = firstFrameSpan else { return }
+        BiliPerformanceStore.shared.end(span)
+        firstFrameSpan = nil
+        finishVideoStartup(outcome: .success)
+    }
+
+    private func beginVideoStartup() {
+        videoStartupID = UUID()
+        videoStartupSpan = BiliPerformanceStore.shared.begin(.videoStartup, correlationID: videoStartupID)
+    }
+
+    private func finishVideoStartup(outcome: BiliPerformanceOutcome) {
+        if let videoStartupSpan { BiliPerformanceStore.shared.end(videoStartupSpan, outcome: outcome) }
+        videoStartupSpan = nil
     }
 
     private func queueWatchHistoryReport(force: Bool) {
@@ -1426,7 +1764,7 @@ final class FocusNativeVideoViewModel: ObservableObject {
     }
 
     private var currentPlaybackMilliseconds: Int64 {
-        Self.milliseconds(from: player.currentTime())
+        hasPlaybackEnded ? playbackDurationMilliseconds : Self.milliseconds(from: player.currentTime())
     }
 
     var danmakuPlaybackPositionMilliseconds: Int64 {
@@ -1852,6 +2190,8 @@ final class FocusNativeVideoViewModel: ObservableObject {
     private func loadComments(for detail: FocusVideoDetail) {
         cancelCommentsTask()
         commentsNextCursor = nil
+        consumedCommentCursors.removeAll()
+        commentsErrorMessage = nil
         commentTotalCount = 0
         commentAccountScope = nil
         let generation = commentsGeneration
@@ -1891,14 +2231,16 @@ final class FocusNativeVideoViewModel: ObservableObject {
                     return
                 }
 
-                self.comments = page.comments
+                var seen: Set<Int64> = []
+                self.comments = page.comments.filter { seen.insert($0.id).inserted }
                 self.commentTotalCount = page.totalCount
                 self.commentsNextCursor = page.nextCursor
                 self.commentAccountScope = accountScope
             } catch is CancellationError {
                 return
             } catch {
-                return
+                guard commentsGeneration == generation, !Task.isCancelled else { return }
+                commentsErrorMessage = error.localizedDescription
             }
         }
     }
@@ -2472,13 +2814,16 @@ final class FocusNativeVideoViewModel: ObservableObject {
         }
     }
 
-    private static func waitUntilReadyToPlay(_ item: AVPlayerItem) async throws {
-        for await status in item.publisher(
-            for: \.status,
-            options: [.initial, .new]
-        ).values {
+    static func waitUntilReadyToPlay(
+        _ item: AVPlayerItem,
+        timeout: Duration = .seconds(30)
+    ) async throws {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        // AsyncPublisher can drop the ready transition between iterator demands.
+        // Read the actual state so an already-ready item cannot wait forever.
+        while true {
             try Task.checkCancellation()
-            switch status {
+            switch item.status {
             case .readyToPlay:
                 return
             case .failed:
@@ -2487,12 +2832,15 @@ final class FocusNativeVideoViewModel: ObservableObject {
                 }
                 throw FocusVideoDetailService.ServiceError.invalidResponse
             case .unknown:
-                continue
+                break
             @unknown default:
-                continue
+                break
             }
+            guard ContinuousClock.now < deadline else {
+                throw PlaybackPreparationError.readinessTimedOut
+            }
+            try await Task.sleep(for: .milliseconds(50))
         }
-        throw CancellationError()
     }
 
     private static func seek(
@@ -2583,6 +2931,9 @@ final class FocusNativeVideoViewModel: ObservableObject {
     }
 
     private func cancelPlaybackTask() {
+        if let firstFrameSpan { BiliPerformanceStore.shared.end(firstFrameSpan, outcome: .cancelled) }
+        firstFrameSpan = nil
+        readySurface = nil
         playbackGeneration &+= 1
         playbackTask?.cancel()
         playbackTask = nil
@@ -2680,7 +3031,27 @@ enum FocusDanmakuSegmentScheduler {
     }
 }
 
-private enum FocusNativePlaybackFactory {
+#if DEBUG
+extension FocusNativeVideoViewModel {
+    func installFixtureDetail(_ detail: FocusVideoDetail) {
+        precondition(FocusTestRuntime.isRunningFixtures)
+        cancelTasks()
+        state = .loaded(detail)
+        selectedPageCID = detail.cid
+    }
+
+    func installFixtureDanmakus(_ comments: [FocusVideoDanmaku]) {
+        precondition(FocusTestRuntime.isRunningFixtures)
+        cancelDanmakuRequests()
+        danmakuContext = nil
+        danmakus = comments
+        danmakuLoadState = .ready
+        isDanmakuEnabled = true
+    }
+}
+#endif
+
+enum FocusNativePlaybackFactory {
     private static let headerOptionsKey = "AVURLAssetHTTPHeaderFieldsKey"
 
     @MainActor
@@ -2711,14 +3082,17 @@ private enum FocusNativePlaybackFactory {
         videoAsset: AVURLAsset,
         audioAsset: AVURLAsset
     ) async throws -> AVMutableComposition {
-        let videoTracks = try await videoAsset.loadTracks(withMediaType: .video)
-        let audioTracks = try await audioAsset.loadTracks(withMediaType: .audio)
+        async let videoTracksRequest = videoAsset.loadTracks(withMediaType: .video)
+        async let audioTracksRequest = audioAsset.loadTracks(withMediaType: .audio)
+        async let videoDurationRequest = videoAsset.load(.duration)
+        async let audioDurationRequest = audioAsset.load(.duration)
+        let (videoTracks, audioTracks, videoDuration, audioDuration) = try await (
+            videoTracksRequest, audioTracksRequest, videoDurationRequest, audioDurationRequest
+        )
         guard let sourceVideoTrack = videoTracks.first, let sourceAudioTrack = audioTracks.first else {
             throw FocusVideoDetailService.ServiceError.noStream
         }
 
-        let videoDuration = try await videoAsset.load(.duration)
-        let audioDuration = try await audioAsset.load(.duration)
         guard videoDuration.isNumeric, CMTimeCompare(videoDuration, .zero) > 0 else {
             throw FocusVideoDetailService.ServiceError.noStream
         }
@@ -2768,6 +3142,13 @@ private func makeFocusNowPlayingArtwork(image: UIImage) -> MPMediaItemArtwork {
 }
 
 enum FocusNativePlaybackLifecyclePolicy {
+    static func isPlaybackRequested(rate: Float, timeControlStatus: AVPlayer.TimeControlStatus) -> Bool {
+        // pause() sets rate to zero before timeControlStatus necessarily leaves
+        // .playing. Waiting, however, is an outstanding play request even when
+        // no frames are advancing; tapping then must cancel it, not play again.
+        rate > 0 || timeControlStatus == .waitingToPlayAtSpecifiedRate
+    }
+
     static let audiovisualBackgroundPlaybackPolicy: AVPlayerAudiovisualBackgroundPlaybackPolicy =
         .continuesIfPossible
 
@@ -2911,7 +3292,7 @@ enum FocusNativeVideoFormatting {
     }
 
     static func rate(_ value: Float) -> String {
-        value.rounded() == value ? "\(Int(value))x" : "\(String(format: "%.2g", value))x"
+        value.rounded() == value ? "\(Int(value))x" : "\(value)x"
     }
 
     static func date(_ timestamp: Int64) -> String {

@@ -71,7 +71,7 @@ fun FocusWatchLaterScreen(
     viewModel: FocusWatchLaterViewModel,
     gridState: LazyGridState = rememberLazyGridState(),
 ) {
-    LaunchedEffect(Unit) { viewModel.loadIfNeeded() }
+    LaunchedEffect(viewModel) { viewModel.loadIfNeeded() }
 
     val state by viewModel.state.collectAsState()
     val loaded = state as? WatchLaterUiState.Loaded

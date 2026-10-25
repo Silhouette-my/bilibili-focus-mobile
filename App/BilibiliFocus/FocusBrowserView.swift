@@ -17,12 +17,15 @@ struct FocusBrowserView: View {
     @Environment(\.colorScheme) private var colorScheme
     @StateObject private var settingsStore: FocusSettingsStore
     @StateObject private var viewModel: FocusAppViewModel
+    /// The last reading viewport. Covered details must not reflow the feed.
+    @State private var dynamicFeedLayoutSize: CGSize?
+    @State private var isPreparingDynamicFeedReturn = false
     private let appGraph: FocusAppGraph
 
-    init(appGraph: FocusAppGraph) {
+    init(appGraph: FocusAppGraph, appViewModel: FocusAppViewModel? = nil) {
         self.appGraph = appGraph
         _settingsStore = StateObject(wrappedValue: appGraph.settingsStore)
-        _viewModel = StateObject(wrappedValue: appGraph.makeAppViewModel())
+        _viewModel = StateObject(wrappedValue: appViewModel ?? appGraph.makeAppViewModel())
     }
 
     init(settingsStore store: FocusSettingsStore) {
@@ -31,19 +34,46 @@ struct FocusBrowserView: View {
 
     var body: some View {
         NavigationStack {
-            ZStack {
-                persistentDynamicFeedLayer
-
-                ZStack {
-                    browserLayer
-                    activeNativeContentLayer
+            // Detail ideal sizes no longer participate in the feed's layout.
+            // The proposal comes from the navigation viewport, not a sibling
+            // player, error state, control dock or web view. Safe areas remain
+            // system supplied; no screen height or inset is frozen/hard-coded.
+            GeometryReader { viewport in
+                ZStack(alignment: .topLeading) {
+                    Color(uiColor: .systemGroupedBackground)
+                    persistentDynamicFeedLayer(viewportSize: viewport.size)
                 }
-                .padding(
-                    .bottom,
-                    (viewModel.isBrowserActive || viewModel.isNativeVideoActive)
-                        ? bottomChromeContentInset(safeAreaBottom: FocusWindowMetrics.safeAreaBottom)
-                        : 0
-                )
+                .frame(width: viewport.size.width, height: viewport.size.height, alignment: .topLeading)
+                .onAppear { recordDynamicFeedLayoutSize(viewport.size) }
+                .onChange(of: viewport.size) { recordDynamicFeedLayoutSize($0) }
+                .onChange(of: viewModel.isDynamicFeedActive) { _ in
+                    recordDynamicFeedLayoutSize(viewport.size)
+                }
+                .overlay {
+                    ZStack {
+                        browserLayer
+                        activeNativeContentLayer
+                    }
+                    .padding(
+                        .bottom,
+                        (viewModel.isBrowserActive || viewModel.isNativeVideoActive)
+                            ? bottomChromeContentInset(safeAreaBottom: viewport.safeAreaInsets.bottom)
+                            : 0
+                    )
+                    .frame(width: viewport.size.width, height: viewport.size.height)
+                    .background {
+                        if !viewModel.isDynamicFeedActive {
+                            Color(uiColor: .systemGroupedBackground)
+#if DEBUG
+                                .background {
+                                    if FocusTestRuntime.isRunningFixtures { FocusDetailCoverFixtureProbe() }
+                                }
+#endif
+                        }
+                    }
+                    .allowsHitTesting(!viewModel.isDynamicFeedActive)
+                    .accessibilityHidden(viewModel.isDynamicFeedActive)
+                }
             }
             .overlay(alignment: .leading) {
                 if viewModel.showsBackButton {
@@ -140,6 +170,12 @@ struct FocusBrowserView: View {
             .task {
                 viewModel.handleLaunchEntryIfNeeded()
             }
+            .task(id: viewModel.isDynamicFeedActive) {
+                // Network visibility is not an input to the isolated feed's
+                // layout. Its prepared subtree stays identical when uncovered.
+                viewModel.dynamicFeedViewModel.setVisibility(viewModel.isDynamicFeedActive)
+                if viewModel.isDynamicFeedActive { viewModel.dynamicFeedViewModel.loadIfNeeded() }
+            }
         }
     }
 
@@ -174,13 +210,38 @@ struct FocusBrowserView: View {
         }
     }
 
+    private func recordDynamicFeedLayoutSize(_ size: CGSize) {
+        guard viewModel.isDynamicFeedActive, size.width > 0, size.height > 0,
+              dynamicFeedLayoutSize != size else { return }
+        dynamicFeedLayoutSize = size
+    }
+
+    /// Landscape fullscreen rotates the whole scene while the feed is covered.
+    /// Both dimensions matter: changing the covered ScrollView's height also
+    /// changes lazy-row materialization and can clamp its offset. Only an active
+    /// feed adopts a new viewport; a detail's orientation is not a feed resize.
+    private func coveredDynamicFeedSize(viewportSize: CGSize) -> CGSize? {
+        guard !viewModel.isDynamicFeedActive, !isPreparingDynamicFeedReturn, let size = dynamicFeedLayoutSize,
+              size != viewportSize else { return nil }
+        return size
+    }
+
     @ViewBuilder
-    private var persistentDynamicFeedLayer: some View {
+    private func persistentDynamicFeedLayer(viewportSize: CGSize) -> some View {
+        let frozenSize = coveredDynamicFeedSize(viewportSize: viewportSize)
         if viewModel.hasDynamicFeedRoot {
-            FocusDynamicFeedView(
+            FocusDynamicFeedViewport(
+                anchor: viewModel.dynamicFeedViewModel.scrollAnchor,
+                returnViewportSize: viewportSize,
+                isPreparingReturn: isPreparingDynamicFeedReturn,
+                onPrepareReturn: { isPreparingDynamicFeedReturn = true },
+                onFinishReturn: { isPreparingDynamicFeedReturn = false },
+                content: FocusDynamicFeedView(
                 viewModel: viewModel.dynamicFeedViewModel,
                 settingsStore: settingsStore,
-                isActive: viewModel.isDynamicFeedActive,
+                // Prepare the exact active subtree under the existing detail
+                // cover. Revealing it must not trigger a second lazy layout.
+                isActive: viewModel.isDynamicFeedActive || isPreparingDynamicFeedReturn,
                 searchPrompt: viewModel.searchKeyword.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                     ? "搜索视频、UP主、直播"
                     : viewModel.searchKeyword,
@@ -199,8 +260,15 @@ struct FocusBrowserView: View {
                 onSearch: {
                     viewModel.presentSearchEntry()
                 }
-            )
-            .opacity(viewModel.isDynamicFeedActive ? 1 : 0)
+            ))
+            // Use the same explicit proposal while active and covered. Switching
+            // from an unconstrained ScrollView to a fixed height changes how its
+            // safe-area extension is laid out, even when the numbers look equal.
+            .frame(width: frozenSize?.width ?? viewportSize.width,
+                   height: frozenSize?.height ?? viewportSize.height,
+                   alignment: .topLeading)
+            // Retain the rendered list underneath the opaque detail overlay.
+            // Visibility changes must not rematerialize the lazy feed itself.
             .allowsHitTesting(viewModel.isDynamicFeedActive)
             .accessibilityHidden(!viewModel.isDynamicFeedActive)
         }
@@ -306,7 +374,8 @@ struct FocusBrowserView: View {
                 },
                 onOpenWeb: { url in
                     viewModel.openVideoInBrowser(url)
-                }
+                },
+                accentColor: FocusAccentColor.color(hex: settingsStore.settings.accentColorHex)
             )
         case .browser:
             EmptyView()
@@ -315,19 +384,11 @@ struct FocusBrowserView: View {
 
     private func bottomChrome(safeAreaBottom: CGFloat) -> some View {
         let tabBottomPadding = bottomTabBarPadding(safeAreaBottom: safeAreaBottom)
-        let hasVideoControls = (viewModel.isBrowserActive && viewModel.browserViewModel.showsNativeVideoControls)
-            || (viewModel.activeNativeVideoViewModel?.showsPlaybackControls == true)
+        let hasVideoControls = viewModel.isBrowserActive && viewModel.browserViewModel.showsNativeVideoControls
         let tabTopPadding = hasVideoControls ? 2.0 : 3.0
 
         return VStack(spacing: 0) {
-            if let nativeVideoViewModel = viewModel.activeNativeVideoViewModel,
-               nativeVideoViewModel.showsPlaybackControls
-            {
-                FocusNativeVideoControlDock(viewModel: nativeVideoViewModel)
-                    .padding(.horizontal, 12)
-                    .padding(.top, 8)
-                    .padding(.bottom, 8)
-            } else if viewModel.isBrowserActive, viewModel.browserViewModel.showsNativeVideoControls {
+            if viewModel.isBrowserActive, viewModel.browserViewModel.showsNativeVideoControls {
                 videoControls
                     .padding(.horizontal, 12)
                     .padding(.top, 8)
@@ -352,9 +413,6 @@ struct FocusBrowserView: View {
 
     private func bottomChromeContentInset(safeAreaBottom: CGFloat) -> CGFloat {
         let tabInset = 54 + bottomTabBarPadding(safeAreaBottom: safeAreaBottom)
-        if viewModel.activeNativeVideoViewModel?.showsPlaybackControls == true {
-            return tabInset + 74
-        }
         if viewModel.isBrowserActive, viewModel.browserViewModel.showsNativeVideoControls {
             return tabInset + 74
         }
@@ -432,6 +490,134 @@ struct FocusBrowserView: View {
         )
     }
 }
+
+/// The navigation viewport has already accounted for system safe areas. Give
+/// the retained feed its own hosting boundary so a covered scene's new safe-area
+/// propagation cannot extend or shrink the ScrollView a second time.
+private struct FocusDynamicFeedViewport<Content: View>: UIViewControllerRepresentable {
+    let anchor: FocusDynamicFeedVisualAnchor
+    let returnViewportSize: CGSize
+    let isPreparingReturn: Bool
+    let onPrepareReturn: () -> Void
+    let onFinishReturn: () -> Void
+    let content: Content
+
+    func makeUIViewController(context: Context) -> FocusDynamicFeedHostingController<AnyView> {
+        let controller = FocusDynamicFeedHostingController(content: hostedContent(environment: context.environment))
+        configure(controller, environment: context.environment)
+        return controller
+    }
+
+    func updateUIViewController(_ controller: FocusDynamicFeedHostingController<AnyView>, context: Context) {
+        configure(controller, environment: context.environment)
+    }
+
+    private func configure(_ controller: FocusDynamicFeedHostingController<AnyView>, environment: EnvironmentValues) {
+        controller.configure(content: hostedContent(environment: environment), anchor: anchor,
+                             returnViewportSize: returnViewportSize, isPreparingReturn: isPreparingReturn,
+                             onPrepareReturn: onPrepareReturn, onFinishReturn: onFinishReturn)
+    }
+
+    private func hostedContent(environment: EnvironmentValues) -> AnyView {
+        // A UIKit hosting boundary must not reset the reader's typography,
+        // accessibility, layout direction, theme or other inherited choices.
+        // The erased concrete root type stays the same on every update.
+        AnyView(content.environment(\.self, environment))
+    }
+}
+
+private final class FocusDynamicFeedHostingController<Content: View>: UIHostingController<Content> {
+    private weak var anchor: FocusDynamicFeedVisualAnchor?
+    private var returnViewportSize = CGSize.zero
+    private var isPreparingReturn = false
+    private var hasUncommittedLayout = true
+    private var waitsForReturnLayout = false
+    private var hasReturnViewport: Bool {
+        // UIKit can round SwiftUI's proposed dimensions to the display grid.
+        abs(view.bounds.width - returnViewportSize.width) <= 0.5 &&
+            abs(view.bounds.height - returnViewportSize.height) <= 0.5
+    }
+
+    init(content: Content) {
+        super.init(rootView: content)
+        if #available(iOS 16.4, *) { safeAreaRegions = [] }
+        view.backgroundColor = .clear
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func configure(content: Content, anchor: FocusDynamicFeedVisualAnchor, returnViewportSize: CGSize,
+                   isPreparingReturn: Bool, onPrepareReturn: @escaping () -> Void,
+                   onFinishReturn: @escaping () -> Void) {
+        self.anchor = anchor
+        self.returnViewportSize = returnViewportSize
+        self.isPreparingReturn = isPreparingReturn
+        hasUncommittedLayout = true
+        if isPreparingReturn {
+            // A second resize or environment update may arrive after the first
+            // layout acknowledgement but before the guarded return finishes.
+            waitsForReturnLayout = true
+            anchor.isReturnLayoutReady = false
+        }
+        rootView = content
+        view.setNeedsLayout()
+        anchor.prepareLayoutForReturn = { [weak self, weak anchor] in
+            guard let self, let anchor else { return true }
+            let isReady = !hasUncommittedLayout && hasReturnViewport
+            waitsForReturnLayout = !isReady
+            anchor.isReturnLayoutReady = isReady
+            // Even an initially ready viewport must keep following later root
+            // updates until identity recovery has actually finished.
+            onPrepareReturn()
+            if !isReady { view.setNeedsLayout() }
+            return isReady
+        }
+        anchor.finishLayoutForReturn = { [weak self, weak anchor] in
+            self?.waitsForReturnLayout = false
+            anchor?.isReturnLayoutReady = true
+            onFinishReturn()
+        }
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        hasUncommittedLayout = false
+        guard waitsForReturnLayout, isPreparingReturn, hasReturnViewport else { return }
+        waitsForReturnLayout = false
+        anchor?.isReturnLayoutReady = true
+        anchor?.geometryDidChange()
+    }
+
+    override func viewSafeAreaInsetsDidChange() {
+        super.viewSafeAreaInsetsDidChange()
+        // iOS 16.0–16.3 has no safeAreaRegions. Consume the inherited insets with
+        // the public controller API; once they reach zero no further update runs.
+        if #unavailable(iOS 16.4) {
+            let inset = view.safeAreaInsets
+            guard inset != .zero else { return }
+            additionalSafeAreaInsets = UIEdgeInsets(
+                top: additionalSafeAreaInsets.top - inset.top,
+                left: additionalSafeAreaInsets.left - inset.left,
+                bottom: additionalSafeAreaInsets.bottom - inset.bottom,
+                right: additionalSafeAreaInsets.right - inset.right
+            )
+        }
+    }
+}
+
+#if DEBUG
+/// Lets integration tests observe when the opaque detail branch actually
+/// leaves the UIKit hierarchy, rather than timing only a model flag change.
+private struct FocusDetailCoverFixtureProbe: UIViewRepresentable {
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView()
+        view.isUserInteractionEnabled = false
+        view.accessibilityIdentifier = "focus-fixture-detail-cover"
+        return view
+    }
+    func updateUIView(_ view: UIView, context: Context) {}
+}
+#endif
 
 private struct FocusEdgeSwipeBackArea: View {
     let onBack: () -> Void

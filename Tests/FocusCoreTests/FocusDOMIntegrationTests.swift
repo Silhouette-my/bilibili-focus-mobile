@@ -117,6 +117,34 @@ struct FocusDOMIntegrationTests {
     }
 
     @Test
+    func searchRepairSettlesAfterOwnMutationsAndStillDecoratesNewResults() async throws {
+        let webView = try await loadFixture(
+            named: "search-rich", url: URL(string: "https://search.bilibili.com/all")!,
+            frame: CGRect(x: 0, y: 0, width: 390, height: 844)
+        )
+        try await Task.sleep(for: .milliseconds(1_200))
+        let saved = try await evaluate("window.__auditFilterChip = document.querySelector('[data-focus-search-filter-chip]'); window.__auditFilterChip ? 'saved' : 'missing';", in: webView)
+        try #require(saved == "saved")
+        let observing = try await evaluate("String(window.__FOCUS_FEATURE_SCRIPT_STATE__['search-repair::search-video-link-rewrite'].searchObserverInstalled)", in: webView)
+        try #require(observing == "true")
+        try await Task.sleep(for: .milliseconds(1_200))
+        let settled = try await evaluate("window.__auditFilterChip === document.querySelector('[data-focus-search-filter-chip]') ? 'true' : 'false'", in: webView)
+        #expect(settled == "true", "Unchanged search results must not continuously rebuild the filter controls")
+
+        _ = try await evaluate("""
+            const list = document.querySelector('.video-list');
+            const added = list.firstElementChild.cloneNode(true);
+            added.id = 'audit-added-result';
+            added.querySelector('a').href = 'https://m.bilibili.com/video/BV5xx411c7mH';
+            list.appendChild(added);
+            'added';
+            """, in: webView)
+        try await Task.sleep(for: .milliseconds(1_200))
+        let decorated = try await evaluate("document.getElementById('audit-added-result').getAttribute('data-focus-search-video-target') || ''", in: webView)
+        #expect(decorated == "https://www.bilibili.com/video/BV5xx411c7mH/")
+    }
+
+    @Test
     func videoFixtureReflowsDesktopPlaybackPage() async throws {
         let webView = try await loadFixture(named: "video", url: URL(string: "https://www.bilibili.com/video/BV1xx411c7mD/")!)
 
@@ -364,6 +392,9 @@ struct FocusDOMIntegrationTests {
     ) async throws -> WKWebView {
         let htmlURL = try #require(Bundle.module.url(forResource: name, withExtension: "html"))
         let html = try String(contentsOf: htmlURL, encoding: .utf8)
+            .replacingOccurrences(of: "<head>", with: """
+                <head><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline' 'unsafe-eval'; img-src data:">
+                """)
 
         let controller = WKUserContentController()
         if simulatesIOS {

@@ -26,49 +26,36 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.remember
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filterNotNull
-import org.bilibilifocus.android.AndroidCookieProvider
 import org.bilibilifocus.android.FocusHistoryViewModel
 import org.bilibilifocus.android.HistoryUiState
 import org.bilibilifocus.android.stableKey
-import org.bilibilifocus.core.service.HistoryService
-import org.bilibilifocus.core.service.KtorHttpClient
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun FocusHistoryScreen(
     onBack: () -> Unit,
     onOpenVideo: (String) -> Unit = {},
-    viewModel: FocusHistoryViewModel? = null,
+    viewModel: FocusHistoryViewModel,
     gridState: LazyGridState = rememberLazyGridState(),
 ) {
-    val resolvedViewModel = viewModel ?: remember {
-        FocusHistoryViewModel(
-            service = HistoryService(
-                cookieProvider = AndroidCookieProvider(),
-                httpClient = KtorHttpClient(),
-            )
-        )
-    }
-
     // A retained history view model may have been loaded before opening a video.
     // Refresh on each screen appearance so the just-reported server position is visible.
-    LaunchedEffect(Unit) { resolvedViewModel.reload() }
+    LaunchedEffect(viewModel) { viewModel.reload() }
 
-    val state by resolvedViewModel.state.collectAsState()
-    val isLoadingMore by resolvedViewModel.isLoadingMore.collectAsState()
+    val state by viewModel.state.collectAsState()
+    val isLoadingMore by viewModel.isLoadingMore.collectAsState()
 
     LaunchedEffect(gridState, state) {
         snapshotFlow<String?> { gridState.layoutInfo.visibleItemsInfo.lastOrNull()?.key as? String }
             .filterNotNull()
             .distinctUntilChanged()
-            .collect { key -> resolvedViewModel.loadMoreIfNeeded(key) }
+            .collect { key -> viewModel.loadMoreIfNeeded(key) }
     }
 
     Scaffold(
@@ -117,7 +104,7 @@ fun FocusHistoryScreen(
                         items(s.items, key = { it.stableKey }) { item ->
                             HistoryCard(
                                 item = item,
-                                onClick = { onOpenVideo("https://www.bilibili.com/video/${item.bvid}") },
+                                onClick = { onOpenVideo(historyItemVideoURL(item)) },
                             )
                         }
 
@@ -138,4 +125,24 @@ fun FocusHistoryScreen(
             }
         }
     }
+}
+
+internal fun historyItemVideoURL(item: org.bilibilifocus.core.model.HistoryItem): String = buildString {
+    append("https://www.bilibili.com/video/${item.bvid}/")
+    val partParameter = when {
+        item.cid > 0 -> "cid=${item.cid}"
+        item.page > 0 -> "p=${item.page}"
+        else -> null
+    }
+    val historyPositionMillis = when {
+        partParameter == null -> null
+        item.progress == -1L -> 0L
+        item.progress in 1..(Long.MAX_VALUE / 1_000) -> item.progress * 1_000
+        else -> null
+    }
+    val parameters = listOfNotNull(
+        partParameter,
+        historyPositionMillis?.let { "focus_history_position_ms=$it" },
+    )
+    if (parameters.isNotEmpty()) append("?${parameters.joinToString("&")}")
 }

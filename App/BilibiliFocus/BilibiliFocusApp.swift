@@ -3,6 +3,18 @@ import FocusCore
 import SwiftUI
 import UIKit
 
+/// TestAction supplies this flag; it is never enabled by a normal app launch.
+/// Keep the hosted app from opening persistent cookies or draining real history.
+enum FocusTestRuntime {
+    static var isRunningFixtures: Bool {
+#if DEBUG
+        ProcessInfo.processInfo.environment["FOCUS_FIXTURE_TESTS"] == "1"
+#else
+        false
+#endif
+    }
+}
+
 class AppDelegate: NSObject, UIApplicationDelegate {
     static var orientationLock = UIInterfaceOrientationMask.portrait
 
@@ -10,12 +22,16 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
-        _ = FocusHistoryBackgroundScheduler.shared.register()
+        if !FocusTestRuntime.isRunningFixtures {
+            _ = FocusHistoryBackgroundScheduler.shared.register()
+        }
         return true
     }
 
     func applicationDidEnterBackground(_ application: UIApplication) {
-        FocusHistoryBackgroundScheduler.shared.schedule()
+        if !FocusTestRuntime.isRunningFixtures {
+            FocusHistoryBackgroundScheduler.shared.schedule()
+        }
     }
 
     func application(_ application: UIApplication, supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
@@ -27,11 +43,15 @@ class AppDelegate: NSObject, UIApplicationDelegate {
 struct BilibiliFocusApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @StateObject private var settingsStore = FocusSettingsStore()
-    let appGraph: FocusAppGraph
+    let appGraph: FocusAppGraph?
 
     init() {
         let settingsStore = FocusSettingsStore()
         _settingsStore = StateObject(wrappedValue: settingsStore)
+        guard !FocusTestRuntime.isRunningFixtures else {
+            appGraph = nil
+            return
+        }
         let appGraph = FocusAppGraph(settingsStore: settingsStore)
         self.appGraph = appGraph
         FocusHistoryBackgroundScheduler.shared.configure(
@@ -48,10 +68,14 @@ struct BilibiliFocusApp: App {
     var body: some Scene {
         WindowGroup {
             let accentColor = FocusAccentColor.color(hex: settingsStore.settings.accentColorHex)
-            FocusBrowserView(appGraph: appGraph)
-                .accentColor(accentColor)
-                .tint(accentColor)
-                .preferredColorScheme(preferredColorScheme)
+            if let appGraph {
+                FocusBrowserView(appGraph: appGraph)
+                    .accentColor(accentColor)
+                    .tint(accentColor)
+                    .preferredColorScheme(preferredColorScheme)
+            } else {
+                Color.clear
+            }
         }
     }
 

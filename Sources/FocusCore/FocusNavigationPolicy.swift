@@ -111,9 +111,11 @@ public struct FocusNavigationPolicy: Sendable {
 
         let lowercasedPath = url.path.lowercased()
         let lowercasedURL = url.absoluteString.lowercased()
-        let isBilibiliFamilyHost = host.contains("bilibili.com") || host.contains("hdslb.com")
+        let isBilibiliFamilyHost = Self.isHost(host, within: "bilibili.com")
+            || Self.isHost(host, within: "hdslb.com")
         let cameFromVideoPage = currentURL?.path.hasPrefix("/video/") == true
-            || currentURL?.host?.contains("bilibili.com") == true && currentURL?.absoluteString.contains("/video/") == true
+            || Self.isHost(currentURL?.host?.lowercased() ?? "", within: "bilibili.com")
+                && currentURL?.absoluteString.contains("/video/") == true
 
         if isBilibiliFamilyHost && lowercasedPath.contains("/download") {
             return true
@@ -128,6 +130,10 @@ public struct FocusNavigationPolicy: Sendable {
         }
 
         return false
+    }
+
+    private static func isHost(_ host: String, within domain: String) -> Bool {
+        host == domain || host.hasSuffix(".\(domain)")
     }
 
     private static func canonicalVideoPath(from components: URLComponents?) -> String? {

@@ -57,6 +57,8 @@ class HistoryService(
                 title = dict.stringValueAt("title") ?: "",
                 coverURL = cover,
                 bvid = history?.stringValueAt("bvid") ?: "",
+                cid = history?.longValueAt("cid") ?: 0L,
+                page = history?.longValueAt("page")?.toInt() ?: 0,
                 authorName = dict.stringValueAt("author_name") ?: "",
                 viewAt = dict.longValueAt("view_at") ?: 0L,
                 progress = dict.longValueAt("progress") ?: 0L,

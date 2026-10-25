@@ -1,5 +1,6 @@
 package org.bilibilifocus.core.service
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import org.bilibilifocus.core.cookie.CookieProvider
@@ -36,9 +37,14 @@ class FollowingAuthorsService(
         }
 
         val authors = linkedMapOf<String, DynamicCard.Author>()
-        runCatching { fetchAttentionAuthors(currentMid) }
-            .getOrDefault(emptyList())
-            .forEach { author -> authors.getOrPut(authorKey(author)) { author } }
+        val attentionAuthors = try {
+            fetchAttentionAuthors(currentMid)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            emptyList()
+        }
+        attentionAuthors.forEach { author -> authors.getOrPut(authorKey(author)) { author } }
 
         val safePageSize = pageSize.coerceIn(1, 100)
         val safeMaxPages = maxPages.coerceAtLeast(1)

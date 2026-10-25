@@ -40,7 +40,11 @@ public struct LoginHealthService: Sendable {
     /// in user-facing diagnostics.
     public func check(now: Date = Date()) async -> LoginHealth {
         let endpoint = BiliAPIContractCatalog.require("credential.info.valid")
-        let cookies = await cookieProvider.loadCookies()
+        let snapshot = await cookieProvider.loadSnapshot()
+        let version = snapshot.version
+        let cookies = snapshot.cookies
+        guard version == cookieProvider.sessionVersion else { return .unknown }
+        if snapshot.readiness == .expired { return .sessionExpired }
         let matchingCookies = CookieRequestPolicy.cookies(
             cookies,
             matching: endpoint.url,
@@ -62,7 +66,8 @@ public struct LoginHealthService: Sendable {
                     !$0.value.isEmpty &&
                     ($0.expiresDate.map { $0 <= now } ?? false)
             }
-            return hasExpiredSession ? .sessionExpired : .notLoggedIn
+            if hasExpiredSession { return .sessionExpired }
+            return snapshot.readiness == .anonymous ? .notLoggedIn : .unknown
         }
 
         let hasCSRF = matchingCookies.contains {
@@ -82,6 +87,7 @@ public struct LoginHealthService: Sendable {
         let response: HTTPURLResponse
         do {
             let result = try await requestLoader(request)
+            guard !Task.isCancelled, version == cookieProvider.sessionVersion else { return .unknown }
             data = result.0
             guard let httpResponse = result.1 as? HTTPURLResponse else {
                 return .unknown
@@ -89,8 +95,8 @@ public struct LoginHealthService: Sendable {
             response = httpResponse
         } catch is CancellationError {
             return .unknown
-        } catch is URLError {
-            return .networkUnavailable
+        } catch let error as URLError {
+            return error.code == .cancelled ? .unknown : .networkUnavailable
         } catch {
             // RequestLoader errors occur before response decoding, so the
             // conservative actionable classification is transport failure.
@@ -98,6 +104,7 @@ public struct LoginHealthService: Sendable {
         }
 
         if response.statusCode == 401 {
+            cookieProvider.noteServerSessionExpired(version: version)
             return .sessionExpired
         }
         if response.statusCode == 403 {
@@ -118,6 +125,7 @@ public struct LoginHealthService: Sendable {
             return .wbiRiskControlled
         }
         if code == -101 {
+            cookieProvider.noteServerSessionExpired(version: version)
             return .sessionExpired
         }
         guard
@@ -128,6 +136,7 @@ public struct LoginHealthService: Sendable {
             return .unknown
         }
         guard isLogin else {
+            cookieProvider.noteServerSessionExpired(version: version)
             return .sessionExpired
         }
         return hasCSRF ? .healthy : .missingCSRF

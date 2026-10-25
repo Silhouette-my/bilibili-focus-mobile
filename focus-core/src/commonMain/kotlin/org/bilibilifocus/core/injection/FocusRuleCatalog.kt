@@ -1126,7 +1126,7 @@ object FocusRuleCatalog {
                     """,
                     script = """
                     const state = helpers.featureState;
-                    const videoPattern = /\\/video\\/|\\/bangumi\\/play\\//;
+                    const videoPattern = /\/video\/|\/bangumi\/play\//;
 
                     const rewriteAnchor = (anchor) => {
                       if (!anchor || !anchor.href) {
@@ -1146,7 +1146,7 @@ object FocusRuleCatalog {
 
                     const candidateKeys = ['href', 'data-href', 'data-url', 'data-link', 'data-target-url', 'data-jump-url', 'data-report-click', 'data-arcurl', 'data-target'];
                     const interactiveSelector = 'button, a, [role="button"], [role="tab"], input, select, label';
-                    const normalizeLabel = (value) => String(value || '').replace(/\\s+/g, '').replace(/[：:]/g, '');
+                    const normalizeLabel = (value) => String(value || '').replace(/\s+/g, '').replace(/[：:]/g, '');
                     const primaryFilterLabels = ['综合排序', '最多播放', '最新发布', '最多弹幕', '最多收藏', '更多筛选'];
                     const collapsedPrimaryLabels = ['综合排序', '最多播放', '最新发布'];
                     const extendedPrimaryLabels = ['最多弹幕', '最多收藏'];
@@ -1198,7 +1198,7 @@ object FocusRuleCatalog {
                         return parsedURL.toString();
                       }
 
-                      if (/^\\/blackboard\\/html5(?:mobile)?player\\.html$/.test(path)) {
+                      if (/^\/blackboard\/html5(?:mobile)?player\.html$/.test(path)) {
                         const bvid = parsedURL.searchParams.get('bvid');
                         const aid = parsedURL.searchParams.get('aid') || parsedURL.searchParams.get('avid');
                         if (bvid) {
@@ -1246,7 +1246,7 @@ object FocusRuleCatalog {
                         return directURL;
                       }
 
-                      const blackboardMatch = trimmed.match(/https?:\\/\\/(?:www\\.|m\\.)?bilibili\\.com\\/blackboard\\/html5(?:mobile)?player\\.html[^\\s"'<>]*/i);
+                      const blackboardMatch = trimmed.match(/https?:\/\/(?:www\.|m\.)?bilibili\.com\/blackboard\/html5(?:mobile)?player\.html[^\s"'<>]*/i);
                       if (blackboardMatch) {
                         try {
                           const canonicalURL = extractCanonicalFromParsedURL(new URL(blackboardMatch[0]));
@@ -1256,12 +1256,12 @@ object FocusRuleCatalog {
                         } catch (_) {}
                       }
 
-                      const absoluteMatch = trimmed.match(/https?:\\/\\/(?:www\\.|m\\.)?bilibili\\.com\\/(?:video\\/BV[0-9A-Za-z]{10}|bangumi\\/play\\/(?:ep|ss)\\d+)/i);
+                      const absoluteMatch = trimmed.match(/https?:\/\/(?:www\.|m\.)?bilibili\.com\/(?:video\/BV[0-9A-Za-z]{10}|bangumi\/play\/(?:ep|ss)\d+)/i);
                       if (absoluteMatch) {
                         return helpers.canonicalizeBilibiliURL(absoluteMatch[0]);
                       }
 
-                      const relativeMatch = trimmed.match(/\\/(?:video\\/BV[0-9A-Za-z]{10}|bangumi\\/play\\/(?:ep|ss)\\d+)/i);
+                      const relativeMatch = trimmed.match(/\/(?:video\/BV[0-9A-Za-z]{10}|bangumi\/play\/(?:ep|ss)\d+)/i);
                       if (relativeMatch) {
                         return helpers.canonicalizeBilibiliURL(relativeMatch[0]);
                       }
@@ -1449,7 +1449,7 @@ object FocusRuleCatalog {
                               const rect = mediaNode.getBoundingClientRect?.();
                               return rect && rect.width >= 120 && rect.height >= 72;
                             });
-                            const promotedByClass = /(?:^|\\s|-|_)(?:ad|advert|game|special|topic|activity|brand|promote)(?:$|\\s|-|_)/i.test(className);
+                            const promotedByClass = /(?:^|\s|-|_)(?:ad|advert|game|special|topic|activity|brand|promote)(?:$|\s|-|_)/i.test(className);
                             const promotedByText = promotedSearchKeywords.some((keyword) => normalizedText.includes(normalizeLabel(keyword)));
 
                             if ((promotedByClass || promotedByText) && hasLargeMedia) {
@@ -1602,7 +1602,7 @@ object FocusRuleCatalog {
                       }
 
                       const isStatLikeText = (text) => {
-                        return /\\d/.test(text) || /万|亿|k|m/i.test(text) || /^(?:\\d+:)?\\d{1,2}:\\d{2}$/.test(text);
+                        return /\d/.test(text) || /万|亿|k|m/i.test(text) || /^(?:\d+:)?\d{1,2}:\d{2}$/.test(text);
                       };
 
                       const candidateContainer = Array.from(coverShell.querySelectorAll('div, ul, ol, section, article, a'))
@@ -1641,7 +1641,7 @@ object FocusRuleCatalog {
 
                       if (candidateContainer) {
                         const orderedChildren = candidateContainer.visibleChildren.sort((left, right) => left.rect.left - right.rect.left);
-                        const durationChild = [...orderedChildren].reverse().find(({ text }) => /^(?:\\d+:)?\\d{1,2}:\\d{2}$/.test(text));
+                        const durationChild = [...orderedChildren].reverse().find(({ text }) => /^(?:\d+:)?\d{1,2}:\d{2}$/.test(text));
                         const removableChildren = orderedChildren.filter(({ node }) => node !== orderedChildren[0].node && node !== durationChild?.node);
 
                         removableChildren.forEach(({ node }) => {
@@ -1687,7 +1687,7 @@ object FocusRuleCatalog {
 
                       if (fallbackContainer) {
                         const orderedChildren = fallbackContainer.statChildren.sort((left, right) => left.rect.left - right.rect.left);
-                        const durationChild = [...orderedChildren].reverse().find(({ text }) => /^(?:\\d+:)?\\d{1,2}:\\d{2}$/.test(text));
+                        const durationChild = [...orderedChildren].reverse().find(({ text }) => /^(?:\d+:)?\d{1,2}:\d{2}$/.test(text));
                         orderedChildren
                           .filter(({ node }) => node !== orderedChildren[0]?.node && node !== durationChild?.node)
                           .forEach(({ node }) => {
@@ -1792,7 +1792,7 @@ object FocusRuleCatalog {
                         return;
                       }
 
-                      const durationCandidate = [...overlayItems].reverse().find(({ normalizedText }) => /^(?:\\d+:)?\\d{1,2}:\\d{2}$/.test(normalizedText));
+                      const durationCandidate = [...overlayItems].reverse().find(({ normalizedText }) => /^(?:\d+:)?\d{1,2}:\d{2}$/.test(normalizedText));
                       const nonDurationStats = overlayItems.filter(({ node }) => node !== durationCandidate?.node);
 
                       nonDurationStats.slice(1).forEach(({ node }) => {
@@ -1868,7 +1868,7 @@ object FocusRuleCatalog {
                             return false;
                           }
 
-                          return /播放|观看|弹幕|点赞|收藏|投币|分享|小时前|分钟前|昨天|:[0-5]\\d|万|亿|arcraiders/i.test(normalizedText);
+                          return /播放|观看|弹幕|点赞|收藏|投币|分享|小时前|分钟前|昨天|:[0-5]\d|万|亿|arcraiders/i.test(normalizedText);
                         })
                         .sort((left, right) => left.getBoundingClientRect().top - right.getBoundingClientRect().top)
                         .slice(0, limit)
@@ -2359,25 +2359,32 @@ object FocusRuleCatalog {
                       state.searchFilterControlCache = {};
                     };
 
+                    const searchObserverOptions = {
+                      childList: true,
+                      subtree: true,
+                      attributes: true,
+                      attributeFilter: ['class', 'style', 'href', 'data-href', 'data-url']
+                    };
+                    const refreshSearchLayout = () => {
+                      // Our own styles and mirrored controls must not schedule
+                      // another repair. All work here is synchronous.
+                      state.searchObserver?.disconnect();
+                      try {
+                        rewriteAll();
+                        decorateSearchInput();
+                        applySearchVideoGrid();
+                        hidePromotedSearchBlocks();
+                        hideSearchTypeNav();
+                        mirrorSearchFilterBoard();
+                      } finally {
+                        state.searchObserver?.observe(document.body || document.documentElement, searchObserverOptions);
+                      }
+                    };
                     const scheduleSearchFilterRefresh = () => {
                       clearTimeout(state.searchFilterRefreshTimer);
-                      state.searchFilterRefreshTimer = setTimeout(() => {
-                        rewriteAll();
-                        decorateSearchInput();
-                        applySearchVideoGrid();
-                        hidePromotedSearchBlocks();
-                        hideSearchTypeNav();
-                        mirrorSearchFilterBoard();
-                      }, 18);
+                      state.searchFilterRefreshTimer = setTimeout(refreshSearchLayout, 18);
                       clearTimeout(state.searchFilterRefreshTimerLate);
-                      state.searchFilterRefreshTimerLate = setTimeout(() => {
-                        rewriteAll();
-                        decorateSearchInput();
-                        applySearchVideoGrid();
-                        hidePromotedSearchBlocks();
-                        hideSearchTypeNav();
-                        mirrorSearchFilterBoard();
-                      }, 96);
+                      state.searchFilterRefreshTimerLate = setTimeout(refreshSearchLayout, 96);
                     };
 
                     const triggerFilterSelection = (label) => {
@@ -2515,9 +2522,7 @@ object FocusRuleCatalog {
                         shell.appendChild(row);
                       });
 
-                      if (root.parentNode && shell.parentNode !== root.parentNode) {
-                        root.parentNode.insertBefore(shell, root);
-                      } else if (root.parentNode) {
+                      if (root.parentNode) {
                         root.parentNode.insertBefore(shell, root);
                       }
 
@@ -2525,12 +2530,7 @@ object FocusRuleCatalog {
                       setOriginalFilterBoardCollapsed(root, true);
                     };
 
-                    rewriteAll();
-                    decorateSearchInput();
-                    applySearchVideoGrid();
-                    hidePromotedSearchBlocks();
-                    hideSearchTypeNav();
-                    mirrorSearchFilterBoard();
+                    refreshSearchLayout();
 
                     if (!state.openWrapped) {
                       state.openWrapped = true;
@@ -2659,12 +2659,8 @@ object FocusRuleCatalog {
                         }
                       });
 
-                      observer.observe(document.body || document.documentElement, {
-                        childList: true,
-                        subtree: true,
-                        attributes: true,
-                        attributeFilter: ['class', 'style', 'href', 'data-href', 'data-url']
-                      });
+                      state.searchObserver = observer;
+                      observer.observe(document.body || document.documentElement, searchObserverOptions);
                     }
                     """,
                     settingKey = FocusFeature.SettingKey.SEARCH_MASK_ENABLED
@@ -3552,7 +3548,7 @@ object FocusRuleCatalog {
                       const isFullscreen = !!document.fullscreenElement
                         || activeVideo?.webkitPresentationMode === 'fullscreen'
                         || activeVideo?.webkitPresentationMode === 'fullScreen'
-                        || /(^|\\s)(?:web-)?fullscreen(?:\\s|$)/.test(String(playerRoot.className || ''));
+                        || /(^|\s)(?:web-)?fullscreen(?:\s|$)/.test(String(playerRoot.className || ''));
                       if (isFullscreen) {
                         clearIOSPlayerSizing();
                         return;
@@ -3992,7 +3988,7 @@ object FocusRuleCatalog {
                       ];
                       for (const selector of selectors) {
                         const node = Array.from(document.querySelectorAll(selector)).find((candidate) => {
-                          const text = String(candidate?.textContent || '').replace(/\\s+/g, '');
+                          const text = String(candidate?.textContent || '').replace(/\s+/g, '');
                           return text.includes('自动连播') || text.includes('连播');
                         });
                         if (node) {
@@ -4025,7 +4021,7 @@ object FocusRuleCatalog {
                         return true;
                       }
 
-                      return /(^|\\s)(on|active|checked|selected|enabled)(\\s|$)/.test(className);
+                      return /(^|\s)(on|active|checked|selected|enabled)(\s|$)/.test(className);
                     };
 
                     const normalizeAutoplayDisabled = (toggle) => {
@@ -4175,7 +4171,7 @@ object FocusRuleCatalog {
                       const uiSuggestsPaused = /play|播放|icon-play|state-play|video-state-play/.test(playButtonDescriptor);
                       const videoSuggestsPlaying = !!activeVideo && !activeVideo.paused && !activeVideo.ended;
                       const rateText = String(playbackRateNode?.textContent || '').trim();
-                      const rateMatch = rateText.match(/(\\d+(?:\\.\\d+)?)\\s*x/i);
+                      const rateMatch = rateText.match(/(\d+(?:\.\d+)?)\s*x/i);
                       const parsedRate = rateMatch ? Number(rateMatch[1]) : NaN;
                       const rawPlaybackRate = Number(activeVideo?.playbackRate || 0);
                       const isDanmakuHidden = document.documentElement.classList.contains('focus-hide-danmaku')
@@ -4210,7 +4206,7 @@ object FocusRuleCatalog {
                         isFullscreen: !!document.fullscreenElement
                           || activeVideo?.webkitPresentationMode === 'fullscreen'
                           || activeVideo?.webkitPresentationMode === 'fullScreen'
-                          || /(^|\\s)(?:web-)?fullscreen(?:\\s|$)/.test(playerClassName),
+                          || /(^|\s)(?:web-)?fullscreen(?:\s|$)/.test(playerClassName),
                         updatedAt: Date.now()
                       };
 

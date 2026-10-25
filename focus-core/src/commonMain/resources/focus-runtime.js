@@ -415,7 +415,8 @@
       return !!element.closest([
         "#focus-native-video-augment",
         "#focus-native-video-loading-mask",
-        "#focus-native-opus-comments"
+        "#focus-native-opus-comments",
+        "[data-focus-search-filter-shell]"
       ].join(","));
     }
 
@@ -495,7 +496,11 @@
       const path = location.pathname || "/";
       const isVideoPage = path.indexOf("/video/") === 0 || path.indexOf("/bangumi/play/") === 0;
       if (!isVideoPage) {
-        return true;
+        return mutations.some((mutation) => {
+          if (isFocusManagedNode(mutation.target)) return false;
+          const changedNodes = [...mutation.addedNodes, ...mutation.removedNodes];
+          return changedNodes.length === 0 || changedNodes.some((node) => !isFocusManagedNode(node));
+        });
       }
 
       if (hasVisiblePrimaryVideo() && hasVisiblePlayerLoadingOverlay()) {

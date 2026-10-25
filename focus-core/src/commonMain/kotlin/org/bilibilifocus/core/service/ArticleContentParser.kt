@@ -6,7 +6,6 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
-import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.bilibilifocus.core.model.ArticleBlock
 import org.bilibilifocus.core.model.RichTextRun
@@ -14,6 +13,16 @@ import org.bilibilifocus.core.model.TextAlignment
 
 object ArticleContentParser {
     private val json = Json { ignoreUnknownKeys = true }
+    private val scriptStylePattern = Regex("(?is)<(script|style)[^>]*>.*?</\\1>")
+    private val breakPattern = Regex("(?i)<br\\s*/?>")
+    private val htmlTokenPattern = Regex("(?s)<[^>]+>|[^<]+")
+    private val tagNamePattern = Regex("</?\\s*([a-zA-Z0-9]+)")
+    private val quotedAttributePattern = Regex("([A-Za-z0-9_:-]+)\\s*=\\s*([\"'])(.*?)\\2", RegexOption.DOT_MATCHES_ALL)
+    private val bareAttributePattern = Regex("([A-Za-z0-9_:-]+)\\s*=\\s*([^\\s>\"']+)")
+    private val colorPattern = Regex("(?i)color\\s*:\\s*([^;]+)")
+    private val encodedByteSequencePattern = Regex("(?:%[0-9A-Fa-f]{2})+")
+    private val decimalEntityPattern = Regex("&#(\\d+);")
+    private val hexEntityPattern = Regex("&#x([0-9A-Fa-f]+);")
 
     fun parse(rawContent: String): List<ArticleBlock> {
         val content = rawContent.trim()
@@ -128,8 +137,8 @@ object ArticleContentParser {
 
     private fun parseHTML(source: String): List<ArticleBlock> {
         val html = source
-            .replace(Regex("(?is)<(script|style)[^>]*>.*?</\\1>"), "")
-            .replace(Regex("(?i)<br\\s*/?>"), "<br>")
+            .replace(scriptStylePattern, "")
+            .replace(breakPattern, "<br>")
         val blocks = mutableListOf<ArticleBlock>()
         val runs = mutableListOf<RichTextRun>()
         var boldDepth = 0
@@ -167,7 +176,7 @@ object ArticleContentParser {
             listOrdered = null
         }
 
-        val tokens = Regex("(?s)<[^>]+>|[^<]+").findAll(html).map { it.value }
+        val tokens = htmlTokenPattern.findAll(html).map { it.value }
         for (token in tokens) {
             if (!token.startsWith('<')) {
                 val text = decodeEntities(token)
@@ -185,7 +194,7 @@ object ArticleContentParser {
             }
 
             val closing = token.startsWith("</")
-            val tag = Regex("</?\\s*([a-zA-Z0-9]+)").find(token)?.groupValues?.getOrNull(1)?.lowercase() ?: continue
+            val tag = tagNamePattern.find(token)?.groupValues?.getOrNull(1)?.lowercase() ?: continue
             val attrs = parseAttributes(token)
             if (closing) {
                 when (tag) {
@@ -286,10 +295,10 @@ object ArticleContentParser {
 
     private fun parseAttributes(tag: String): Map<String, String> {
         val result = mutableMapOf<String, String>()
-        Regex("([A-Za-z0-9_:-]+)\\s*=\\s*([\"'])(.*?)\\2", RegexOption.DOT_MATCHES_ALL).findAll(tag).forEach { match ->
+        quotedAttributePattern.findAll(tag).forEach { match ->
             result[match.groupValues[1].lowercase()] = decodeEntities(match.groupValues[3])
         }
-        Regex("([A-Za-z0-9_:-]+)\\s*=\\s*([^\\s>\"']+)").findAll(tag).forEach { match ->
+        bareAttributePattern.findAll(tag).forEach { match ->
             val key = match.groupValues[1].lowercase()
             result.getOrPut(key) { decodeEntities(match.groupValues[2]) }
         }
@@ -303,7 +312,7 @@ object ArticleContentParser {
     }
 
     private fun colorFromStyle(style: String?): String? =
-        Regex("(?i)color\\s*:\\s*([^;]+)").find(style.orEmpty())
+        colorPattern.find(style.orEmpty())
             ?.groupValues
             ?.getOrNull(1)
             ?.trim()
@@ -370,9 +379,11 @@ object ArticleContentParser {
     }
 
     private fun decodePercentEncoded(value: String): String {
-        var result = value.replace("+", " ")
-        val regex = Regex("%([0-9A-Fa-f]{2})")
-        result = regex.replace(result) { match -> match.groupValues[1].toInt(16).toChar().toString() }
+        val result = encodedByteSequencePattern.replace(value.replace("+", " ")) { match ->
+            ByteArray(match.value.length / 3) { index ->
+                match.value.substring(index * 3 + 1, index * 3 + 3).toInt(16).toByte()
+            }.decodeToString()
+        }
         return decodeEntities(result)
     }
 
@@ -384,9 +395,24 @@ object ArticleContentParser {
             .replace("&gt;", ">")
             .replace("&quot;", "\"")
             .replace("&#39;", "'")
-        result = Regex("&#(\\d+);").replace(result) { match -> match.groupValues[1].toIntOrNull()?.toChar()?.toString() ?: match.value }
-        result = Regex("&#x([0-9A-Fa-f]+);").replace(result) { match -> match.groupValues[1].toIntOrNull(16)?.toChar()?.toString() ?: match.value }
+        result = decimalEntityPattern.replace(result) { match ->
+            decodedCodePoint(match.groupValues[1].toIntOrNull()) ?: match.value
+        }
+        result = hexEntityPattern.replace(result) { match ->
+            decodedCodePoint(match.groupValues[1].toIntOrNull(16)) ?: match.value
+        }
         return result
+    }
+
+    private fun decodedCodePoint(value: Int?): String? = when (value) {
+        null, in 0xD800..0xDFFF -> null
+        in 0..0xFFFF -> value.toChar().toString()
+        in 0x10000..0x10FFFF -> {
+            val offset = value - 0x10000
+            charArrayOf((0xD800 + (offset ushr 10)).toChar(), (0xDC00 + (offset and 0x3FF)).toChar())
+                .concatToString()
+        }
+        else -> null
     }
 
     private fun List<RichTextRun>.trimmedRuns(): List<RichTextRun> {

@@ -1,12 +1,61 @@
 package org.bilibilifocus.core.repository
 
 import kotlinx.coroutines.async
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 
+@OptIn(ExperimentalCoroutinesApi::class)
 class AsyncExpiringCacheTests {
+    @Test
+    fun `failed refresh cannot overwrite a newer explicit value`() = runTest {
+        var now = 0L
+        val cache = AsyncExpiringCache<String, String>(nowMillis = { now })
+        val policy = CachePolicy(freshForMillis = 10, staleIfErrorForMillis = 20)
+        cache.put("feed", "old", policy)
+        now = 11
+        val gate = CompletableDeferred<Unit>()
+        val refresh = async { cache.value("feed", policy) { gate.await(); error("offline") } }
+        runCurrent()
+        cache.put("feed", "new", policy)
+        gate.complete(Unit)
+        assertEquals("new", refresh.await())
+        assertEquals("new", cache.cachedValue("feed"))
+    }
+
+    @Test
+    fun `invalidating during refresh prevents stale resurrection`() = runTest {
+        val cache = AsyncExpiringCache<String, String>()
+        val policy = CachePolicy(freshForMillis = 100, staleIfErrorForMillis = 100)
+        cache.put("feed", "old", policy)
+        val gate = CompletableDeferred<Unit>()
+        val refresh = async {
+            assertFailsWith<IllegalStateException> {
+                cache.value("feed", policy, forceRefresh = true) { gate.await(); error("offline") }
+            }
+        }
+        runCurrent()
+        cache.invalidate("feed")
+        gate.complete(Unit)
+        refresh.await()
+        assertEquals(null, cache.cachedValue("feed", allowStale = true))
+    }
+    @Test
+    fun `stale fallback expires while a refresh is loading`() = runTest {
+        var now = 0L
+        val cache = AsyncExpiringCache<String, String>(nowMillis = { now })
+        val policy = CachePolicy(freshForMillis = 10, staleIfErrorForMillis = 20)
+        cache.put("profile", "cached", policy)
+        now = 11
+        assertFailsWith<IllegalStateException> {
+            cache.value("profile", policy) { now = 31; error("offline") }
+        }
+    }
+
     @Test
     fun `coalesces concurrent misses and expires by ttl`() = runTest {
         var now = 1_000L
@@ -14,8 +63,12 @@ class AsyncExpiringCacheTests {
         val cache = AsyncExpiringCache<String, String>(nowMillis = { now })
         val policy = CachePolicy(freshForMillis = 100)
 
-        val first = async { cache.value("video", policy) { loads += 1; "value-$loads" } }
+        val gate = CompletableDeferred<Unit>()
+        val first = async { cache.value("video", policy) { loads += 1; gate.await(); "value-$loads" } }
+        runCurrent()
         val second = async { cache.value("video", policy) { loads += 1; "value-$loads" } }
+        runCurrent()
+        gate.complete(Unit)
 
         assertEquals("value-1", first.await())
         assertEquals("value-1", second.await())

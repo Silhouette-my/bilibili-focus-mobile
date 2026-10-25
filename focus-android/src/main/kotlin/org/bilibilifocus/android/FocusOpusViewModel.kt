@@ -1,5 +1,6 @@
 package org.bilibilifocus.android
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -52,6 +53,8 @@ class FocusOpusViewModel(
                 } else {
                     _state.value = OpusUiState.Failed(e.message ?: "加载失败")
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 _state.value = OpusUiState.Failed(e.message ?: "加载失败")
             }

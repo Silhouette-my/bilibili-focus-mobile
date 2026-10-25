@@ -18,6 +18,8 @@ data class HistoryItem(
     val viewAt: Long,
     val progress: Long,
     val duration: Long,
+    val cid: Long = 0,
+    val page: Int = 0,
 )
 
 /** 历史记录翻页游标。*/

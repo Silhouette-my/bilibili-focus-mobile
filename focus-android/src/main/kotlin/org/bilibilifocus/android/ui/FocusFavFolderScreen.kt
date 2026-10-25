@@ -33,7 +33,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -43,12 +42,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
-import org.bilibilifocus.android.AndroidCookieProvider
 import org.bilibilifocus.android.FavFolderUiState
 import org.bilibilifocus.android.FocusFavFolderViewModel
 import org.bilibilifocus.core.model.FavResource
-import org.bilibilifocus.core.service.FavoriteService
-import org.bilibilifocus.core.service.KtorHttpClient
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -57,18 +53,12 @@ fun FocusFavFolderScreen(
     folderTitle: String,
     onBack: () -> Unit,
     onOpenVideo: (String) -> Unit = {},
-    viewModel: FocusFavFolderViewModel? = null,
+    viewModel: FocusFavFolderViewModel,
     gridState: LazyGridState = rememberLazyGridState(),
 ) {
-    val resolvedViewModel = viewModel ?: remember(mediaId) {
-        FocusFavFolderViewModel(
-            service = FavoriteService(AndroidCookieProvider(), KtorHttpClient()),
-        )
-    }
+    LaunchedEffect(viewModel, mediaId) { viewModel.loadIfNeeded(mediaId) }
 
-    LaunchedEffect(mediaId) { resolvedViewModel.loadIfNeeded(mediaId) }
-
-    val state by resolvedViewModel.state.collectAsState()
+    val state by viewModel.state.collectAsState()
 
     Scaffold(
         topBar = {

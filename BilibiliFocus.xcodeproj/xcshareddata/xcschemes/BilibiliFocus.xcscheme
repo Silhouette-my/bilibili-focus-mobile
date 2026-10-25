@@ -40,7 +40,11 @@
       buildConfiguration = "Debug"
       selectedDebuggerIdentifier = "Xcode.DebuggerFoundation.Debugger.LLDB"
       selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB"
-      shouldUseLaunchSchemeArgsEnv = "YES">
+      shouldUseLaunchSchemeArgsEnv = "NO">
+      <EnvironmentVariables>
+         <EnvironmentVariable key="FOCUS_FIXTURE_TESTS" value="1" isEnabled="YES"/>
+         <EnvironmentVariable key="FOCUS_ONLINE_SMOKE" value="0" isEnabled="YES"/>
+      </EnvironmentVariables>
       <Testables>
          <TestableReference
             skipped = "NO">

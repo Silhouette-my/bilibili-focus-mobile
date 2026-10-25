@@ -1,5 +1,6 @@
 package org.bilibilifocus.core.service
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
@@ -150,6 +151,8 @@ class VideoInfoService(
             if (response.statusCode !in 200..299) return null
             val data = parseDataField(response.body)
             parsePlaybackProgress(data)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (_: Exception) {
             // Resume metadata is optional. A signed-out account or a temporary
             // player-info failure must not prevent the video detail from loading.
@@ -202,6 +205,8 @@ class VideoInfoService(
 
             // Last resort: accept_description / accept_quality with durl
             null
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (_: Exception) {
             null
         }
@@ -249,6 +254,8 @@ class VideoInfoService(
                 totalCount = total,
                 cursor = CommentCursor(nextOffset),
             )
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (_: Exception) {
             CommentPage(emptyList(), 0L, CommentCursor())
         }
@@ -346,6 +353,7 @@ class VideoInfoService(
             replyCount = obj["rcount"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0,
             publishTime = obj["ctime"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0,
             replies = subReplies?.mapNotNull { parseComment(it as? JsonObject) } ?: emptyList(),
+            imageURLs = CommentRichTextParser.parseImageURLs(content),
         )
     }
 

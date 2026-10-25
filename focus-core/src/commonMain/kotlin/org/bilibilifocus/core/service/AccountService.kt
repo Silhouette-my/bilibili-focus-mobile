@@ -27,9 +27,12 @@ class AccountService(
 
         val payload = json.parseToJsonElement(response.body) as? JsonObject
             ?: throw ServiceError.InvalidResponse
-        val code = payload.intValueAt("code") ?: -1
-        val data = payload.dictionaryValueAt("data") ?: return loggedOutAccount()
-        val isLogin = code == 0 && data.stringValueAt("isLogin") == "true"
+        val code = payload.intValueAt("code") ?: throw ServiceError.InvalidResponse
+        if (code == -101) return loggedOutAccount()
+        if (code != 0) throw ServiceError.InvalidResponse
+        val data = payload.dictionaryValueAt("data") ?: throw ServiceError.InvalidResponse
+        val isLogin = data.stringValueAt("isLogin")?.toBooleanStrictOrNull()
+            ?: throw ServiceError.InvalidResponse
         if (!isLogin) {
             return loggedOutAccount()
         }

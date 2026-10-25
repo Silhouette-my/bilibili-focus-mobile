@@ -1,6 +1,7 @@
 package org.bilibilifocus.core.service
 
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.CancellationException
 import org.bilibilifocus.core.cookie.Cookie
 import org.bilibilifocus.core.cookie.CookieProvider
 import org.bilibilifocus.core.model.OpusBlock
@@ -8,9 +9,28 @@ import org.bilibilifocus.core.model.RichTextRun
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
+import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 class OpusRichTextTests {
+    @Test
+    fun `dynamic detail fallback preserves cancellation`() = runTest {
+        val service = OpusService(
+            cookieProvider = object : CookieProvider {
+                override suspend fun loadCookies(): List<Cookie> = emptyList()
+            },
+            httpClient = object : HttpClient {
+                override suspend fun get(url: String, headers: Map<String, String>): HttpResponse {
+                    if ("/opus/detail" in url) return HttpResponse(200, """{"code":0,"data":{"item":{"modules":{}}}}""")
+                    throw CancellationException("cancel dynamic fallback")
+                }
+                override suspend fun post(url: String, body: String, headers: Map<String, String>): HttpResponse =
+                    error("Unexpected POST")
+            },
+        )
+        assertFailsWith<CancellationException> { service.fetchOpusDetail("123") }
+    }
+
     @Test
     fun `dynamic detail fallback keeps emoji node order dimensions animation and images`() = runTest {
         val service = OpusService(

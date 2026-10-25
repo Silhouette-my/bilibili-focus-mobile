@@ -3,6 +3,7 @@ import Foundation
 public struct DynamicFeedService: Sendable {
     private struct FeedCacheKey: Hashable, Sendable {
         let sessionFingerprint: Int
+        let sessionVersion: UInt64
         let timezoneOffsetMinutes: Int
         let offset: String
     }
@@ -40,10 +41,12 @@ public struct DynamicFeedService: Sendable {
     private let requestLoader: RequestLoader
     private let timezoneOffsetMinutes: Int
     private let pageCache: AsyncExpiringCache<FeedCacheKey, FeedPage>
+    private let snapshotStore: DynamicFeedSnapshotStore
 
     public init(
         cookieProvider: any CookieSnapshotProvider,
         timezoneOffsetMinutes: Int = -(TimeZone.current.secondsFromGMT() / 60),
+        snapshotStore: DynamicFeedSnapshotStore = .shared,
         requestLoader: @escaping RequestLoader = { request in
             try await BiliAPINetwork.data(for: request)
         }
@@ -51,7 +54,36 @@ public struct DynamicFeedService: Sendable {
         self.cookieProvider = cookieProvider
         self.timezoneOffsetMinutes = timezoneOffsetMinutes
         self.requestLoader = requestLoader
+        self.snapshotStore = snapshotStore
         pageCache = AsyncExpiringCache(maximumEntries: 32)
+    }
+
+    public var sessionVersion: UInt64 { cookieProvider.sessionVersion }
+    public var sessionReadiness: CookieSessionReadiness { cookieProvider.sessionReadiness }
+    public func prepareSessionVersion() async -> UInt64 { await cookieProvider.loadSnapshot().version }
+    public func clearCache() async { await pageCache.clear() }
+    public func clearPersistentCache() async throws {
+        await pageCache.clear()
+        try await snapshotStore.clear()
+    }
+    public func snapshotWriteRevision() async -> UInt64 { await snapshotStore.writeRevision() }
+    public func cachedSnapshot() async -> DynamicFeedSnapshotStore.Snapshot? {
+        let snapshot = await cookieProvider.loadSnapshot()
+        guard snapshot.version == cookieProvider.sessionVersion, snapshot.readiness == .authenticated else { return nil }
+        let cached = await snapshotStore.load(scope: .resolve(cookies: snapshot.cookies))
+        guard snapshot.version == cookieProvider.sessionVersion else { return nil }
+        return cached
+    }
+    public func saveSnapshot(cards: [DynamicCard], nextOffset: String?, version: UInt64, revision: UInt64) async throws {
+        // Keep the last complete page boundary below the cap; dropping rows
+        // while keeping a later cursor would create an invisible pagination gap.
+        guard cards.count <= 300 else { return }
+        let snapshot = await cookieProvider.loadSnapshot()
+        try Task.checkCancellation()
+        guard version == snapshot.version, version == cookieProvider.sessionVersion,
+              snapshot.readiness == .authenticated else { return }
+        try await snapshotStore.save(cards: cards, nextOffset: nextOffset,
+                                     scope: .resolve(cookies: snapshot.cookies), revision: revision)
     }
 
     public func fetchFollowingFeed() async throws -> [DynamicCard] {
@@ -70,29 +102,42 @@ public struct DynamicFeedService: Sendable {
         offset: String?,
         forceRefresh: Bool
     ) async throws -> FeedPage {
-        let cookies = await cookieProvider.loadCookies()
-        guard !cookies.isEmpty else {
+        let snapshot = await cookieProvider.loadSnapshot()
+        let version = snapshot.version
+        guard version == cookieProvider.sessionVersion else { throw CancellationError() }
+        if snapshot.readiness == .expired { throw ServiceError.loginRequired }
+        guard !snapshot.cookies.isEmpty else {
+            if snapshot.readiness == .unconfirmed || snapshot.readiness == .restoring {
+                throw URLError(.resourceUnavailable)
+            }
             throw ServiceError.loginRequired
         }
-
         let key = FeedCacheKey(
-            sessionFingerprint: Self.sessionFingerprint(for: cookies),
-            timezoneOffsetMinutes: timezoneOffsetMinutes,
-            offset: offset ?? ""
+            sessionFingerprint: Self.sessionFingerprint(for: snapshot.cookies), sessionVersion: version,
+            timezoneOffsetMinutes: timezoneOffsetMinutes, offset: offset ?? ""
         )
-        if forceRefresh {
-            await pageCache.invalidate(key)
-        }
-        return try await pageCache.value(
-            for: key,
-            policy: FocusCachePolicy(freshFor: 20, staleIfErrorFor: 180)
-        ) {
-            try await Self.loadFollowingFeedPage(
-                offset: offset,
-                timezoneOffsetMinutes: timezoneOffsetMinutes,
-                cookies: cookies,
-                requestLoader: requestLoader
-            )
+        do {
+            let page = try await pageCache.value(
+                for: key, policy: FocusCachePolicy(freshFor: 20, staleIfErrorFor: 180),
+                forceRefresh: forceRefresh,
+                returnsStaleOnError: !forceRefresh,
+                canUseStaleOnError: { error in
+                    guard let network = error as? URLError else { return false }
+                    return network.code != .cancelled && network.code != .userAuthenticationRequired
+                }
+            ) {
+                let page = try await Self.loadFollowingFeedPage(
+                    offset: offset, timezoneOffsetMinutes: timezoneOffsetMinutes,
+                    cookies: snapshot.cookies, requestLoader: requestLoader
+                )
+                guard version == cookieProvider.sessionVersion else { throw CancellationError() }
+                return page
+            }
+            guard version == cookieProvider.sessionVersion else { throw CancellationError() }
+            return page
+        } catch let error as ServiceError where error == .loginRequired {
+            cookieProvider.noteServerSessionExpired(version: version)
+            throw error
         }
     }
 
@@ -104,12 +149,15 @@ public struct DynamicFeedService: Sendable {
     ) async throws -> FeedPage {
         var request = URLRequest(url: Self.endpoint(timezoneOffsetMinutes: timezoneOffsetMinutes, offset: offset))
         request.httpMethod = "GET"
+        request.httpShouldHandleCookies = false
         request.setValue("https://t.bilibili.com/", forHTTPHeaderField: "Referer")
         request.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
         request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
         request = Self.attach(cookies: cookies, to: request)
 
         let (data, response) = try await requestLoader(request)
+        try Task.checkCancellation()
+        if (response as? HTTPURLResponse)?.statusCode == 401 { throw ServiceError.loginRequired }
         guard
             let httpResponse = response as? HTTPURLResponse,
             (200..<300).contains(httpResponse.statusCode)
@@ -169,7 +217,10 @@ public struct DynamicFeedService: Sendable {
         }
 
         let nextOffset = payload.stringValue(at: ["data", "offset"])?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return FeedPage(cards: cards, nextOffset: nextOffset?.isEmpty == true ? nil : nextOffset)
+        // The API can return the last cursor even when pagination is finished.
+        // Missing has_more remains compatible with older responses/fixtures.
+        let hasMore = payload.intValue(at: ["data", "has_more"])
+        return FeedPage(cards: cards, nextOffset: hasMore == 0 || nextOffset?.isEmpty == true ? nil : nextOffset)
     }
 
     public static func attach(cookies: [HTTPCookie], to request: URLRequest) -> URLRequest {

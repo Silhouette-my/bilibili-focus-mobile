@@ -2,7 +2,7 @@ import Foundation
 import Testing
 @testable import FocusCore
 
-@Suite("4-12 week architecture foundations")
+@Suite("Core cache, paging, and transport")
 struct ArchitectureFoundationTests {
     @Test("cache coalesces concurrent misses and uses stale-if-error")
     func cacheCoalescesAndFallsBack() async throws {

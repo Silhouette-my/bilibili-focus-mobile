@@ -2,8 +2,10 @@ package org.bilibilifocus.core.repository
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import org.bilibilifocus.core.service.currentEpochSeconds
 
 data class CachePolicy(
@@ -45,10 +47,10 @@ class AsyncExpiringCache<Key : Any, Value : Any>(
         key: Key,
         policy: CachePolicy,
         forceRefresh: Boolean = false,
+        canUseStaleOnError: (Exception) -> Boolean = { true },
         loader: suspend () -> Value,
     ): Value {
         val now = nowMillis()
-        var staleEntry: Entry<Value>? = null
         var leader = false
         val deferred = mutex.withLock {
             val cached = entries[key]
@@ -56,8 +58,6 @@ class AsyncExpiringCache<Key : Any, Value : Any>(
                 touch(key, cached)
                 return cached.value
             }
-            staleEntry = cached?.takeIf { now < it.staleUntilMillis }
-
             inFlight[key] ?: CompletableDeferred<Value>().also {
                 inFlight[key] = it
                 leader = true
@@ -87,18 +87,33 @@ class AsyncExpiringCache<Key : Any, Value : Any>(
             deferred.complete(loaded)
             return loaded
         } catch (error: CancellationException) {
-            mutex.withLock { inFlight.remove(key) }
-            deferred.completeExceptionally(error)
+            // The cancelled loader must still unlink and settle its shared
+            // deferred, including when another cache operation holds the lock.
+            withContext(NonCancellable) {
+                mutex.withLock { inFlight.remove(key) }
+                deferred.completeExceptionally(error)
+            }
             throw error
         } catch (error: Exception) {
-            val stale = staleEntry
-            mutex.withLock { inFlight.remove(key) }
-            if (stale != null) {
-                mutex.withLock { touch(key, stale) }
-                deferred.complete(stale.value)
-                return stale.value
+            val acceptsStale = canUseStaleOnError(error)
+            val stale = withContext(NonCancellable) {
+                val fallback = mutex.withLock {
+                    inFlight.remove(key)
+                    if (!acceptsStale) {
+                        entries.remove(key)
+                        null
+                    } else {
+                        // Read and touch atomically: never resurrect a value
+                        // invalidated or replaced while this loader was running.
+                        entries[key]?.takeIf { nowMillis() < it.staleUntilMillis }
+                            ?.also { touch(key, it) }
+                    }
+                }
+                if (fallback != null) deferred.complete(fallback.value)
+                else deferred.completeExceptionally(error)
+                fallback
             }
-            deferred.completeExceptionally(error)
+            if (stale != null) return stale.value
             throw error
         }
     }

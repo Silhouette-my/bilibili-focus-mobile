@@ -4,7 +4,7 @@ import Testing
 
 @Suite("bilibili-api contract catalog")
 struct BiliAPIContractTests {
-    @Test("loads the attributed sibling snapshot")
+    @Test("loads the independently maintained endpoint subset")
     func loadsSnapshot() {
         let snapshot = BiliAPIContractCatalog.snapshot
 
@@ -14,7 +14,7 @@ struct BiliAPIContractTests {
         #expect(snapshot.source.repository.host == "github.com")
     }
 
-    @Test("exposes verified endpoint metadata")
+    @Test("exposes local endpoint metadata")
     func exposesEndpointMetadata() {
         let endpoint = BiliAPIContractCatalog.require("video.info.get_player_info")
 
@@ -24,7 +24,7 @@ struct BiliAPIContractTests {
         #expect(endpoint.usesWBI)
     }
 
-    @Test("includes watch-later contracts for the next feature layer")
+    @Test("includes watch-later read and write contracts")
     func includesWatchLaterContracts() {
         #expect(
             BiliAPIContractCatalog.require("toview.info.list").url.path ==

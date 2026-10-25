@@ -410,6 +410,27 @@ internal fun parseRequestedCid(url: String): Long? {
         ?.takeIf { it > 0 }
 }
 
+internal fun parseRequestedHistoryPositionMillis(url: String): Long? {
+    return Regex("""[?&]focus_history_position_ms=(\d+)""", RegexOption.IGNORE_CASE)
+        .find(url.replace("&amp;", "&", ignoreCase = true))
+        ?.groupValues
+        ?.getOrNull(1)
+        ?.toLongOrNull()
+}
+
+internal fun historyPositionForRequestedPage(
+    positionMillis: Long?,
+    requestedPageNumber: Int?,
+    requestedPageCid: Long?,
+    activePageNumber: Int,
+    activePageCid: Long,
+): Long? {
+    if (positionMillis == null) return null
+    val cidMatches = requestedPageCid != null && requestedPageCid == activePageCid
+    val pageMatches = requestedPageNumber != null && requestedPageNumber == activePageNumber
+    return positionMillis.takeIf { cidMatches || pageMatches }
+}
+
 
 private fun formatPublishDate(timestamp: Long): String =
     java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.CHINA)

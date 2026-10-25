@@ -1,3 +1,4 @@
+import AVFoundation
 import FocusCore
 import UIKit
 import WebKit
@@ -6,6 +7,308 @@ import XCTest
 
 @MainActor
 final class BilibiliFocusStabilityTests: XCTestCase {
+    func testPlaybackUsesBackupCDNAfterSourceFailure() async {
+        var attempts: [String] = []
+        let model = makeBackupPlaybackModel { source in
+            guard case let .progressive(urls) = source.stream else { throw FocusVideoDetailService.ServiceError.noStream }
+            attempts.append(urls[0].host!)
+            if attempts.count == 1 { throw URLError(.cannotConnectToHost) }
+            return [AVPlayerItem(asset: AVMutableComposition())]
+        }
+        defer { model.suspend() }
+        model.activate(url: URL(string: "https://www.bilibili.com/video/BV1xx411c7mD/")!)
+        await waitUntil { model.hasPreparedPlayer }
+        XCTAssertEqual(attempts, ["cdn-a.example", "cdn-b.example"])
+        XCTAssertNil(model.playerErrorMessage)
+    }
+
+    func testPlaybackDoesNotRetryDecoderFailureOnEveryCDN() async {
+        var attempts = 0
+        let model = makeBackupPlaybackModel { _ in
+            attempts += 1
+            throw NSError(domain: AVFoundationErrorDomain, code: AVError.Code.decoderNotFound.rawValue)
+        }
+        defer { model.suspend() }
+        model.activate(url: URL(string: "https://www.bilibili.com/video/BV1xx411c7mD/")!)
+        await waitUntil { model.playerErrorMessage != nil }
+        XCTAssertEqual(attempts, 1)
+        XCTAssertFalse(model.hasPreparedPlayer)
+    }
+
+    func testCancelledCDNPreparationCannotInstallItsLateItemOrTryAnotherAddress() async {
+        let gate = NativeVideoAsyncGate()
+        var attempts = 0
+        var factoryFinished = false
+        let model = makeBackupPlaybackModel { _ in
+            attempts += 1
+            await gate.wait()
+            factoryFinished = true
+            return [AVPlayerItem(asset: AVMutableComposition())]
+        }
+        model.activate(url: URL(string: "https://www.bilibili.com/video/BV1xx411c7mD/")!)
+        await waitUntilAsync { await gate.waiterCount == 1 }
+        model.suspend()
+        await gate.release()
+        await waitUntil { factoryFinished }
+        XCTAssertEqual(attempts, 1)
+        XCTAssertNil(model.player.currentItem)
+        XCTAssertFalse(model.hasPreparedPlayer)
+        XCTAssertFalse(model.hasActivePlaybackPreparationTask)
+    }
+
+    private func makeBackupPlaybackModel(
+        factory: @escaping FocusNativeVideoViewModel.PlaybackItemFactory
+    ) -> FocusNativeVideoViewModel {
+        FocusNativeVideoViewModel(
+            detailService: FocusVideoDetailService(cookieProvider: NativeVideoTestCookieProvider(), requestLoader: { request in
+                if request.url?.path.hasSuffix("playurl") == true {
+                    let payload = #"{"code":0,"data":{"quality":80,"durl":[{"url":"https://cdn-a.example/video.mp4","backup_url":["https://cdn-b.example/video.mp4"]}]}}"#
+                    return (Data(payload.utf8), HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+                }
+                return try await NativeVideoTestAPI.detailResponse(for: request)
+            }),
+            actionService: FocusVideoActionService(cookieProvider: NativeVideoTestCookieProvider(), requestLoader: NativeVideoTestAPI.actionResponse),
+            playbackProgressStore: makeNativeVideoPlaybackStore(), nativeDanmakuEnabled: false,
+            playbackReadyWaiter: { _ in }, playbackItemFactory: factory
+        )
+    }
+
+    func testSinglePartFetchesStreamWhileHistoryIsPendingAndStillResumes() async {
+        let historyGate = NativeVideoAsyncGate()
+        let streamGate = NativeVideoAsyncGate()
+        var seekPositions: [Int64] = []
+        let model = FocusNativeVideoViewModel(
+            detailService: FocusVideoDetailService(
+                cookieProvider: NativeVideoTestCookieProvider(),
+                requestLoader: { request in
+                    if request.url?.path == "/x/player/wbi/v2" || request.url?.path == "/x/player/v2" {
+                        await historyGate.wait()
+                        return (
+                            Data(#"{"code":0,"data":{"last_play_cid":4201,"last_play_time":64000}}"#.utf8),
+                            HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+                        )
+                    }
+                    if request.url?.path == "/x/player/playurl" { await streamGate.wait() }
+                    return try await NativeVideoTestAPI.detailResponse(for: request)
+                }
+            ),
+            actionService: FocusVideoActionService(
+                cookieProvider: NativeVideoTestCookieProvider(),
+                requestLoader: NativeVideoTestAPI.actionResponse
+            ),
+            playbackProgressStore: makeNativeVideoPlaybackStore(),
+            accountScopeProvider: { .anonymous },
+            nativeDanmakuEnabled: false,
+            playbackReadyWaiter: { _ in },
+            initialPlaybackSeeker: { _, position in seekPositions.append(position) }
+        )
+        defer { model.suspend() }
+        model.activate(url: URL(string: "https://www.bilibili.com/video/BV1xx411c7mD/")!)
+        await waitUntilAsync {
+            let historyStarted = await historyGate.waiterCount > 0
+            let streamStarted = await streamGate.waiterCount > 0
+            return historyStarted && streamStarted
+        }
+        XCTAssertFalse(model.hasPreparedPlayer)
+        await streamGate.release()
+        await waitUntil { model.player.currentItem != nil }
+        XCTAssertNotNil(model.player.currentItem, "Media items must be prepared while the history request is still blocked")
+        XCTAssertFalse(model.hasPreparedPlayer, "Formal playback must still wait for resume resolution")
+        XCTAssertTrue(seekPositions.isEmpty)
+        await historyGate.release()
+        await waitUntil { model.hasPreparedPlayer }
+        XCTAssertEqual(seekPositions, [64_000])
+        XCTAssertEqual(model.selectedPageCID, 4201)
+    }
+
+    func testResumeDeadlineDoesNotJoinLateHistoryAndFirstFrameRequiresCurrentVisibleSurface() async throws {
+        let historyGate = NativeVideoAsyncGate()
+        let deadlineGate = NativeVideoAsyncGate()
+        var seekPositions: [Int64] = []
+        let model = FocusNativeVideoViewModel(
+            detailService: FocusVideoDetailService(cookieProvider: NativeVideoTestCookieProvider(), requestLoader: { request in
+                if request.url?.path == "/x/player/wbi/v2" || request.url?.path == "/x/player/v2" {
+                    await historyGate.wait()
+                    return (Data(#"{"code":0,"data":{"last_play_cid":4201,"last_play_time":64000}}"#.utf8),
+                            HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+                }
+                return try await NativeVideoTestAPI.detailResponse(for: request)
+            }),
+            actionService: FocusVideoActionService(cookieProvider: NativeVideoTestCookieProvider(), requestLoader: NativeVideoTestAPI.actionResponse),
+            playbackProgressStore: makeNativeVideoPlaybackStore(), accountScopeProvider: { .anonymous },
+            nativeDanmakuEnabled: false, playbackReadyWaiter: { _ in },
+            initialPlaybackSeeker: { _, position in seekPositions.append(position) },
+            resumeBudgetSleeper: { _ in await deadlineGate.wait() }
+        )
+        defer { model.suspend() }
+        model.activate(url: URL(string: "https://www.bilibili.com/video/BV1xx411c7mD/")!)
+        await waitUntilAsync { await historyGate.waiterCount > 0 }
+        await waitUntilAsync { await deadlineGate.waiterCount > 0 }
+        await waitUntil { model.player.currentItem != nil }
+        await deadlineGate.release()
+        await waitUntil { model.hasPreparedPlayer }
+        XCTAssertTrue(seekPositions.isEmpty)
+        let requestID = model.playbackDiagnosticID
+        let item = try XCTUnwrap(model.player.currentItem)
+        let itemID = ObjectIdentifier(item)
+        let surface = UUID()
+        func frames() -> [BiliPerformanceEvent] {
+            BiliPerformanceStore.shared.snapshot().filter { $0.correlationID == requestID && $0.stage == .firstFrame && $0.outcome == .success }
+        }
+        XCTAssertTrue(frames().isEmpty, "Ready-to-play is not first-frame evidence")
+        model.recordSurfaceReadiness(surface: surface, itemID: itemID, isReady: true, requestID: requestID)
+        XCTAssertTrue(frames().isEmpty, "An unmounted surface cannot report a displayed frame")
+        model.activatePresentationSurface(surface)
+        model.recordSurfaceReadiness(surface: surface, itemID: itemID, isReady: true, requestID: UUID())
+        model.recordSurfaceReadiness(surface: surface, itemID: ObjectIdentifier(NSObject()), isReady: true, requestID: requestID)
+        model.recordSurfaceReadiness(surface: surface, itemID: itemID, isReady: true, requestID: requestID, isFullscreenSurface: true)
+        XCTAssertTrue(frames().isEmpty, "Stale requests, items and covered/wrong-mode surfaces must be rejected")
+        model.recordSurfaceReadiness(surface: surface, itemID: itemID, isReady: true, requestID: requestID)
+        model.recordSurfaceReadiness(surface: surface, itemID: itemID, isReady: true, requestID: requestID)
+        XCTAssertEqual(frames().count, 1)
+        let startup = BiliPerformanceStore.shared.snapshot().filter {
+            $0.correlationID == requestID && $0.stage == .videoStartup && $0.outcome == .success
+        }
+        XCTAssertEqual(startup.count, 1)
+        let startupEvent = try XCTUnwrap(startup.first)
+        let frameEvent = try XCTUnwrap(frames().first)
+        XCTAssertGreaterThanOrEqual(startupEvent.durationMilliseconds, frameEvent.durationMilliseconds)
+        model.deactivatePresentationSurface(surface)
+        await historyGate.release()
+        await Task.yield()
+        XCTAssertTrue(seekPositions.isEmpty, "Late history must never seek an already-started video")
+        XCTAssertEqual(frames().count, 1)
+    }
+
+    func testListPreviewIsTemporaryAndDoesNotClaimFetchedDetail() {
+        let (store, defaults, suiteName) = makeSettingsStore()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let app = FocusAppViewModel(settingsStore: store)
+        let preview = SearchResultItem.PreviewVideo(id: "fixture", title: "List title",
+            coverURL: URL(string: "https://focus-image.test/preview.jpg"),
+            targetURL: URL(string: "https://www.bilibili.com/video/BV1xx411c7mD/")!)
+        app.open(searchPreview: preview)
+        guard case let .video(id, _) = app.route else { return XCTFail("Expected video route") }
+        let video = app.videoViewModel(for: id)
+        defer { video.suspend(); app.dynamicFeedViewModel.suspend() }
+        XCTAssertEqual(video.routePreview?.title, "List title")
+        XCTAssertEqual(video.routePreview?.coverURL, preview.coverURL)
+        XCTAssertNil(video.detail)
+        XCTAssertFalse(video.hasPreparedPlayer)
+        video.open(URL(string: "https://www.bilibili.com/video/BV1yy411c7mD/")!)
+        XCTAssertNil(video.routePreview, "Metadata must not survive a change of video")
+    }
+
+    func testStartupCookieWarmupDoesNotResetAnAlreadyVisibleFeed() async throws {
+        let (store, defaults, suiteName) = makeSettingsStore()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let model = FocusAppViewModel(settingsStore: store)
+        defer { model.dynamicFeedViewModel.suspend() }
+        model.handleLaunchEntryIfNeeded()
+        // The retained feed can already be visible while startup cookie work awaits.
+        model.dynamicFeedViewModel.updateScrollOffset(420)
+        let revision = model.dynamicFeedViewModel.scrollRestorationRevision
+        try await Task.sleep(for: .seconds(3))
+        XCTAssertEqual(model.dynamicFeedViewModel.scrollOffsetY, 420)
+        XCTAssertEqual(model.dynamicFeedViewModel.scrollRestorationRevision, revision)
+    }
+
+    func testMyPageDoesNotTurnSectionFailuresIntoEmptyLists() async {
+        let sections: [(String, FocusMyViewModel.Section)] = [
+            ("/x/relation/stat", .relation), ("/x/web-interface/history/cursor", .history),
+            ("/x/v3/fav/folder/created/list-all", .folders), ("/x/v3/fav/resource/list", .previews),
+            ("/x/v2/history/toview", .watchLater),
+        ]
+        for (path, section) in sections {
+            let model = makeMyPageTestModel(failedPath: path)
+            await model.refresh()
+            guard case .loaded = model.state else {
+                model.suspend()
+                XCTFail("Optional section failure must preserve profile for \(path)")
+                continue
+            }
+            guard case let .failed(message) = model.sectionStates[section] else {
+                model.suspend()
+                XCTFail("Failure was not surfaced for \(path); failed must not become successful empty")
+                continue
+            }
+            XCTAssertFalse(message.isEmpty)
+            let independent: FocusMyViewModel.Section = section == .history ? .watchLater : .history
+            XCTAssertEqual(model.sectionStates[independent], .loaded)
+            model.suspend()
+        }
+    }
+
+    func testMyPageAcceptsSuccessfulEmptySections() async {
+        let model = makeMyPageTestModel()
+        defer { model.suspend() }
+        await model.refresh()
+        guard case let .loaded(page) = model.state else { return XCTFail("Expected loaded page") }
+        XCTAssertTrue(FocusMyViewModel.Section.allCases.allSatisfy { model.sectionStates[$0] == .loaded })
+        XCTAssertTrue(page.history.isEmpty)
+        XCTAssertTrue(page.watchLater.isEmpty)
+        XCTAssertEqual(page.folders.count, 1)
+        XCTAssertTrue(page.folders[0].previews.isEmpty)
+    }
+
+    func testMyPageSurfacesRelationAPIErrorAndWatchLaterExpiredSession() async {
+        let relation = makeMyPageTestModel(failedPath: "/x/relation/stat", failureCode: -352)
+        await relation.refresh()
+        if case let .failed(message) = relation.sectionStates[.relation] { XCTAssertEqual(message, "fixture failure") }
+        else { XCTFail("API failure must not become successful zero counts") }
+        if case .loaded = relation.state {} else { XCTFail("Risk control of one section must not sign out the page") }
+        XCTAssertEqual(relation.sectionStates[.history], .loaded)
+        relation.suspend()
+
+        let watchLater = makeMyPageTestModel(failedPath: "/x/v2/history/toview", failureCode: -101)
+        watchLater.loadIfNeeded()
+        await waitUntil { if case .loginRequired = watchLater.state { return true }; return false }
+        if case .loginRequired = watchLater.state {} else { XCTFail("Expected loginRequired") }
+        watchLater.suspend()
+    }
+
+    private func makeMyPageTestModel(failedPath: String? = nil, failureCode: Int? = nil) -> FocusMyViewModel {
+        let loader: FocusWatchLaterService.RequestLoader = { request in
+            let url = request.url!
+            let body: String
+            if url.path == failedPath {
+                if let failureCode {
+                    body = "{\"code\":\(failureCode),\"message\":\"fixture failure\"}"
+                } else {
+                    throw URLError(.notConnectedToInternet)
+                }
+            } else if url.path == "/x/v3/fav/folder/created/list-all" {
+                body = #"{"code":0,"data":{"list":[{"id":1,"title":"Folder","media_count":0}]}}"#
+            } else {
+                body = #"{"code":0,"data":{"isLogin":true,"mid":42,"following":1,"follower":2,"list":[],"medias":[],"count":0}}"#
+            }
+            return (Data(body.utf8), HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+        }
+        return FocusMyViewModel(
+            service: FocusMyDataService(
+                cookieProvider: WebViewCookieSnapshotProvider(websiteDataStore: .nonPersistent(), performsLoginWarmup: false),
+                requestLoader: loader
+            ),
+            watchLaterService: FocusWatchLaterService(cookieProvider: NativeVideoTestCookieProvider(), requestLoader: loader)
+        )
+    }
+
+    func testCookieWarmupWaitsForUsableSessionRatherThanUserID() {
+        func cookie(_ name: String, value: String = "test", domain: String = ".bilibili.com", expires: Date? = nil) -> HTTPCookie {
+            var properties: [HTTPCookiePropertyKey: Any] = [
+                .name: name, .value: value, .domain: domain, .path: "/",
+            ]
+            if let expires { properties[.expires] = expires }
+            return HTTPCookie(properties: properties)!
+        }
+        let now = Date()
+        XCTAssertFalse(WebViewCookieSnapshotProvider.containsUsableLoginSession(in: [cookie("DedeUserID"), cookie("bili_jct")]))
+        XCTAssertFalse(WebViewCookieSnapshotProvider.containsUsableLoginSession(in: [cookie("SESSDATA", value: "")]))
+        XCTAssertFalse(WebViewCookieSnapshotProvider.containsUsableLoginSession(in: [cookie("SESSDATA", domain: "example.com")]))
+        XCTAssertFalse(WebViewCookieSnapshotProvider.containsUsableLoginSession(in: [cookie("SESSDATA", expires: now.addingTimeInterval(-60))], now: now))
+        XCTAssertTrue(WebViewCookieSnapshotProvider.containsUsableLoginSession(in: [cookie("SESSDATA")]))
+    }
+
     func testArticleRoutingAcceptsOnlySupportedBilibiliVariants() {
         let variants = [
             "https://www.bilibili.com/read/cv123?from=search",
@@ -848,7 +1151,7 @@ final class BilibiliFocusStabilityTests: XCTestCase {
         XCTAssertEqual(viewModel.playbackPositionMilliseconds, 64_000)
     }
 
-    func testNativeVideoImmediateReentryWaitsForPendingLocalProgressWrite() async {
+    func testNativeVideoImmediateReentryPreparesMediaWhileWaitingForPendingLocalProgressWrite() async {
         let progressStore = makeNativeVideoPlaybackStore()
         let writeCoordinator = FocusPlaybackProgressWriteCoordinator()
         let writeGate = NativeVideoAsyncGate()
@@ -897,11 +1200,11 @@ final class BilibiliFocusStabilityTests: XCTestCase {
             url: URL(string: "https://www.bilibili.com/video/BV1xx411c7mD/")!
         )
         await waitUntilAsync { await scopeProbe.callCount >= 2 }
-        try? await Task.sleep(nanoseconds: 50_000_000)
+        await waitUntil { reachedReadyWaiter }
 
         XCTAssertTrue(viewModel.hasActivePlaybackPreparationTask)
         XCTAssertFalse(viewModel.hasPreparedPlayer)
-        XCTAssertFalse(reachedReadyWaiter)
+        XCTAssertTrue(reachedReadyWaiter, "Known-CID media preparation is independent of the pending progress write")
         XCTAssertEqual(seekPositions, [])
 
         await writeGate.release()
@@ -1409,6 +1712,74 @@ final class BilibiliFocusStabilityTests: XCTestCase {
         let documentPaths = await subtitleAPI.documentPaths
         XCTAssertTrue(documentPaths.contains("/bfs/subtitle/4201-en.json"))
         XCTAssertTrue(documentPaths.contains("/bfs/subtitle/4202-en.json"))
+    }
+
+    func testCommentTailAutomaticallyPaginatesDeduplicatesCyclesAndRequiresExplicitRetry() async throws {
+        let api = NativeVideoPaginationTestAPI()
+        let model = FocusNativeVideoViewModel(
+            detailService: FocusVideoDetailService(cookieProvider: NativeVideoTestCookieProvider(), requestLoader: { try await api.response(for: $0) }),
+            actionService: FocusVideoActionService(cookieProvider: NativeVideoTestCookieProvider(), requestLoader: NativeVideoTestAPI.actionResponse),
+            playbackProgressStore: makeNativeVideoPlaybackStore(), accountScopeProvider: { .anonymous },
+            nativeDanmakuEnabled: false, playbackReadyWaiter: { _ in }, initialPlaybackSeeker: { _, _ in }
+        )
+        defer { model.suspend() }
+        model.activate(url: URL(string: "https://www.bilibili.com/video/BV1xx411c7mD/")!)
+        await waitUntil { model.comments.count == 8 }
+        model.commentDidAppear(1)
+        await Task.yield()
+        let initialCount = await api.requestCount
+        XCTAssertEqual(initialCount, 1, "Rows far from the tail must not start pagination")
+        model.commentDidAppear(8)
+        model.commentDidAppear(7)
+        await waitUntil { model.commentsErrorMessage != nil }
+        XCTAssertEqual(model.comments.count, 8)
+        model.commentDidAppear(8)
+        await Task.yield()
+        let failedCount = await api.requestCount
+        XCTAssertEqual(failedCount, 2, "A visible failed row must not enter an automatic retry loop")
+        model.retryComments()
+        await waitUntil { model.comments.count == 9 && !model.isLoadingMoreComments }
+        XCTAssertNil(model.commentsErrorMessage)
+        XCTAssertEqual(model.comments.map(\.id), Array(1...9).map(Int64.init))
+        model.commentDidAppear(9)
+        await waitUntil { !model.hasMoreComments }
+        let finalCount = await api.requestCount
+        XCTAssertEqual(finalCount, 4, "A cursor cycle must terminate even if the endpoint keeps returning a cursor")
+        model.suspend()
+        model.commentDidAppear(9)
+        await Task.yield()
+        let suspendedCount = await api.requestCount
+        XCTAssertEqual(suspendedCount, finalCount)
+    }
+
+    func testHiddenVideoCancelsCommentAppendAndRejectsLateResponse() async {
+        let gate = NativeVideoAsyncGate()
+        let api = NativeVideoPaginationTestAPI(appendGate: gate)
+        let model = FocusNativeVideoViewModel(
+            detailService: FocusVideoDetailService(cookieProvider: NativeVideoTestCookieProvider(), requestLoader: { try await api.response(for: $0) }),
+            actionService: FocusVideoActionService(cookieProvider: NativeVideoTestCookieProvider(), requestLoader: NativeVideoTestAPI.actionResponse),
+            playbackProgressStore: makeNativeVideoPlaybackStore(), accountScopeProvider: { .anonymous },
+            nativeDanmakuEnabled: false, playbackReadyWaiter: { _ in }, initialPlaybackSeeker: { _, _ in }
+        )
+        let url = URL(string: "https://www.bilibili.com/video/BV1xx411c7mD/")!
+        model.activate(url: url)
+        await waitUntil { model.comments.count == 8 }
+        model.commentDidAppear(8)
+        await waitUntilAsync { await gate.waiterCount > 0 }
+        model.suspend()
+        model.commentDidAppear(8)
+        await gate.release()
+        await Task.yield()
+        XCTAssertEqual(model.comments.count, 8)
+        XCTAssertFalse(model.isLoadingMoreComments)
+        XCTAssertNil(model.commentsErrorMessage)
+        let count = await api.requestCount
+        XCTAssertEqual(count, 2)
+        model.activate(url: url)
+        model.commentDidAppear(8)
+        await waitUntil { model.comments.count == 9 }
+        XCTAssertEqual(model.comments.count, 9, "Reappearing near the tail may start a fresh append")
+        model.suspend()
     }
 
     func testNativeVideoCommentRepliesDeduplicateAndCollapsePreservesCache() async throws {
@@ -2502,6 +2873,29 @@ private struct NativeVideoTestCookieProvider: CookieSnapshotProvider {
             .value: value,
             .secure: "TRUE",
         ])
+    }
+}
+
+private actor NativeVideoPaginationTestAPI {
+    private(set) var requestCount = 0
+    let appendGate: NativeVideoAsyncGate?
+
+    init(appendGate: NativeVideoAsyncGate? = nil) { self.appendGate = appendGate }
+
+    func response(for request: URLRequest) async throws -> (Data, URLResponse) {
+        guard request.url?.path == "/x/v2/reply/wbi/main" else {
+            return try await NativeVideoTestAPI.detailResponse(for: request)
+        }
+        requestCount += 1
+        if requestCount == 2 {
+            if let appendGate { await appendGate.wait() }
+            else { throw URLError(.notConnectedToInternet) }
+        }
+        let ids = requestCount == 1 ? Array(1...8) : [8, 9]
+        let cursor = requestCount <= 3 ? (requestCount == 1 ? "A" : "B") : "A"
+        let replies = ids.map { #"{"rpid":\#($0),"member":{"uname":"fixture"},"content":{"message":"comment"}}"# }.joined(separator: ",")
+        let payload = #"{"code":0,"data":{"cursor":{"all_count":9,"pagination_reply":{"next_offset":"\#(cursor)"}},"replies":[\#(replies)]}}"#
+        return (Data(payload.utf8), HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
     }
 }
 

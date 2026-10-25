@@ -39,13 +39,16 @@ import org.bilibilifocus.core.storage.SettingsStorage
 class MainActivity : ComponentActivity() {
     private lateinit var playbackConnection: FocusPlaybackConnection
     private val pictureInPictureMode = mutableStateOf(false)
+    private val multiWindowMode = mutableStateOf(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
+        multiWindowMode.value = isInMultiWindowMode
         playbackConnection = FocusPlaybackConnection(applicationContext)
         requestedOrientation = FocusActivityOrientationPolicy.defaultOrientation(
             resources.configuration.smallestScreenWidthDp,
+            isInMultiWindowMode,
         )
         setContent {
             val settingsViewModel = remember {
@@ -83,6 +86,7 @@ class MainActivity : ComponentActivity() {
                             playbackConnection = playbackConnection,
                             playerSurfaceRevision = playerSurfaceRevision,
                             isInPictureInPictureMode = pictureInPictureMode.value,
+                            isInMultiWindowMode = multiWindowMode.value,
                         )
                         if (pictureInPictureMode.value) {
                             PictureInPicturePlayer(
@@ -114,6 +118,23 @@ class MainActivity : ComponentActivity() {
     ) {
         super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
         pictureInPictureMode.value = isInPictureInPictureMode
+    }
+
+    override fun onMultiWindowModeChanged(
+        isInMultiWindowMode: Boolean,
+        newConfig: Configuration,
+    ) {
+        super.onMultiWindowModeChanged(isInMultiWindowMode, newConfig)
+        multiWindowMode.value = isInMultiWindowMode
+        if (FocusActivityOrientationPolicy.shouldApplyMultiWindowCallbackOrientation(
+                isInPictureInPictureMode,
+            )
+        ) {
+            requestedOrientation = FocusActivityOrientationPolicy.defaultOrientation(
+                newConfig.smallestScreenWidthDp,
+                isInMultiWindowMode,
+            )
+        }
     }
 
     override fun onDestroy() {
@@ -193,8 +214,14 @@ private fun PictureInPicturePlayer(
 }
 
 internal object FocusActivityOrientationPolicy {
-    fun defaultOrientation(smallestScreenWidthDp: Int): Int =
-        if (smallestScreenWidthDp < 600) {
+    fun shouldApplyMultiWindowCallbackOrientation(isInPictureInPictureMode: Boolean): Boolean =
+        !isInPictureInPictureMode
+
+    fun defaultOrientation(
+        smallestScreenWidthDp: Int,
+        isInMultiWindowMode: Boolean = false,
+    ): Int =
+        if (!isInMultiWindowMode && smallestScreenWidthDp < 600) {
             ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
         } else {
             ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED

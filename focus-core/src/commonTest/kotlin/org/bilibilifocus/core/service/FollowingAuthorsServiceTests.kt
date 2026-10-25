@@ -1,13 +1,38 @@
 package org.bilibilifocus.core.service
 
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.CancellationException
 import org.bilibilifocus.core.cookie.Cookie
 import org.bilibilifocus.core.cookie.CookieProvider
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
+import kotlin.test.assertFailsWith
 
 class FollowingAuthorsServiceTests {
+    @Test
+    fun `cancelled attention request does not start fallback pagination`() = runTest {
+        var requests = 0
+        val service = FollowingAuthorsService(
+            cookieProvider = object : CookieProvider {
+                override suspend fun loadCookies(): List<Cookie> = emptyList()
+            },
+            httpClient = object : HttpClient {
+                override suspend fun get(url: String, headers: Map<String, String>): HttpResponse {
+                    requests += 1
+                    return when {
+                        url.contains("/x/web-interface/nav") -> HttpResponse(200, """{"code":0,"data":{"isLogin":true,"mid":99}}""")
+                        url.contains("/x/web-interface/attentions") -> throw CancellationException("screen disposed")
+                        else -> HttpResponse(200, """{"code":0,"data":{"total":0,"list":[]}}""")
+                    }
+                }
+                override suspend fun post(url: String, body: String, headers: Map<String, String>): HttpResponse = error("Unexpected POST")
+            },
+        )
+        assertFailsWith<CancellationException> { service.fetchFollowingAuthors() }
+        assertEquals(2, requests)
+    }
+
     @Test
     fun `following list merges attention authors and reads every page`() = runTest {
         val httpClient = FollowingFixtureHttpClient()

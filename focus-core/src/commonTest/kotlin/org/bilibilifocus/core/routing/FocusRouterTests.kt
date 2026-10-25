@@ -42,4 +42,44 @@ class FocusRouterTests {
 
         assertEquals(AppRoute.DynamicFeed, router.entryRoute())
     }
+
+    @Test
+    fun `swift friendly constructor is equivalent to settings constructor`() {
+        val configurations = listOf(
+            true to FocusEntry.SEARCH,
+            false to FocusEntry.DYNAMIC,
+        )
+        val urls = listOf(
+            "https://www.bilibili.com/",
+            "https://m.bilibili.com/index.html",
+            "https://t.bilibili.com/",
+            "not a URL",
+        )
+
+        configurations.forEach { (redirectEnabled, defaultEntry) ->
+            val settingsRouter = FocusRouter(
+                FocusSettings(
+                    redirectEnabled = redirectEnabled,
+                    defaultEntry = defaultEntry,
+                )
+            )
+            val swiftFriendlyRouter = FocusRouter(
+                redirectEnabled = redirectEnabled,
+                defaultEntry = defaultEntry,
+            )
+
+            assertEquals(settingsRouter.entry(), swiftFriendlyRouter.entry())
+            assertEquals(settingsRouter.entryRoute(), swiftFriendlyRouter.entryRoute())
+            urls.forEach { url ->
+                assertEquals(
+                    settingsRouter.decision(url),
+                    swiftFriendlyRouter.decision(url),
+                )
+                assertEquals(
+                    settingsRouter.redirectTarget(url),
+                    swiftFriendlyRouter.redirectTarget(url),
+                )
+            }
+        }
+    }
 }

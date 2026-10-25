@@ -70,7 +70,10 @@ final class FocusAppViewModel: ObservableObject {
 
     private var didHandleLaunchEntry = false
     private var didRefreshOnBecomeActive = false
+    private var isLoginFlowActive = false
+    private var pendingDynamicReturnID: UUID?
     private var activeRouteCancellables: Set<AnyCancellable> = []
+    private var sessionCancellable: AnyCancellable?
 
     var route: AppRoute {
         routeStack.last ?? .dynamicFeed
@@ -98,27 +101,24 @@ final class FocusAppViewModel: ObservableObject {
         self.videoCommentService = appGraph.videoCommentService
         self.playbackProgressStore = appGraph.playbackProgressStore
         self.playbackProgressWriteCoordinator = appGraph.playbackProgressWriteCoordinator
+        sessionCancellable = NotificationCenter.default.publisher(for: .focusSessionDidChange, object: cookieProvider)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] notification in self?.handleSessionTransition(notification) }
 
         Task { [appGraph] in
             _ = await appGraph.drainPlaybackHistoryOutbox()
         }
 
         browserViewModel.onEntryRequest = { [weak self] entry in
-            Task { @MainActor [weak self] in
-                self?.open(entry)
-            }
+            self?.scheduleBrowserRouteRequest { $0.open(entry) }
         }
 
         browserViewModel.onUserSpaceRequest = { [weak self] url in
-            Task { @MainActor [weak self] in
-                self?.openNativeUserSpace(url)
-            }
+            self?.scheduleBrowserRouteRequest { $0.openNativeUserSpace(url) }
         }
 
         browserViewModel.onVideoRequest = { [weak self] url in
-            Task { @MainActor [weak self] in
-                self?.openNativeVideo(url)
-            }
+            self?.scheduleBrowserRouteRequest { $0.openNativeVideo(url) }
         }
 
         observeActiveRoute()
@@ -126,6 +126,15 @@ final class FocusAppViewModel: ObservableObject {
 
     convenience init(settingsStore: FocusSettingsStore) {
         self.init(appGraph: FocusAppGraph(settingsStore: settingsStore))
+    }
+
+    private func scheduleBrowserRouteRequest(_ action: @escaping @MainActor (FocusAppViewModel) -> Void) {
+        guard isBrowserActive, let sessionID = browserViewModel.activeRouteRequestSessionID else { return }
+        Task { @MainActor [weak self] in
+            guard let self, self.isBrowserActive,
+                  self.browserViewModel.activeRouteRequestSessionID == sessionID else { return }
+            action(self)
+        }
     }
 
     func userSpaceViewModel(for routeID: RouteID) -> FocusUserSpaceViewModel {
@@ -226,7 +235,13 @@ final class FocusAppViewModel: ObservableObject {
         case let .opus(routeID, _):
             forwardActiveChanges(from: opusDetailViewModel(for: routeID))
         case let .video(routeID, _):
-            forwardActiveChanges(from: videoViewModel(for: routeID))
+            // Only detail/title and dock visibility affect the shell. Progress,
+            // subtitles, danmaku and playback buttons observe their own subtree.
+            videoViewModel(for: routeID).$state
+                .removeDuplicates()
+                .dropFirst()
+                .sink { [weak self] _ in self?.objectWillChange.send() }
+                .store(in: &activeRouteCancellables)
         case .browser:
             let presentationChanges: [AnyPublisher<Void, Never>] = [
                 browserViewModel.$navigationTitle.removeDuplicates().map { _ in () }.eraseToAnyPublisher(),
@@ -242,6 +257,43 @@ final class FocusAppViewModel: ObservableObject {
                 .sink { [weak self] in self?.objectWillChange.send() }
                 .store(in: &activeRouteCancellables)
         }
+    }
+
+    private func handleSessionTransition(_ notification: Notification) {
+        guard let version = notification.userInfo?["version"] as? UInt64,
+              version == cookieProvider.sessionVersion else { return }
+        let requiresReset = notification.userInfo?["requiresAccountReset"] as? Bool ?? false
+        guard requiresReset else {
+            browserViewModel.reconcileSessionVersion(version)
+            if cookieProvider.sessionReadiness == .authenticated || cookieProvider.sessionReadiness == .anonymous {
+                myViewModel.reconcileSessionVersion(version)
+                dynamicFeedViewModel.reconcileSessionVersion(version)
+                if case let .video(routeID, _) = route {
+                    videoViewModel(for: routeID).reconcileSessionVersion(version)
+                }
+            }
+            return
+        }
+        cancelPendingDynamicReturn()
+        let primary = activePrimaryTab
+        let loginBrowser: AppRoute? = isLoginFlowActive && isBrowserActive ? route : nil
+        routeStack.forEach(suspend)
+        browserViewModel.resetForSessionChange()
+        dynamicFeedViewModel.resetForSessionChange()
+        myViewModel.resetForSessionChange()
+        historyViewModel.resetForSessionChange()
+        favoriteFolderViewModel.resetForSessionChange()
+        userSpaceViewModels.values.forEach { $0.suspend() }
+        userCollectionViewModels.values.forEach { $0.suspend() }
+        articleViewModels.values.forEach { $0.suspend() }
+        opusDetailViewModels.values.forEach { $0.suspend() }
+        videoViewModels.values.forEach { $0.suspend() }
+        userSpaceViewModels.removeAll(); userCollectionViewModels.removeAll()
+        articleViewModels.removeAll(); opusDetailViewModels.removeAll(); videoViewModels.removeAll()
+        let root: AppRoute = primary == .my ? .my : .dynamicFeed
+        routeStack = loginBrowser.map { [root, $0] } ?? [root]
+        observeActiveRoute()
+        activate(route)
     }
 
     private func forwardActiveChanges<Object: ObservableObject>(from object: Object)
@@ -341,15 +393,39 @@ final class FocusAppViewModel: ObservableObject {
         routeStack.count > 1
     }
 
+    private func cancelPendingDynamicReturn() {
+        // Revoke the old completion before cancelling its layout work.
+        pendingDynamicReturnID = nil
+        dynamicFeedViewModel.cancelDetailReturn()
+    }
+
     private func setRootRoute(_ newRoute: AppRoute) {
+        cancelPendingDynamicReturn()
+        if case .dynamicFeed = newRoute, hasDynamicFeedRoot, routeStack.count > 1 {
+            let requestID = UUID()
+            pendingDynamicReturnID = requestID
+            dynamicFeedViewModel.prepareForDetailReturn { [weak self] _ in
+                guard let self, self.pendingDynamicReturnID == requestID else { return }
+                self.pendingDynamicReturnID = nil
+                self.completeSetRootRoute(newRoute)
+            }
+            return
+        }
+        completeSetRootRoute(newRoute)
+    }
+
+    private func completeSetRootRoute(_ newRoute: AppRoute) {
         suspend(route)
         routeStack.dropFirst().forEach(cleanUpRoute)
         routeStack = [newRoute]
         observeActiveRoute()
         activate(newRoute)
+        finishLoginFlowIfNeeded()
     }
 
     private func pushRoute(_ newRoute: AppRoute) {
+        cancelPendingDynamicReturn()
+        if case .dynamicFeed = route { dynamicFeedViewModel.freezeForDetails() }
         snapshotActiveBrowserURL()
         suspend(route)
         routeStack.append(newRoute)
@@ -359,6 +435,32 @@ final class FocusAppViewModel: ObservableObject {
 
     @discardableResult
     private func popRoute() -> Bool {
+        guard routeStack.count > 1 else { return false }
+        if pendingDynamicReturnID != nil {
+            // Finish the pending transition at its current legal position;
+            // never expose it and then resume conflicting corrections.
+            dynamicFeedViewModel.finishDetailReturnNow()
+            if pendingDynamicReturnID != nil {
+                cancelPendingDynamicReturn()
+                return completePopRoute()
+            }
+            return true
+        }
+        if routeStack.count == 2, case .dynamicFeed = routeStack[0] {
+            let requestID = UUID()
+            pendingDynamicReturnID = requestID
+            dynamicFeedViewModel.prepareForDetailReturn { [weak self] _ in
+                guard let self, self.pendingDynamicReturnID == requestID else { return }
+                self.pendingDynamicReturnID = nil
+                _ = self.completePopRoute()
+            }
+            return true
+        }
+        return completePopRoute()
+    }
+
+    @discardableResult
+    private func completePopRoute() -> Bool {
         guard routeStack.count > 1, let removedRoute = routeStack.last else {
             return false
         }
@@ -366,7 +468,10 @@ final class FocusAppViewModel: ObservableObject {
         cleanUpRoute(removedRoute)
         routeStack.removeLast()
         observeActiveRoute()
-        activate(route)
+        activate(route, restoringRetainedBrowser: true)
+        if case .browser = removedRoute {
+            finishLoginFlowIfNeeded()
+        }
         return true
     }
 
@@ -408,7 +513,7 @@ final class FocusAppViewModel: ObservableObject {
         }
     }
 
-    private func activate(_ route: AppRoute) {
+    private func activate(_ route: AppRoute, restoringRetainedBrowser: Bool = false) {
         switch route {
         case .dynamicFeed:
             dynamicFeedViewModel.loadIfNeeded()
@@ -437,7 +542,9 @@ final class FocusAppViewModel: ObservableObject {
         case let .video(routeID, url):
             videoViewModel(for: routeID).activate(url: url)
         case let .browser(url, context):
-            if !browserViewModel.isSessionActive
+            if restoringRetainedBrowser {
+                browserViewModel.resume(url, context: context)
+            } else if !browserViewModel.isSessionActive
                 || browserViewModel.currentURL.map(FocusNavigationPolicy.canonicalWebURL(for:)) != url
             {
                 browserViewModel.open(url, context: context)
@@ -469,7 +576,9 @@ final class FocusAppViewModel: ObservableObject {
 
         didHandleLaunchEntry = true
         hasInstantiatedBrowser = true
-        refreshLoginSensitiveContent(reloadDynamicFeed: true)
+        // The feed view owns its initial load, which already awaits cookies.
+        // Late startup warmup must not refresh an already visible/returned feed.
+        refreshLoginSensitiveContent(reloadDynamicFeed: false)
         if settingsStore.settings.defaultEntry == .search {
             presentSearchEntry()
         }
@@ -499,7 +608,8 @@ final class FocusAppViewModel: ObservableObject {
             return
         }
         if Self.isVideoURL(destinationURL) {
-            openVideo(destinationURL)
+            // Dynamic text may be commentary rather than the video's title.
+            openVideo(destinationURL, preview: .init(title: "", coverURL: card.coverURLs.first))
             return
         }
         openBrowser(destinationURL, context: .dynamic)
@@ -518,11 +628,11 @@ final class FocusAppViewModel: ObservableObject {
             openOpus(searchItem.targetURL)
             return
         }
-        openVideo(searchItem.targetURL)
+        openVideo(searchItem.targetURL, preview: .init(title: searchItem.title, coverURL: searchItem.coverURL))
     }
 
     func open(searchPreview: SearchResultItem.PreviewVideo) {
-        openVideo(searchPreview.targetURL)
+        openVideo(searchPreview.targetURL, preview: .init(title: searchPreview.title, coverURL: searchPreview.coverURL))
     }
 
     func openMyVideo(_ url: URL) {
@@ -586,7 +696,14 @@ final class FocusAppViewModel: ObservableObject {
     }
 
     func openLogin() {
+        isLoginFlowActive = true
         openBrowser(Self.loginURL, context: .my)
+    }
+
+    private func finishLoginFlowIfNeeded() {
+        guard isLoginFlowActive else { return }
+        isLoginFlowActive = false
+        refreshLoginSensitiveContent(reloadDynamicFeed: true)
     }
 
     func reloadCurrent() {
@@ -618,6 +735,7 @@ final class FocusAppViewModel: ObservableObject {
 
     func handleAppDidBecomeActive() {
         activeNativeVideoViewModel?.handleAppDidBecomeActive()
+        dynamicFeedViewModel.setApplicationActive(true)
         guard didHandleLaunchEntry else {
             return
         }
@@ -631,7 +749,9 @@ final class FocusAppViewModel: ObservableObject {
     }
 
     func handleAppDidEnterBackground() {
+        didRefreshOnBecomeActive = false
         activeNativeVideoViewModel?.handleAppDidEnterBackground()
+        dynamicFeedViewModel.setApplicationActive(false)
     }
 
     func goBack() {
@@ -712,7 +832,7 @@ final class FocusAppViewModel: ObservableObject {
         pushRoute(.article(routeID, canonicalURL))
     }
 
-    private func openVideo(_ url: URL) {
+    private func openVideo(_ url: URL, preview: FocusNativeVideoViewModel.RoutePreview? = nil) {
         let canonicalURL = FocusNavigationPolicy.canonicalWebURL(for: url)
         guard FocusVideoIdentifier.extract(from: canonicalURL) != nil else {
             openBrowser(canonicalURL, context: entryContext(for: activePrimaryTab))
@@ -720,7 +840,7 @@ final class FocusAppViewModel: ObservableObject {
         }
 
         let routeID = RouteID()
-        _ = videoViewModel(for: routeID)
+        videoViewModel(for: routeID).seedRoutePreview(preview, for: canonicalURL)
         pushRoute(.video(routeID, canonicalURL))
     }
 
@@ -740,11 +860,32 @@ final class FocusAppViewModel: ObservableObject {
             }
 
             _ = await cookieProvider.refreshSnapshotIfNeeded()
+            // Returning from the background must not discard loaded pages or
+            // scroll positions. Only retry screens blocked by authentication.
+            guard reloadDynamicFeed else {
+                switch route {
+                case .dynamicFeed:
+                    if case .loginRequired = dynamicFeedViewModel.state { dynamicFeedViewModel.reload() }
+                case .my:
+                    if case .loginRequired = myViewModel.state { myViewModel.reload() }
+                case .history:
+                    if case .loginRequired = historyViewModel.state { historyViewModel.reload() }
+                case .favoriteFolder:
+                    if case .loginRequired = favoriteFolderViewModel.state { favoriteFolderViewModel.reload() }
+                case let .article(routeID, _):
+                    let viewModel = articleViewModel(for: routeID)
+                    if case .loginRequired = viewModel.state { viewModel.reload() }
+                case let .opus(routeID, _):
+                    let viewModel = opusDetailViewModel(for: routeID)
+                    if case .loginRequired = viewModel.state { viewModel.reload() }
+                default:
+                    break
+                }
+                return
+            }
             switch route {
             case .dynamicFeed:
-                if reloadDynamicFeed {
-                    dynamicFeedViewModel.reload()
-                }
+                dynamicFeedViewModel.reload()
             case .searchResults(_):
                 searchResultsViewModel.reload()
             case .my:

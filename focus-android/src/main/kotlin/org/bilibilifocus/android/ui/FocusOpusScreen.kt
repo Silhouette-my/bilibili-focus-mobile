@@ -53,16 +53,15 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
-import org.bilibilifocus.android.AndroidCookieProvider
 import org.bilibilifocus.android.FocusOpusViewModel
 import org.bilibilifocus.android.OpusUiState
+import org.bilibilifocus.android.ui.video.CommentImageStrip
+import org.bilibilifocus.android.ui.video.commentImageGalleryRequest
 import org.bilibilifocus.core.model.OpusBlock
 import org.bilibilifocus.core.model.OpusDetail
 import org.bilibilifocus.core.model.OpusImage
 import org.bilibilifocus.core.model.RichTextRun
 import org.bilibilifocus.core.model.VideoComment
-import org.bilibilifocus.core.service.KtorHttpClient
-import org.bilibilifocus.core.service.OpusService
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -75,24 +74,15 @@ fun FocusOpusScreen(
     onOpenUser: (Long) -> Unit = {},
     onOpenVideo: (String) -> Unit = {},
     onOpenURL: (String) -> Unit = {},
-    viewModel: FocusOpusViewModel? = null,
+    viewModel: FocusOpusViewModel,
     listState: LazyListState = rememberLazyListState(),
 ) {
-    val resolvedViewModel = viewModel ?: remember(opusId) {
-        FocusOpusViewModel(
-            service = OpusService(
-                cookieProvider = AndroidCookieProvider(),
-                httpClient = KtorHttpClient(),
-            )
-        )
+    LaunchedEffect(viewModel, opusId) {
+        viewModel.loadIfNeeded(opusId)
     }
 
-    LaunchedEffect(opusId) {
-        resolvedViewModel.loadIfNeeded(opusId)
-    }
-
-    val state by resolvedViewModel.state.collectAsState()
-    val comments by resolvedViewModel.comments.collectAsState()
+    val state by viewModel.state.collectAsState()
+    val comments by viewModel.comments.collectAsState()
     var galleryRequest by remember(opusId) { mutableStateOf<FocusImageGalleryRequest?>(null) }
 
     Box(modifier = Modifier.fillMaxSize()) {
@@ -192,6 +182,14 @@ fun FocusOpusScreen(
                                     comment = comment,
                                     modifier = Modifier.padding(16.dp),
                                     onOpenURL = onOpenURL,
+                                    referer = "https://www.bilibili.com/opus/$opusId",
+                                    onOpenImage = { imageURLs, imageIndex ->
+                                        galleryRequest = commentImageGalleryRequest(
+                                            imageURLs = imageURLs,
+                                            imageIndex = imageIndex,
+                                            referer = "https://www.bilibili.com/opus/$opusId",
+                                        )
+                                    },
                                 )
                             }
                         }
@@ -290,7 +288,7 @@ private fun OpusImageGrid(images: List<OpusImage>, onOpenImage: (OpusImage) -> U
         return
     }
 
-    val columnCount = if (images.size == 1) 1 else 2
+    val columnCount = 2
     val rows = images.chunked(columnCount)
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         rows.forEach { rowImages ->
@@ -299,7 +297,6 @@ private fun OpusImageGrid(images: List<OpusImage>, onOpenImage: (OpusImage) -> U
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 rowImages.forEach { image ->
-                    val imageHeight = if (images.size == 1) 220 else 160
                     AsyncImage(
                         model = ImageRequest.Builder(LocalContext.current)
                             .data(image.url)
@@ -309,7 +306,7 @@ private fun OpusImageGrid(images: List<OpusImage>, onOpenImage: (OpusImage) -> U
                         modifier = Modifier
                             .weight(1f)
                             .clickable { onOpenImage(image) }
-                            .height(imageHeight.dp)
+                            .height(160.dp)
                             .clip(RoundedCornerShape(12.dp))
                             .background(MaterialTheme.colorScheme.surfaceVariant)
                             .border(
@@ -350,6 +347,8 @@ private fun OpusCommentItem(
     comment: VideoComment,
     modifier: Modifier = Modifier,
     onOpenURL: (String) -> Unit = {},
+    referer: String,
+    onOpenImage: (List<String>, Int) -> Unit = { _, _ -> },
 ) {
     Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -379,14 +378,19 @@ private fun OpusCommentItem(
             }
         }
         FocusRichText(comment.contentRuns, style = MaterialTheme.typography.bodyLarge, onOpenURL = onOpenURL)
+        CommentImageStrip(comment.imageURLs, onOpenImage, referer = referer)
         comment.replies.take(2).forEach { reply ->
-            Row(modifier = Modifier.padding(start = 42.dp)) {
-                Text("${reply.authorName}: ", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
-                FocusRichText(
-                    reply.contentRuns,
-                    style = MaterialTheme.typography.bodyMedium.copy(color = MaterialTheme.colorScheme.onSurfaceVariant),
-                    onOpenURL = onOpenURL,
-                )
+            Column(modifier = Modifier.padding(start = 42.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Row {
+                    Text("${reply.authorName}: ", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
+                    FocusRichText(
+                        reply.contentRuns,
+                        style = MaterialTheme.typography.bodyMedium.copy(color = MaterialTheme.colorScheme.onSurfaceVariant),
+                        modifier = Modifier.weight(1f),
+                        onOpenURL = onOpenURL,
+                    )
+                }
+                CommentImageStrip(reply.imageURLs, onOpenImage, referer = referer)
             }
         }
     }

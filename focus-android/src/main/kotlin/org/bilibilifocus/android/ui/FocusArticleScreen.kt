@@ -39,7 +39,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -51,15 +50,12 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
-import org.bilibilifocus.android.AndroidCookieProvider
 import org.bilibilifocus.android.ArticleUiState
 import org.bilibilifocus.android.FocusArticleViewModel
 import org.bilibilifocus.core.model.ArticleBlock
 import org.bilibilifocus.core.model.ArticleDetail
 import org.bilibilifocus.core.model.TextAlignment
 import org.bilibilifocus.core.model.plainText
-import org.bilibilifocus.core.service.ArticleService
-import org.bilibilifocus.core.service.KtorHttpClient
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -72,13 +68,10 @@ fun FocusArticleScreen(
     onOpenUser: (Long) -> Unit = {},
     onOpenURL: (String) -> Unit = {},
     onOpenWeb: (String) -> Unit = onOpenURL,
-    viewModel: FocusArticleViewModel? = null,
+    viewModel: FocusArticleViewModel,
 ) {
-    val resolvedViewModel = viewModel ?: remember(cvid) {
-        FocusArticleViewModel(ArticleService(AndroidCookieProvider(), KtorHttpClient()))
-    }
-    LaunchedEffect(cvid) { resolvedViewModel.loadIfNeeded(cvid) }
-    val state by resolvedViewModel.state.collectAsState()
+    LaunchedEffect(viewModel, cvid) { viewModel.loadIfNeeded(cvid) }
+    val state by viewModel.state.collectAsState()
     val originalURL = "https://www.bilibili.com/read/cv$cvid"
 
     Scaffold(
@@ -113,14 +106,14 @@ fun FocusArticleScreen(
 
             ArticleUiState.LoginRequired -> ArticleFailure(
                 message = "当前专栏需要登录后查看",
-                onRetry = { resolvedViewModel.load(cvid) },
+                onRetry = { viewModel.load(cvid) },
                 onOpenWeb = { onOpenWeb(originalURL) },
                 modifier = Modifier.padding(innerPadding),
             )
 
             is ArticleUiState.Failed -> ArticleFailure(
                 message = value.message,
-                onRetry = { resolvedViewModel.load(cvid) },
+                onRetry = { viewModel.load(cvid) },
                 onOpenWeb = { onOpenWeb(originalURL) },
                 modifier = Modifier.padding(innerPadding),
             )
@@ -222,9 +215,6 @@ private fun ArticleBlockView(block: ArticleBlock, referer: String, onOpenURL: (S
         )
 
         is ArticleBlock.Image -> Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            val ratio = if (block.width > 0 && block.height > 0) {
-                (block.width.toFloat() / block.height).coerceIn(0.55f, 2.2f)
-            } else 4f / 3f
             AsyncImage(
                 model = ImageRequest.Builder(LocalContext.current)
                     .data(block.url)

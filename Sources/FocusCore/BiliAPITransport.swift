@@ -7,6 +7,7 @@ public struct BiliNetworkEvent: Equatable, Sendable {
     public let durationMilliseconds: Int
     public let responseBytes: Int?
     public let failureType: String?
+    public let attemptCount: Int
 
     public init(
         method: String,
@@ -14,7 +15,8 @@ public struct BiliNetworkEvent: Equatable, Sendable {
         statusCode: Int?,
         durationMilliseconds: Int,
         responseBytes: Int?,
-        failureType: String?
+        failureType: String?,
+        attemptCount: Int = 1
     ) {
         self.method = method
         self.target = target
@@ -22,6 +24,7 @@ public struct BiliNetworkEvent: Equatable, Sendable {
         self.durationMilliseconds = durationMilliseconds
         self.responseBytes = responseBytes
         self.failureType = failureType
+        self.attemptCount = attemptCount
     }
 }
 
@@ -98,16 +101,21 @@ public struct BiliAPITransport: Sendable {
     private let sleeper: Sleeper
 
     public init(
-        requestLoader: @escaping RequestLoader = { request in
-            try await URLSession.shared.data(for: request)
-        },
+        requestLoader: RequestLoader? = nil,
         eventStore: BiliNetworkEventStore? = nil,
         retryPolicy: BiliHTTPRetryPolicy = BiliHTTPRetryPolicy(),
         sleeper: @escaping Sleeper = { milliseconds in
             try await Task.sleep(nanoseconds: milliseconds * 1_000_000)
         }
     ) {
-        self.requestLoader = requestLoader
+        self.requestLoader = requestLoader ?? { request in
+            // Test doubles opt in explicitly through RequestLoader. Never let
+            // an accidentally constructed app service reach a real account.
+            if ProcessInfo.processInfo.environment["FOCUS_FIXTURE_TESTS"] == "1" {
+                throw URLError(.notConnectedToInternet)
+            }
+            return try await BiliNativeHTTPSession.shared.data(for: request)
+        }
         self.eventStore = eventStore
         self.retryPolicy = retryPolicy
         self.sleeper = sleeper
@@ -116,10 +124,14 @@ public struct BiliAPITransport: Sendable {
     public func data(for request: URLRequest) async throws -> (Data, URLResponse) {
         let startedAt = ContinuousClock.now
         var attempt = 1
+        var attemptsStarted = 0
         do {
             while true {
+                try Task.checkCancellation()
                 do {
+                    attemptsStarted += 1
                     let result = try await requestLoader(request)
+                    try Task.checkCancellation()
                     let statusCode = (result.1 as? HTTPURLResponse)?.statusCode
                     if
                         isIdempotent(request),
@@ -135,12 +147,24 @@ public struct BiliAPITransport: Sendable {
                         startedAt: startedAt,
                         statusCode: statusCode,
                         responseBytes: result.0.count,
-                        failureType: nil
+                        failureType: nil,
+                        attemptCount: attemptsStarted
                     )
                     return result
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
+                    if let urlError = error as? URLError {
+                        if urlError.code == .cancelled { throw CancellationError() }
+                        let terminal: Set<URLError.Code> = [
+                            .notConnectedToInternet, .cannotFindHost, .dnsLookupFailed,
+                            .secureConnectionFailed, .serverCertificateUntrusted,
+                            .serverCertificateHasBadDate, .serverCertificateHasUnknownRoot,
+                            .serverCertificateNotYetValid, .userAuthenticationRequired,
+                            .badURL, .unsupportedURL
+                        ]
+                        if terminal.contains(urlError.code) { throw error }
+                    }
                     guard isIdempotent(request), attempt < retryPolicy.maximumAttempts else {
                         throw error
                     }
@@ -156,7 +180,8 @@ public struct BiliAPITransport: Sendable {
                 responseBytes: nil,
                 failureType: error is CancellationError
                     ? "cancelled"
-                    : String(describing: type(of: error))
+                    : String(describing: type(of: error)),
+                attemptCount: attemptsStarted
             )
             throw error
         }
@@ -191,7 +216,8 @@ public struct BiliAPITransport: Sendable {
         startedAt: ContinuousClock.Instant,
         statusCode: Int?,
         responseBytes: Int?,
-        failureType: String?
+        failureType: String?,
+        attemptCount: Int
     ) async {
         guard let eventStore else {
             return
@@ -206,9 +232,53 @@ public struct BiliAPITransport: Sendable {
                 statusCode: statusCode,
                 durationMilliseconds: max(milliseconds, 0),
                 responseBytes: responseBytes,
-                failureType: failureType
+                failureType: failureType,
+                attemptCount: attemptCount
             )
         )
+    }
+}
+
+/// Native API requests carry an explicit WebKit snapshot. URLSession must not
+/// silently add a second credential source or persist response Set-Cookie.
+private enum BiliNativeHTTPSession {
+    static let shared: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpCookieStorage = nil
+        configuration.httpShouldSetCookies = false
+        configuration.urlCredentialStorage = nil
+        configuration.urlCache = nil
+        configuration.timeoutIntervalForRequest = 18
+        configuration.timeoutIntervalForResource = 30
+        return URLSession(configuration: configuration, delegate: BiliNativeRedirectPolicy(), delegateQueue: nil)
+    }()
+}
+
+final class BiliNativeRedirectPolicy: NSObject, URLSessionTaskDelegate, Sendable {
+    static func permitsRedirect(original: URLRequest?, destination: URL) -> Bool {
+        guard let original, let source = original.url,
+              source.scheme?.lowercased() == "https", destination.scheme?.lowercased() == "https",
+              source.host?.lowercased() == destination.host?.lowercased(),
+              (source.port ?? 443) == (destination.port ?? 443),
+              original.value(forHTTPHeaderField: "Cookie") == nil,
+              original.value(forHTTPHeaderField: "Authorization") == nil else { return false }
+        return true
+    }
+
+    func urlSession(
+        _ session: URLSession, task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
+        completionHandler: @escaping @Sendable (URLRequest?) -> Void
+    ) {
+        guard let url = request.url, Self.permitsRedirect(original: task.originalRequest, destination: url) else {
+            completionHandler(nil)
+            return
+        }
+        var redirected = request
+        redirected.httpShouldHandleCookies = false
+        redirected.setValue(nil, forHTTPHeaderField: "Cookie")
+        redirected.setValue(nil, forHTTPHeaderField: "Authorization")
+        completionHandler(redirected)
     }
 }
 

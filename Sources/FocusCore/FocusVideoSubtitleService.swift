@@ -1,5 +1,92 @@
 import Foundation
 
+/// One owner per shared WebKit session. Resume and subtitle discovery request
+/// identical signed player-info semantics; signed media URLs are never cached.
+public actor FocusPlayerInfoRepository {
+    public enum ServiceError: Error, Sendable {
+        case invalidResponse, httpStatus(Int), api(Int, String)
+    }
+    private struct Key: Hashable, Sendable { let version: UInt64; let aid: Int64; let cid: Int64 }
+    private let cookieProvider: any CookieSnapshotProvider
+    private let requestLoader: BiliAPITransport.RequestLoader
+    private let signer: WBISigner
+    private let cache = AsyncExpiringCache<Key, Data>(maximumEntries: 32)
+
+    public init(
+        cookieProvider: any CookieSnapshotProvider,
+        requestLoader: @escaping BiliAPITransport.RequestLoader = { try await BiliAPINetwork.data(for: $0) }
+    ) {
+        self.cookieProvider = cookieProvider
+        self.signer = .shared
+        self.requestLoader = requestLoader
+    }
+
+    init(cookieProvider: any CookieSnapshotProvider, signer: WBISigner,
+         requestLoader: @escaping BiliAPITransport.RequestLoader) {
+        self.cookieProvider = cookieProvider
+        self.signer = signer
+        self.requestLoader = requestLoader
+    }
+
+    var activeConsumerCount: Int { get async { await cache.activeConsumerCount } }
+
+    public func fetch(aid: Int64, cid: Int64) async throws -> Data {
+        guard aid > 0, cid > 0 else { throw ServiceError.invalidResponse }
+        let snapshot = await cookieProvider.loadSnapshot()
+        let version = snapshot.version
+        guard version == cookieProvider.sessionVersion else { throw CancellationError() }
+        if snapshot.readiness == .expired { throw ServiceError.api(-101, "登录已失效") }
+        let key = Key(version: version, aid: aid, cid: cid)
+        let data = try await cache.value(
+            for: key, policy: FocusCachePolicy(freshFor: 2), canUseStaleOnError: { _ in false }
+        ) { [signer, requestLoader, cookieProvider] in
+            let referer = "https://www.bilibili.com/video/av\(aid)/"
+            @Sendable func request(_ url: URL) -> URLRequest {
+                var request = URLRequest(url: url)
+                request.httpMethod = "GET"
+                request.timeoutInterval = 18
+                request.httpShouldHandleCookies = false
+                request.setValue(FocusVideoDetailService.userAgent, forHTTPHeaderField: "User-Agent")
+                request.setValue(referer, forHTTPHeaderField: "Referer")
+                request.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
+                return CookieRequestPolicy.attach(cookies: snapshot.cookies, to: request)
+            }
+            let response: WBISigner.HTTPResponse
+            do {
+                response = try await signer.execute(
+                    parameters: ["aid": String(aid), "cid": String(cid), "isGaiaAvoided": "false", "web_location": "1315873"],
+                    navigationRequest: request(BiliAPIContractCatalog.require("credential.info.valid").url),
+                    requestLoader: requestLoader
+                ) { signedQuery in
+                    var components = URLComponents(
+                        url: BiliAPIContractCatalog.require("video.info.get_player_info").url,
+                        resolvingAgainstBaseURL: false
+                    )!
+                    components.percentEncodedQuery = signedQuery
+                    guard let url = components.url else { throw WBISigner.SigningError.invalidRequest }
+                    return request(url)
+                }
+            } catch is WBISigner.SigningError { throw ServiceError.invalidResponse }
+            try Task.checkCancellation()
+            guard version == cookieProvider.sessionVersion else { throw CancellationError() }
+            if response.response.statusCode == 401 {
+                cookieProvider.noteServerSessionExpired(version: version)
+                throw ServiceError.httpStatus(401)
+            }
+            guard (200..<300).contains(response.response.statusCode) else {
+                throw ServiceError.httpStatus(response.response.statusCode)
+            }
+            guard let root = try JSONSerialization.jsonObject(with: response.data) as? [String: Any],
+                  let code = root["code"] as? Int else { throw ServiceError.invalidResponse }
+            if code == -101 { cookieProvider.noteServerSessionExpired(version: version) }
+            guard code == 0 else { throw ServiceError.api(code, root["message"] as? String ?? "播放器信息暂不可用") }
+            return response.data
+        }
+        guard version == cookieProvider.sessionVersion else { throw CancellationError() }
+        return data
+    }
+}
+
 public struct FocusVideoSubtitleTrack: Codable, Equatable, Sendable, Identifiable {
     public let id: Int64
     public let languageCode: String
@@ -95,19 +182,20 @@ public actor FocusVideoSubtitleService {
         "bilivideo.com",
     ]
 
-    private let cookieProvider: any CookieSnapshotProvider
     private let requestLoader: RequestLoader
-    private let wbiSigner: WBISigner
+    private let playerInfoRepository: FocusPlayerInfoRepository
 
     public init(
         cookieProvider: any CookieSnapshotProvider,
+        playerInfoRepository: FocusPlayerInfoRepository? = nil,
         requestLoader: @escaping RequestLoader = { request in
             try await BiliAPINetwork.data(for: request)
         }
     ) {
-        self.cookieProvider = cookieProvider
         self.requestLoader = requestLoader
-        wbiSigner = .shared
+        self.playerInfoRepository = playerInfoRepository ?? FocusPlayerInfoRepository(
+            cookieProvider: cookieProvider, requestLoader: requestLoader
+        )
     }
 
     init(
@@ -115,9 +203,10 @@ public actor FocusVideoSubtitleService {
         wbiSigner: WBISigner,
         requestLoader: @escaping RequestLoader
     ) {
-        self.cookieProvider = cookieProvider
         self.requestLoader = requestLoader
-        self.wbiSigner = wbiSigner
+        self.playerInfoRepository = FocusPlayerInfoRepository(
+            cookieProvider: cookieProvider, signer: wbiSigner, requestLoader: requestLoader
+        )
     }
 
     public func fetchTracks(aid: Int64, cid: Int64) async throws -> [FocusVideoSubtitleTrack] {
@@ -125,50 +214,15 @@ public actor FocusVideoSubtitleService {
             throw ServiceError.invalidParameters
         }
 
-        let cookies = await cookieProvider.loadCookies()
-        let referer = "https://www.bilibili.com/video/av\(aid)/"
-        let navigationRequest = Self.makeAPIRequest(
-            url: BiliAPIContractCatalog.require("credential.info.valid").url,
-            referer: referer,
-            cookies: cookies
-        )
-
-        let response: WBISigner.HTTPResponse
         do {
-            response = try await wbiSigner.execute(
-                parameters: [
-                    "aid": String(aid),
-                    "cid": String(cid),
-                    "isGaiaAvoided": "false",
-                    "web_location": "1315873",
-                ],
-                navigationRequest: navigationRequest,
-                requestLoader: requestLoader
-            ) { signedQuery in
-                guard var components = URLComponents(
-                    url: BiliAPIContractCatalog.require("video.info.get_player_info").url,
-                    resolvingAgainstBaseURL: false
-                ) else {
-                    throw WBISigner.SigningError.invalidRequest
-                }
-                components.percentEncodedQuery = signedQuery
-                guard let url = components.url else {
-                    throw WBISigner.SigningError.invalidRequest
-                }
-                return Self.makeAPIRequest(
-                    url: url,
-                    referer: referer,
-                    cookies: cookies
-                )
+            return try Self.decodeTracksResponse(try await playerInfoRepository.fetch(aid: aid, cid: cid))
+        } catch let error as FocusPlayerInfoRepository.ServiceError {
+            switch error {
+            case .invalidResponse: throw ServiceError.invalidResponse
+            case let .httpStatus(code): throw ServiceError.httpStatus(code: code)
+            case let .api(code, message): throw ServiceError.api(code: code, message: message)
             }
-        } catch is WBISigner.SigningError {
-            throw ServiceError.invalidResponse
         }
-
-        guard (200 ..< 300).contains(response.response.statusCode) else {
-            throw ServiceError.httpStatus(code: response.response.statusCode)
-        }
-        return try Self.decodeTracksResponse(response.data)
     }
 
     public func fetchDocument(
@@ -277,21 +331,6 @@ public actor FocusVideoSubtitleService {
             )
         }
         return FocusVideoSubtitleDocument(cues: cues)
-    }
-
-    private nonisolated static func makeAPIRequest(
-        url: URL,
-        referer: String,
-        cookies: [HTTPCookie]
-    ) -> URLRequest {
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.timeoutInterval = 20
-        request.setValue(FocusVideoDetailService.userAgent, forHTTPHeaderField: "User-Agent")
-        request.setValue(referer, forHTTPHeaderField: "Referer")
-        request.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
-        request.setValue("zh-CN,zh-Hans;q=0.9", forHTTPHeaderField: "Accept-Language")
-        return CookieRequestPolicy.attach(cookies: cookies, to: request)
     }
 
     private nonisolated static func decodeTrack(

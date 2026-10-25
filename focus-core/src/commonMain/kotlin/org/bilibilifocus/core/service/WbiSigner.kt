@@ -1,11 +1,13 @@
 package org.bilibilifocus.core.service
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import org.bilibilifocus.core.cookie.CookieProvider
 import org.bilibilifocus.core.crypto.md5Hex
+import org.bilibilifocus.core.routing.urlEncode
 
 /**
  * Application-shareable WBI signer.
@@ -85,6 +87,8 @@ class WbiSigner(
             )
             val response = try {
                 httpClient.get(navUrl, headers)
+            } catch (error: CancellationException) {
+                throw error
             } catch (error: Exception) {
                 throw SigningUnavailable(cause = error)
             }
@@ -172,25 +176,4 @@ internal fun signWbiQuery(
     return "$canonicalQuery&w_rid=${md5Hex(canonicalQuery + mixinKey)}"
 }
 
-internal fun rfc3986Encode(value: String): String = buildString {
-    value.encodeToByteArray().forEach { byte ->
-        val octet = byte.toInt() and 0xff
-        if (
-            octet in 'A'.code..'Z'.code ||
-            octet in 'a'.code..'z'.code ||
-            octet in '0'.code..'9'.code ||
-            octet == '-'.code ||
-            octet == '.'.code ||
-            octet == '_'.code ||
-            octet == '~'.code
-        ) {
-            append(octet.toChar())
-        } else {
-            append('%')
-            append(HEX_DIGITS[octet ushr 4])
-            append(HEX_DIGITS[octet and 0x0f])
-        }
-    }
-}
-
-private const val HEX_DIGITS = "0123456789ABCDEF"
+internal fun rfc3986Encode(value: String): String = urlEncode(value)

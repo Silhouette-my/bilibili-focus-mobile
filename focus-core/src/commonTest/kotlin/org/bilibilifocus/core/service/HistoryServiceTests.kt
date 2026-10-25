@@ -20,6 +20,8 @@ class HistoryServiceTests {
         assertEquals(3_000_000_001L, page.items.single().viewAt)
         assertEquals(3_000_000_002L, page.items.single().progress)
         assertEquals(3_000_000_003L, page.items.single().duration)
+        assertEquals(2_000_000_001L, page.items.single().cid)
+        assertEquals(2, page.items.single().page)
         assertEquals(9_223_372_036_854_770_000L, page.nextMax)
         assertEquals(3_000_000_004L, page.nextViewAt)
     }
@@ -68,7 +70,7 @@ class HistoryServiceTests {
                       "view_at":3000000001,
                       "progress":"3000000002",
                       "duration":3000000003,
-                      "history":{"bvid":"BV1TEST00001"}
+                      "history":{"bvid":"BV1TEST00001","cid":"2000000001","page":2}
                     }],
                     "cursor":{
                       "max":"9223372036854770000",

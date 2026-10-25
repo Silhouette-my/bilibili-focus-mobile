@@ -35,15 +35,18 @@ internal class ProtobufReader(private val bytes: ByteArray) {
     }
 
     fun readLengthDelimited(): ByteArray {
+        val length = readLength()
+        val start = offset
+        skipBytes(length)
+        return bytes.copyOfRange(start, offset)
+    }
+
+    private fun readLength(): Int {
         val length = readVarint()
         if (length < 0 || length > Int.MAX_VALUE) {
             throw ProtobufDecodingException("protobuf 字段长度无效")
         }
-        val end = offset + length.toInt()
-        if (end < offset || end > bytes.size) {
-            throw ProtobufDecodingException("protobuf 字段被截断")
-        }
-        return bytes.copyOfRange(offset, end).also { offset = end }
+        return length.toInt()
     }
 
     fun readString(): String = readLengthDelimited().decodeToString()
@@ -52,7 +55,7 @@ internal class ProtobufReader(private val bytes: ByteArray) {
         when (tag.wireType) {
             0 -> readVarint()
             1 -> skipBytes(8)
-            2 -> readLengthDelimited()
+            2 -> skipBytes(readLength())
             5 -> skipBytes(4)
             else -> throw ProtobufDecodingException("不支持的 protobuf wire type: ${tag.wireType}")
         }

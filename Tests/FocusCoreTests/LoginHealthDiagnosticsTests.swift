@@ -132,6 +132,8 @@ struct LoginHealthDiagnosticsTests {
 
 private struct LoginHealthCookieProvider: CookieSnapshotProvider {
     let cookies: [HTTPCookie]
+    // This fixture is a completed authoritative read, not an initializing store.
+    var sessionReadiness: CookieSessionReadiness { cookies.isEmpty ? .anonymous : .authenticated }
 
     func loadCookies() async -> [HTTPCookie] {
         cookies

@@ -60,7 +60,6 @@ import coil.request.ImageRequest
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import org.bilibilifocus.android.AndroidCookieProvider
 import org.bilibilifocus.android.FocusUserViewModel
 import org.bilibilifocus.android.UserContentSection
 import org.bilibilifocus.android.UserUiState
@@ -68,8 +67,6 @@ import org.bilibilifocus.core.model.UserArticle
 import org.bilibilifocus.core.model.UserContentCollection
 import org.bilibilifocus.core.model.UserProfile
 import org.bilibilifocus.core.model.UserVideo
-import org.bilibilifocus.core.service.KtorHttpClient
-import org.bilibilifocus.core.service.UserService
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -79,22 +76,14 @@ fun FocusUserScreen(
     onOpenVideo: (String) -> Unit = {},
     onOpenCollection: (UserContentCollection) -> Unit = {},
     onOpenArticle: (String) -> Unit = {},
-    viewModel: FocusUserViewModel? = null,
+    viewModel: FocusUserViewModel,
     gridState: LazyGridState = rememberLazyGridState(),
 ) {
-    val resolvedViewModel = viewModel ?: remember(userId) {
-        FocusUserViewModel(
-            service = UserService(
-                cookieProvider = AndroidCookieProvider(),
-                httpClient = KtorHttpClient(),
-            )
-        )
-    }
-    LaunchedEffect(userId) { resolvedViewModel.loadIfNeeded(userId) }
+    LaunchedEffect(viewModel, userId) { viewModel.loadIfNeeded(userId) }
 
-    val state by resolvedViewModel.state.collectAsState()
-    val isLoadingMore by resolvedViewModel.isLoadingMore.collectAsState()
-    var selectedSection by remember(userId) { mutableStateOf(resolvedViewModel.selectedSection) }
+    val state by viewModel.state.collectAsState()
+    val isLoadingMore by viewModel.isLoadingMore.collectAsState()
+    var selectedSection by remember(userId) { mutableStateOf(viewModel.selectedSection) }
     var isRefreshing by remember { mutableStateOf(false) }
 
     Scaffold(
@@ -142,7 +131,7 @@ fun FocusUserScreen(
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             textAlign = TextAlign.Center,
                         )
-                        Button(onClick = { resolvedViewModel.load(userId) }) { Text("重试") }
+                        Button(onClick = { viewModel.load(userId) }) { Text("重试") }
                     }
                 }
             }
@@ -157,7 +146,7 @@ fun FocusUserScreen(
                 LaunchedEffect(sections) {
                     if (activeSection != null && selectedSection != activeSection) {
                         selectedSection = activeSection
-                        resolvedViewModel.selectSection(activeSection)
+                        viewModel.selectSection(activeSection)
                     }
                 }
 
@@ -165,7 +154,7 @@ fun FocusUserScreen(
                     isRefreshing = isRefreshing,
                     onRefresh = {
                         isRefreshing = true
-                        resolvedViewModel.load(userId) { isRefreshing = false }
+                        viewModel.load(userId) { isRefreshing = false }
                     },
                     modifier = Modifier.fillMaxSize().padding(innerPadding),
                 ) {
@@ -195,7 +184,7 @@ fun FocusUserScreen(
                                         selected = activeSection ?: sections.first(),
                                         onSelect = { section ->
                                             selectedSection = section
-                                            resolvedViewModel.selectSection(section)
+                                            viewModel.selectSection(section)
                                         },
                                     )
                                 }
@@ -206,7 +195,7 @@ fun FocusUserScreen(
                             UserContentSection.VIDEOS -> {
                                 items(current.videos, key = { "video-${it.bvid}" }) { video ->
                                     LaunchedEffect(video.bvid) {
-                                        resolvedViewModel.loadMoreIfNeeded(video.bvid)
+                                        viewModel.loadMoreIfNeeded(video.bvid)
                                     }
                                     ElevatedCard(
                                         onClick = { onOpenVideo("https://www.bilibili.com/video/${video.bvid}") },

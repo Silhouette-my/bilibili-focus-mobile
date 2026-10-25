@@ -19,8 +19,9 @@ kotlin {
         iosSimulatorArm64()
     ).forEach {
         it.binaries.framework {
-            baseName = "FocusCore"
+            baseName = "FocusKMP"
             isStatic = true
+            binaryOption("bundleId", "org.bilibilifocus.core.FocusKMP")
         }
     }
 

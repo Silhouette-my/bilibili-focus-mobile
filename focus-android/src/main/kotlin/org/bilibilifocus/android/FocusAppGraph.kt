@@ -8,6 +8,7 @@ import org.bilibilifocus.core.service.AccountService
 import org.bilibilifocus.core.service.ArticleService
 import org.bilibilifocus.core.service.DynamicFeedService
 import org.bilibilifocus.core.service.FavoriteService
+import org.bilibilifocus.core.service.FollowingAuthorsService
 import org.bilibilifocus.core.service.HistoryService
 import org.bilibilifocus.core.service.HttpClient
 import org.bilibilifocus.core.service.InMemoryNetworkEventSink
@@ -49,6 +50,7 @@ class FocusAppGraph(
     val articleService: ArticleService = ArticleService(cookieProvider, httpClient)
     val dynamicFeedService: DynamicFeedService = DynamicFeedService(cookieProvider, httpClient)
     val favoriteService: FavoriteService = FavoriteService(cookieProvider, httpClient)
+    val followingAuthorsService: FollowingAuthorsService = FollowingAuthorsService(cookieProvider, httpClient)
     val historyService: HistoryService = HistoryService(cookieProvider, httpClient)
     val loginHealthService: LoginHealthService = LoginHealthService(cookieProvider, httpClient)
     val opusService: OpusService =

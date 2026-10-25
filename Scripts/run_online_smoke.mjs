@@ -15,17 +15,16 @@ const MAX_RESPONSE_BYTES = 1024 * 1024;
 
 if (process.env[OPT_IN_VARIABLE] !== "1") {
   console.log(`SKIP online smoke: set ${OPT_IN_VARIABLE}=1 to opt in`);
-  process.exit(0);
-}
-
-const cookieHeader = process.env[COOKIE_VARIABLE] ?? "";
-const cookieValues = validateCookieHeader(cookieHeader);
-if (!cookieValues) {
-  fail(`configuration_invalid (set ${COOKIE_VARIABLE} to a Cookie header value)`, 2);
-} else if (!(cookieValues.get("sessdata")?.length > 0)) {
-  fail("login_health=not_logged_in", 2);
 } else {
-  await runSmoke(cookieHeader, cookieValues);
+  const cookieHeader = process.env[COOKIE_VARIABLE] ?? "";
+  const cookieValues = validateCookieHeader(cookieHeader);
+  if (!cookieValues) {
+    fail(`configuration_invalid (set ${COOKIE_VARIABLE} to a Cookie header value)`, 2);
+  } else if (!(cookieValues.get("sessdata")?.length > 0)) {
+    fail("login_health=not_logged_in", 2);
+  } else {
+    await runSmoke(cookieHeader, cookieValues);
+  }
 }
 
 async function runSmoke(cookie, values) {
@@ -49,12 +48,13 @@ async function runSmoke(cookie, values) {
 
     const declaredLength = Number(response.headers.get("content-length") ?? "0");
     if (Number.isFinite(declaredLength) && declaredLength > MAX_RESPONSE_BYTES) {
+      await response.body?.cancel();
       fail("contract_mismatch", 1);
       return;
     }
 
-    const body = await response.text();
-    if (Buffer.byteLength(body, "utf8") > MAX_RESPONSE_BYTES) {
+    const body = await readBoundedBody(response);
+    if (body === null) {
       fail("contract_mismatch", 1);
       return;
     }
@@ -93,6 +93,27 @@ async function runSmoke(cookie, values) {
     fail("login_health=network_unavailable", 1);
   } finally {
     clearTimeout(timeout);
+  }
+}
+
+async function readBoundedBody(response) {
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const chunks = [];
+  let bytes = 0;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) return Buffer.concat(chunks, bytes).toString("utf8");
+      bytes += value.byteLength;
+      if (bytes > MAX_RESPONSE_BYTES) {
+        await reader.cancel();
+        return null;
+      }
+      chunks.push(Buffer.from(value));
+    }
+  } finally {
+    reader.releaseLock();
   }
 }
 

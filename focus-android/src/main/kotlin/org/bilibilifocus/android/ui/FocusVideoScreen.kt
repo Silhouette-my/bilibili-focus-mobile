@@ -41,7 +41,9 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -53,7 +55,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.media3.common.util.UnstableApi
-import org.bilibilifocus.android.AndroidCookieProvider
 import org.bilibilifocus.android.FocusPictureInPicturePolicy
 import org.bilibilifocus.android.FocusVideoViewModel
 import org.bilibilifocus.android.VideoUiState
@@ -64,6 +65,7 @@ import org.bilibilifocus.android.playback.FocusPlaybackRequest
 import org.bilibilifocus.android.playback.FocusPlaybackResumePolicy
 import org.bilibilifocus.android.ui.video.AuthorCard
 import org.bilibilifocus.android.ui.video.CommentItem
+import org.bilibilifocus.android.ui.video.commentImageGalleryRequest
 import org.bilibilifocus.android.ui.video.DanmakuFullscreenButton
 import org.bilibilifocus.android.ui.video.ExpandableDescription
 import org.bilibilifocus.android.ui.video.FocusVideoDeviceType
@@ -79,15 +81,16 @@ import org.bilibilifocus.android.ui.video.VideoEpisodeSections
 import org.bilibilifocus.android.ui.video.VideoPageSection
 import org.bilibilifocus.android.ui.video.VideoTitleSection
 import org.bilibilifocus.android.ui.video.findActivity
+import org.bilibilifocus.android.ui.video.historyPositionForRequestedPage
 import org.bilibilifocus.android.ui.video.nextSpeed
 import org.bilibilifocus.android.ui.video.parseRequestedCid
+import org.bilibilifocus.android.ui.video.parseRequestedHistoryPositionMillis
 import org.bilibilifocus.android.ui.video.parseRequestedPage
 import org.bilibilifocus.android.ui.video.requestedLandscapeOrientation
 import org.bilibilifocus.android.ui.video.resolveActivePage
 import org.bilibilifocus.android.ui.video.setSystemBarsHidden
-import org.bilibilifocus.core.service.KtorHttpClient
-import org.bilibilifocus.core.service.VideoActionService
 import org.bilibilifocus.core.service.VideoInfoService
+import kotlinx.coroutines.flow.distinctUntilChanged
 
 @androidx.annotation.OptIn(UnstableApi::class)
 @OptIn(ExperimentalMaterial3Api::class)
@@ -100,42 +103,32 @@ fun FocusVideoScreen(
     onOpenURL: (String) -> Unit = {},
     nativeDanmakuEnabled: Boolean = true,
     onNativeDanmakuEnabledChange: (Boolean) -> Unit = {},
-    viewModel: FocusVideoViewModel? = null,
+    viewModel: FocusVideoViewModel,
     scrollState: ScrollState = rememberScrollState(),
     playbackConnection: FocusPlaybackConnection,
     playbackAccountScopeProvider: FocusPlaybackAccountScopeProvider,
     playbackProgressStore: FocusPlaybackProgressStore,
     playerSurfaceRevision: Int,
     isInPictureInPictureMode: Boolean,
+    isInMultiWindowMode: Boolean = false,
 ) {
     val bvid = remember(url) { VideoInfoService.extractBvid(url) }
     val initialPageNumber = remember(url) { parseRequestedPage(url) }
     val initialPageCid = remember(url) { parseRequestedCid(url) }
+    val initialHistoryPositionMillis = remember(url) { parseRequestedHistoryPositionMillis(url) }
     val context = LocalContext.current
 
-    val resolvedViewModel = viewModel ?: remember(url) {
-        FocusVideoViewModel(
-            service = VideoInfoService(
-                cookieProvider = AndroidCookieProvider(),
-                httpClient = KtorHttpClient(),
-            ),
-            actionService = VideoActionService(
-                cookieProvider = AndroidCookieProvider(),
-                httpClient = KtorHttpClient(),
-            ),
-        )
-    }
-
     if (bvid != null) {
-        LaunchedEffect(bvid) { resolvedViewModel.loadIfNeeded(bvid) }
+        LaunchedEffect(viewModel, bvid) { viewModel.loadIfNeeded(bvid) }
     }
 
-    val state by resolvedViewModel.state.collectAsState()
-    val comments by resolvedViewModel.comments.collectAsState()
-    val interactionState by resolvedViewModel.interactionState.collectAsState()
-    val isFullscreen by resolvedViewModel.isFullscreen.collectAsState()
-    val isCompletingFullscreenExit by resolvedViewModel.isCompletingFullscreenExit.collectAsState()
-    val danmakuState by resolvedViewModel.danmakuState.collectAsState()
+    val state by viewModel.state.collectAsState()
+    val comments by viewModel.comments.collectAsState()
+    var galleryRequest by remember(url) { mutableStateOf<FocusImageGalleryRequest?>(null) }
+    val interactionState by viewModel.interactionState.collectAsState()
+    val isFullscreen by viewModel.isFullscreen.collectAsState()
+    val isCompletingFullscreenExit by viewModel.isCompletingFullscreenExit.collectAsState()
+    val danmakuState by viewModel.danmakuState.collectAsState()
     val loaded = state as? VideoUiState.Loaded
     val info = loaded?.info
     val configuration = LocalConfiguration.current
@@ -143,6 +136,9 @@ fun FocusVideoScreen(
         FocusVideoDeviceType.fromSmallestWidth(configuration.smallestScreenWidthDp)
     }
     val isPhone = deviceType == FocusVideoDeviceType.Phone
+    val isInMultiWindowModeUpdated by rememberUpdatedState(isInMultiWindowMode)
+    val isInPictureInPictureModeUpdated by rememberUpdatedState(isInPictureInPictureMode)
+    val deviceTypeUpdated by rememberUpdatedState(deviceType)
     val isNarrowLayout = configuration.screenWidthDp < 840
 
     val player by playbackConnection.controller.collectAsState()
@@ -154,18 +150,24 @@ fun FocusVideoScreen(
     var playbackAccountScope by remember(url) { mutableStateOf<String?>(null) }
     var didResolvePlaybackAccountScope by remember(url) { mutableStateOf(false) }
     var videoAspectRatio by remember { mutableStateOf(playbackState.videoAspectRatio) }
-    var playbackPositionMillis by remember { mutableLongStateOf(0L) }
+    // Read this in Canvas/coroutines, not composition, so a playback frame does
+    // not invalidate the entire metadata/comment screen.
+    val playbackPositionMillis = remember { mutableLongStateOf(0L) }
     var fullscreenLandscapeOrientation by remember {
         mutableStateOf(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE)
     }
-    var shouldIgnoreInitialOrientationAfterPictureInPicture by remember {
+    var shouldIgnoreNextInitialOrientationAfterWindowMode by remember {
         mutableStateOf(false)
     }
     val prefersPortraitFullscreen = FocusVideoFullscreenPolicy.isPortrait(videoAspectRatio)
 
-    LaunchedEffect(isInPictureInPictureMode) {
-        if (isInPictureInPictureMode) {
-            shouldIgnoreInitialOrientationAfterPictureInPicture = true
+    LaunchedEffect(isInPictureInPictureMode, isInMultiWindowMode) {
+        if (FocusVideoRotationPolicy.shouldArmInitialOrientationIgnore(
+                isInPictureInPictureMode = isInPictureInPictureMode,
+                isInMultiWindowMode = isInMultiWindowMode,
+            )
+        ) {
+            shouldIgnoreNextInitialOrientationAfterWindowMode = true
         }
     }
 
@@ -176,12 +178,12 @@ fun FocusVideoScreen(
         )
     }
 
-    val requestFullscreen = { resolvedViewModel.requestFullscreen() }
+    val requestFullscreen = { viewModel.requestFullscreen() }
     val requestFullscreenExit = {
         if (isPhone) {
-            resolvedViewModel.beginFullscreenExit()
+            viewModel.beginFullscreenExit()
         } else {
-            resolvedViewModel.completeFullscreenExit()
+            viewModel.completeFullscreenExit()
         }
     }
     LaunchedEffect(info, initialPageNumber, initialPageCid) {
@@ -212,18 +214,25 @@ fun FocusVideoScreen(
         }
             ?: info?.lastPlaybackCid,
     )
+    val requestedHistoryPositionMillis = historyPositionForRequestedPage(
+        positionMillis = initialHistoryPositionMillis,
+        requestedPageNumber = initialPageNumber,
+        requestedPageCid = initialPageCid,
+        activePageNumber = activePage?.pageNumber ?: 0,
+        activePageCid = activePage?.cid ?: 0L,
+    )
 
     LaunchedEffect(player) {
         while (true) {
             withFrameNanos { }
-            playbackPositionMillis = player?.currentPosition?.coerceAtLeast(0) ?: 0
+            playbackPositionMillis.longValue = player?.currentPosition?.coerceAtLeast(0) ?: 0
         }
     }
 
     LaunchedEffect(info?.aid, activePage?.cid, nativeDanmakuEnabled) {
         val resolvedInfo = info ?: return@LaunchedEffect
         val resolvedPage = activePage ?: return@LaunchedEffect
-        resolvedViewModel.configureDanmaku(
+        viewModel.configureDanmaku(
             aid = resolvedInfo.aid,
             cid = resolvedPage.cid,
             durationSeconds = resolvedPage.duration,
@@ -232,9 +241,11 @@ fun FocusVideoScreen(
         )
     }
 
-    LaunchedEffect(playbackPositionMillis / 1_000, activePage?.cid, nativeDanmakuEnabled) {
+    LaunchedEffect(viewModel, activePage?.cid, nativeDanmakuEnabled) {
         if (nativeDanmakuEnabled) {
-            resolvedViewModel.updateDanmakuPosition(playbackPositionMillis)
+            snapshotFlow { playbackPositionMillis.longValue / 1_000 }
+                .distinctUntilChanged()
+                .collect { viewModel.updateDanmakuPosition(playbackPositionMillis.longValue) }
         }
     }
 
@@ -256,7 +267,7 @@ fun FocusVideoScreen(
             .takeIf { resolvedInfo.lastPlaybackCid == resolvedPage.cid }
         val startPositionMillis = FocusPlaybackResumePolicy.resolvePositionMillis(
             localPositionMillis = localProgress,
-            serverPositionMillis = serverProgress,
+            serverPositionMillis = requestedHistoryPositionMillis ?: serverProgress,
             durationMillis = resolvedPage.duration.coerceAtLeast(0) * 1_000,
         )
         playbackConnection.load(
@@ -294,18 +305,23 @@ fun FocusVideoScreen(
             isVideoLoaded = state is VideoUiState.Loaded,
             prefersPortraitFullscreen = prefersPortraitFullscreen,
             isInPictureInPictureMode = isInPictureInPictureMode,
+            isInMultiWindowMode = isInMultiWindowMode,
         ),
-        ignoreInitialOrientation = shouldIgnoreInitialOrientationAfterPictureInPicture,
+        ignoreInitialOrientation = shouldIgnoreNextInitialOrientationAfterWindowMode,
         onInitialOrientationConsumed = {
-            shouldIgnoreInitialOrientationAfterPictureInPicture = false
+            shouldIgnoreNextInitialOrientationAfterWindowMode = false
         },
         onLandscape = { orientation ->
-            val requestedOrientation = orientation.requestedLandscapeOrientation()
-            fullscreenLandscapeOrientation = requestedOrientation
-            context.findActivity()?.requestedOrientation = requestedOrientation
-            resolvedViewModel.requestFullscreen()
+            if (!isInMultiWindowMode) {
+                val requestedOrientation = orientation.requestedLandscapeOrientation()
+                fullscreenLandscapeOrientation = requestedOrientation
+                context.findActivity()?.requestedOrientation = requestedOrientation
+                viewModel.requestFullscreen()
+            }
         },
-        onPortrait = { resolvedViewModel.beginFullscreenExit() },
+        onPortrait = {
+            if (!isInMultiWindowMode) viewModel.beginFullscreenExit()
+        },
     )
 
     LaunchedEffect(
@@ -313,18 +329,20 @@ fun FocusVideoScreen(
         isCompletingFullscreenExit,
         configuration.orientation,
         isInPictureInPictureMode,
+        isInMultiWindowMode,
     ) {
         if (FocusVideoRotationPolicy.shouldCompleteFullscreenExit(
                 isPhone = isPhone,
                 isCompletingFullscreenExit = isCompletingFullscreenExit,
                 configurationOrientation = configuration.orientation,
                 isInPictureInPictureMode = isInPictureInPictureMode,
+                isInMultiWindowMode = isInMultiWindowMode,
             )
         ) {
             // 与 iOS 一致：界面几何稳定为竖屏后再撤下全屏层，避免先闪回详情页。
             withFrameNanos { }
             withFrameNanos { }
-            resolvedViewModel.completeFullscreenExit()
+            viewModel.completeFullscreenExit()
         }
     }
 
@@ -337,9 +355,14 @@ fun FocusVideoScreen(
         fullscreenLandscapeOrientation,
         configuration.orientation,
         isInPictureInPictureMode,
+        isInMultiWindowMode,
     ) {
         val activity = context.findActivity()
-        if (FocusVideoRotationPolicy.shouldApplyActivityOrientation(isInPictureInPictureMode)) {
+        if (FocusVideoRotationPolicy.shouldApplyActivityOrientation(
+                isInPictureInPictureMode = isInPictureInPictureMode,
+                isInMultiWindowMode = isInMultiWindowMode,
+            )
+        ) {
             activity?.requestedOrientation = when {
                 deviceType == FocusVideoDeviceType.Tablet -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
                 isCompletingFullscreenExit -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
@@ -348,16 +371,20 @@ fun FocusVideoScreen(
                 else -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
             }
             setSystemBarsHidden(activity, isFullscreen)
+        } else if (isInMultiWindowMode) {
+            setSystemBarsHidden(activity, false)
         }
         onDispose { }
     }
-    DisposableEffect(deviceType) {
+    DisposableEffect(Unit) {
         onDispose {
             val activity = context.findActivity()
-            activity?.requestedOrientation = if (deviceType == FocusVideoDeviceType.Phone) {
-                ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-            } else {
-                ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            if (!isInMultiWindowModeUpdated && !isInPictureInPictureModeUpdated) {
+                activity?.requestedOrientation = if (deviceTypeUpdated == FocusVideoDeviceType.Phone) {
+                    ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                } else {
+                    ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                }
             }
             setSystemBarsHidden(activity, false)
         }
@@ -466,33 +493,23 @@ fun FocusVideoScreen(
                                 contentAlignment = Alignment.Center,
                             ) {
                                 if (!isFullscreen) {
-                                    if (isPhone) {
-                                        PlayerSurface(
-                                            player = player,
-                                            showController = false,
-                                            onToggleFullscreen = requestFullscreen,
-                                            attachmentKey = playerSurfaceRevision,
-                                            modifier = Modifier.fillMaxSize(),
-                                        )
-                                    } else {
-                                        PlayerSurface(
-                                            player = player,
-                                            showController = false,
-                                            onToggleFullscreen = requestFullscreen,
-                                            attachmentKey = playerSurfaceRevision,
-                                            modifier = Modifier.fillMaxSize(),
-                                        )
-                                    }
+                                    PlayerSurface(
+                                        player = player,
+                                        showController = false,
+                                        onToggleFullscreen = requestFullscreen,
+                                        attachmentKey = playerSurfaceRevision,
+                                        modifier = Modifier.fillMaxSize(),
+                                    )
                                     VideoDanmakuOverlay(
                                         state = danmakuState,
                                         enabled = nativeDanmakuEnabled,
-                                        playbackPositionMillis = playbackPositionMillis,
+                                        playbackPositionMillis = { playbackPositionMillis.longValue },
                                         modifier = Modifier.fillMaxSize(),
                                     )
                                     VideoDanmakuStatusBanner(
                                         state = danmakuState,
                                         enabled = nativeDanmakuEnabled,
-                                        onRetry = { resolvedViewModel.retryDanmaku(playbackPositionMillis) },
+                                        onRetry = { viewModel.retryDanmaku(playbackPositionMillis.longValue) },
                                         modifier = Modifier.align(Alignment.TopCenter),
                                     )
                                 }
@@ -529,9 +546,9 @@ fun FocusVideoScreen(
                                 VideoActionBar(
                                     interactionState = interactionState,
                                     info = currentState.info,
-                                    onToggleLike = { resolvedViewModel.toggleLike() },
-                                    onCoin = { resolvedViewModel.coin() },
-                                    onToggleFavorite = { resolvedViewModel.toggleFavorite() },
+                                    onToggleLike = { viewModel.toggleLike() },
+                                    onCoin = { viewModel.coin() },
+                                    onToggleFavorite = { viewModel.toggleFavorite() },
                                 )
 
                                 if (currentState.info.author.mid > 0) {
@@ -568,7 +585,17 @@ fun FocusVideoScreen(
                                         style = MaterialTheme.typography.titleMedium,
                                     )
                                     comments.forEach { comment ->
-                                        CommentItem(comment, onOpenURL = onOpenURL)
+                                        CommentItem(
+                                            comment = comment,
+                                            onOpenURL = onOpenURL,
+                                            onOpenImage = { images, index ->
+                                                galleryRequest = commentImageGalleryRequest(
+                                                    imageURLs = images,
+                                                    imageIndex = index,
+                                                    referer = "https://www.bilibili.com/video/${currentState.info.bvid}",
+                                                )
+                                            },
+                                        )
                                     }
                                 }
                             }
@@ -595,7 +622,7 @@ fun FocusVideoScreen(
                 onToggleDanmaku = {
                     val enabled = !nativeDanmakuEnabled
                     onNativeDanmakuEnabledChange(enabled)
-                    resolvedViewModel.setDanmakuEnabled(enabled, playbackPositionMillis)
+                    viewModel.setDanmakuEnabled(enabled, playbackPositionMillis.longValue)
                 },
                 onToggleFullscreen = requestFullscreen,
                 modifier = Modifier.align(Alignment.BottomCenter),
@@ -635,13 +662,13 @@ fun FocusVideoScreen(
                     VideoDanmakuOverlay(
                         state = danmakuState,
                         enabled = nativeDanmakuEnabled,
-                        playbackPositionMillis = playbackPositionMillis,
+                        playbackPositionMillis = { playbackPositionMillis.longValue },
                         modifier = Modifier.fillMaxSize(),
                     )
                     VideoDanmakuStatusBanner(
                         state = danmakuState,
                         enabled = nativeDanmakuEnabled,
-                        onRetry = { resolvedViewModel.retryDanmaku(playbackPositionMillis) },
+                        onRetry = { viewModel.retryDanmaku(playbackPositionMillis.longValue) },
                         modifier = Modifier.align(Alignment.TopCenter).padding(top = 18.dp),
                     )
                     DanmakuFullscreenButton(
@@ -649,7 +676,7 @@ fun FocusVideoScreen(
                         onClick = {
                             val enabled = !nativeDanmakuEnabled
                             onNativeDanmakuEnabledChange(enabled)
-                            resolvedViewModel.setDanmakuEnabled(enabled, playbackPositionMillis)
+                            viewModel.setDanmakuEnabled(enabled, playbackPositionMillis.longValue)
                         },
                         modifier = Modifier.align(Alignment.TopEnd).padding(18.dp),
                     )
@@ -680,13 +707,13 @@ fun FocusVideoScreen(
                         VideoDanmakuOverlay(
                             state = danmakuState,
                             enabled = nativeDanmakuEnabled,
-                            playbackPositionMillis = playbackPositionMillis,
+                            playbackPositionMillis = { playbackPositionMillis.longValue },
                             modifier = Modifier.fillMaxSize(),
                         )
                         VideoDanmakuStatusBanner(
                             state = danmakuState,
                             enabled = nativeDanmakuEnabled,
-                            onRetry = { resolvedViewModel.retryDanmaku(playbackPositionMillis) },
+                            onRetry = { viewModel.retryDanmaku(playbackPositionMillis.longValue) },
                             modifier = Modifier.align(Alignment.TopCenter).padding(top = 18.dp),
                         )
                         DanmakuFullscreenButton(
@@ -694,13 +721,17 @@ fun FocusVideoScreen(
                             onClick = {
                                 val enabled = !nativeDanmakuEnabled
                                 onNativeDanmakuEnabledChange(enabled)
-                                resolvedViewModel.setDanmakuEnabled(enabled, playbackPositionMillis)
+                                viewModel.setDanmakuEnabled(enabled, playbackPositionMillis.longValue)
                             },
                             modifier = Modifier.align(Alignment.TopEnd).padding(18.dp),
                         )
                     }
                 }
             }
+        }
+
+        galleryRequest?.let { request ->
+            FocusImageGallery(request = request, onDismiss = { galleryRequest = null })
         }
     }
 }

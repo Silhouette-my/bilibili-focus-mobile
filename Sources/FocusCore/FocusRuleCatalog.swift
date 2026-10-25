@@ -2559,25 +2559,32 @@ public enum FocusRuleCatalog {
                       state.searchFilterControlCache = {};
                     };
 
+                    const searchObserverOptions = {
+                      childList: true,
+                      subtree: true,
+                      attributes: true,
+                      attributeFilter: ['class', 'style', 'href', 'data-href', 'data-url']
+                    };
+                    const refreshSearchLayout = () => {
+                      // Our own styles and mirrored controls must not schedule
+                      // another repair. All work here is synchronous.
+                      state.searchObserver?.disconnect();
+                      try {
+                        rewriteAll();
+                        decorateSearchInput();
+                        applySearchVideoGrid();
+                        hidePromotedSearchBlocks();
+                        hideSearchTypeNav();
+                        mirrorSearchFilterBoard();
+                      } finally {
+                        state.searchObserver?.observe(document.body || document.documentElement, searchObserverOptions);
+                      }
+                    };
                     const scheduleSearchFilterRefresh = () => {
                       clearTimeout(state.searchFilterRefreshTimer);
-                      state.searchFilterRefreshTimer = setTimeout(() => {
-                        rewriteAll();
-                        decorateSearchInput();
-                        applySearchVideoGrid();
-                        hidePromotedSearchBlocks();
-                        hideSearchTypeNav();
-                        mirrorSearchFilterBoard();
-                      }, 18);
+                      state.searchFilterRefreshTimer = setTimeout(refreshSearchLayout, 18);
                       clearTimeout(state.searchFilterRefreshTimerLate);
-                      state.searchFilterRefreshTimerLate = setTimeout(() => {
-                        rewriteAll();
-                        decorateSearchInput();
-                        applySearchVideoGrid();
-                        hidePromotedSearchBlocks();
-                        hideSearchTypeNav();
-                        mirrorSearchFilterBoard();
-                      }, 96);
+                      state.searchFilterRefreshTimerLate = setTimeout(refreshSearchLayout, 96);
                     };
 
                     const triggerFilterSelection = (label) => {
@@ -2715,9 +2722,7 @@ public enum FocusRuleCatalog {
                         shell.appendChild(row);
                       });
 
-                      if (root.parentNode && shell.parentNode !== root.parentNode) {
-                        root.parentNode.insertBefore(shell, root);
-                      } else if (root.parentNode) {
+                      if (root.parentNode) {
                         root.parentNode.insertBefore(shell, root);
                       }
 
@@ -2725,12 +2730,7 @@ public enum FocusRuleCatalog {
                       setOriginalFilterBoardCollapsed(root, true);
                     };
 
-                    rewriteAll();
-                    decorateSearchInput();
-                    applySearchVideoGrid();
-                    hidePromotedSearchBlocks();
-                    hideSearchTypeNav();
-                    mirrorSearchFilterBoard();
+                    refreshSearchLayout();
 
                     if (!state.openWrapped) {
                       state.openWrapped = true;
@@ -2859,12 +2859,8 @@ public enum FocusRuleCatalog {
                         }
                       });
 
-                      observer.observe(document.body || document.documentElement, {
-                        childList: true,
-                        subtree: true,
-                        attributes: true,
-                        attributeFilter: ['class', 'style', 'href', 'data-href', 'data-url']
-                      });
+                      state.searchObserver = observer;
+                      observer.observe(document.body || document.documentElement, searchObserverOptions);
                     }
                     """,
                     settingKey: .searchMaskEnabled

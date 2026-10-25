@@ -57,7 +57,7 @@ struct FocusWebView: UIViewRepresentable {
 
     func makeUIView(context: Context) -> WKWebView {
         let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = .default()
+        configuration.websiteDataStore = viewModel.websiteDataStore
         configuration.allowsInlineMediaPlayback = true
         configuration.defaultWebpagePreferences.preferredContentMode = .mobile
         configuration.mediaTypesRequiringUserActionForPlayback = []
@@ -270,10 +270,11 @@ struct FocusWebView: UIViewRepresentable {
         }
 
         func applyAppearance(on webView: WKWebView, settings: FocusSettings, isDarkMode: Bool) {
+            // Update future navigations too. Evaluating only the current page
+            // leaves WKUserScripts on the old theme, including video pages that
+            // intentionally skip the didFinish feature replay.
+            installScripts(on: webView, settings: settings, isDarkMode: isDarkMode)
             let appearanceScript = FocusWebAppearance.script(isDarkMode: isDarkMode)
-            lastAppliedSettings = settings
-            lastAppliedDarkMode = isDarkMode
-            lastAppearanceScript = appearanceScript
             webView.evaluateJavaScript(appearanceScript)
         }
 

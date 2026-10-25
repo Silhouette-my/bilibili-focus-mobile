@@ -2,17 +2,17 @@ package org.bilibilifocus.core.routing
 
 fun urlEncode(value: String): String {
     val sb = StringBuilder()
-    for (char in value) {
+    val hexDigits = "0123456789ABCDEF"
+    // Encode the whole string first so UTF-16 surrogate pairs stay together.
+    for (byte in value.encodeToByteArray()) {
+        val octet = byte.toInt() and 0xFF
+        val char = octet.toChar()
         when (char) {
             in 'a'..'z', in 'A'..'Z', in '0'..'9', '-', '_', '.', '~' -> sb.append(char)
-            ' ' -> sb.append("%20")
             else -> {
-                val bytes = char.toString().encodeToByteArray()
-                for (byte in bytes) {
-                    sb.append('%')
-                    val hex = (byte.toInt() and 0xFF).toString(16).uppercase().padStart(2, '0')
-                    sb.append(hex)
-                }
+                sb.append('%')
+                sb.append(hexDigits[octet ushr 4])
+                sb.append(hexDigits[octet and 0x0F])
             }
         }
     }

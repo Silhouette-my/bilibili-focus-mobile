@@ -40,6 +40,18 @@ class FocusPlaybackProgressStoreTests {
     }
 
     @Test
+    fun `same part local progress wins over the tapped history position`() {
+        assertEquals(
+            95_000,
+            FocusPlaybackResumePolicy.resolvePositionMillis(
+                localPositionMillis = 95_000,
+                serverPositionMillis = 87_000,
+                durationMillis = 180_000,
+            ),
+        )
+    }
+
+    @Test
     fun `near-start and near-end progress restart from zero`() {
         assertEquals(
             0,

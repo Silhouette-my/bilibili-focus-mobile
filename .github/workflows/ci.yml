@@ -27,11 +27,16 @@ jobs:
       - name: Verify focus-runtime.js mirror
         run: ./Scripts/sync_focus_runtime.sh --check
 
+      - name: Compile Kotlin embedded JavaScript
+        run: node Scripts/check_kotlin_feature_scripts.mjs
+
       - name: Verify Bilibili API contract mirror
         run: ./Scripts/sync_bilibili_api_contracts.mjs --check
 
       - name: Verify online smoke remains opt-in
-        run: node Scripts/run_online_smoke.mjs
+        run: |
+          node Scripts/run_online_smoke.mjs
+          node --test Scripts/run_online_smoke.test.mjs
 
   swift:
     name: Swift and Xcode
@@ -75,6 +80,7 @@ jobs:
         run: FOCUS_INCLUDE_TESTS=1 swift test --disable-sandbox
 
       - name: Run Swift package tests in Release
+        if: github.event_name == 'workflow_dispatch'
         run: FOCUS_INCLUDE_TESTS=1 swift test -c release --disable-sandbox
 
       - name: Run FocusVerifier
@@ -102,6 +108,7 @@ jobs:
             CODE_SIGNING_REQUIRED=NO
 
       - name: Build unsigned iOS Release
+        if: github.event_name == 'workflow_dispatch'
         run: >-
           xcodebuild build
           -project BilibiliFocus.xcodeproj
@@ -152,7 +159,10 @@ jobs:
           :focus-android:testDebugUnitTest
           :focus-android:lintDebug
           :focus-android:assembleDebug
-          :focus-android:compileReleaseKotlin
+
+      - name: Compile Android Release
+        if: github.event_name == 'workflow_dispatch'
+        run: ./gradlew --no-daemon :focus-android:compileReleaseKotlin
 
       - name: Upload Android reports on failure
         if: failure()

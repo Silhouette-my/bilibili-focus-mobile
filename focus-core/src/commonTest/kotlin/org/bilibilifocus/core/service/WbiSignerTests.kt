@@ -1,6 +1,7 @@
 package org.bilibilifocus.core.service
 
 import kotlinx.coroutines.async
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.test.runTest
@@ -9,8 +10,20 @@ import org.bilibilifocus.core.cookie.CookieProvider
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotEquals
+import kotlin.test.assertFailsWith
 
 class WbiSignerTests {
+    @Test
+    fun `cancelled navigation load stays cancellation rather than signing failure`() = runTest {
+        val signer = WbiSigner(EmptyCookieProvider, object : HttpClient {
+            override suspend fun get(url: String, headers: Map<String, String>): HttpResponse =
+                throw CancellationException("fixture cancelled")
+            override suspend fun post(url: String, body: String, headers: Map<String, String>): HttpResponse =
+                error("Unexpected POST")
+        })
+        assertFailsWith<CancellationException> { signer.signedQuery(mapOf("keyword" to "fixture")) }
+    }
+
     @Test
     fun `signing sanitizes and RFC3986 encodes Chinese values`() {
         val query = signWbiQuery(

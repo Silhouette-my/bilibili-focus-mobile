@@ -56,7 +56,7 @@ final class FocusBrowserViewModel: ObservableObject {
     let settingsStore: FocusSettingsStore
 
     weak var webView: WKWebView?
-    var nativePageAugmentService: FocusNativePageAugmentService?
+    var nativePageAugmentService: (any FocusNativePageAugmentServing)?
     var prepareForURL: ((WKWebView, URL) -> Void)?
     var onEntryRequest: ((FocusEntry) -> Void)?
     var onUserSpaceRequest: ((URL) -> Void)?
@@ -69,16 +69,23 @@ final class FocusBrowserViewModel: ObservableObject {
     private var playerCommandTask: Task<Void, Never>?
     private var pageAugmentationTask: Task<Void, Never>?
     private var pageAugmentationApplyTask: Task<Void, Never>?
+    private var nativeVideoFollowTask: Task<Void, Never>?
     private var nativeVideoLoadingMaskTask: Task<Void, Never>?
     private var nativeVideoPlaceholderTask: Task<Void, Never>?
     private var pageAugmentationRevision = 0
-    private var pageAugmentCache: [String: FocusNativePageAugmentPayload] = [:]
+    private var pageAugmentCache = FocusNativePageAugmentCache()
+    private var pageAugmentCacheSessionVersion: UInt64?
     private var scheduledPageAugmentationKey: String?
     private var pageAugmentationFailureCounts: [String: Int] = [:]
     private var pageAugmentationRetryAfter: [String: Date] = [:]
     private var appBackStack: [URL] = []
+    private var appBackSourceURL: URL?
     private var pendingAppBackTarget: URL?
     private var isHandlingAppBackNavigation = false
+
+    var activeRouteRequestSessionID: BrowserSessionID? {
+        isSessionActive ? browserSessionID : nil
+    }
 #if DEBUG
     private var lastDebugDetectedPageStateSignature: String?
     private var lastDebugPlayerStateSignature: String?
@@ -98,6 +105,8 @@ final class FocusBrowserViewModel: ObservableObject {
     private var sessionCanonicalURL: URL?
     private var isAwaitingNavigationStart = false
 
+    var websiteDataStore: WKWebsiteDataStore = FocusTestRuntime.isRunningFixtures ? .nonPersistent() : .default()
+
     init(settingsStore: FocusSettingsStore) {
         self.settingsStore = settingsStore
     }
@@ -108,15 +117,12 @@ final class FocusBrowserViewModel: ObservableObject {
         playerCommandTask?.cancel()
         pageAugmentationTask?.cancel()
         pageAugmentationApplyTask?.cancel()
+        nativeVideoFollowTask?.cancel()
         nativeVideoLoadingMaskTask?.cancel()
         nativeVideoPlaceholderTask?.cancel()
         orientationDebounceTask?.cancel()
         fullscreenTransitionTask?.cancel()
         webContentRecoveryTask?.cancel()
-    }
-
-    var router: FocusRouter {
-        FocusRouter(settings: settingsStore.settings)
     }
 
     var navigationPolicy: FocusNavigationPolicy {
@@ -353,6 +359,9 @@ final class FocusBrowserViewModel: ObservableObject {
     }
 
     private func advanceNavigationSession(to canonicalURL: URL?, awaitingStart: Bool) {
+        nativeVideoFollowTask?.cancel()
+        nativeVideoFollowTask = nil
+        isUpdatingNativeVideoFollow = false
         navigationRevisionCounter &+= 1
         navigationRevision = NavigationRevision(rawValue: navigationRevisionCounter)
         browserSessionID = BrowserSessionID()
@@ -457,6 +466,23 @@ final class FocusBrowserViewModel: ObservableObject {
                 "context": entryContextLabel(context)
             ])
         )
+    }
+
+    func resume(_ url: URL, context: EntryContext) {
+        let canonicalURL = FocusNavigationPolicy.canonicalWebURL(for: url)
+        guard let webView,
+              currentURL == canonicalURL,
+              webView.url.map(FocusNavigationPolicy.canonicalWebURL(for:)) == canonicalURL else {
+            open(url, context: context)
+            return
+        }
+
+        // Returning from a native detail restores this route's committed
+        // document, not a new browser entry. No didCommit follows this path.
+        isSessionActive = true
+        entryContext = context
+        prepareNavigationSession(to: canonicalURL, force: true)
+        updateNavigationState(from: webView)
     }
 
     func reload() {
@@ -566,6 +592,7 @@ final class FocusBrowserViewModel: ObservableObject {
         let resolvedURL = webView.url.map(FocusNavigationPolicy.canonicalWebURL(for:))
         alignNavigationSessionIfNeeded(to: resolvedURL)
         currentURL = resolvedURL
+        appBackSourceURL = resolvedURL
         pendingURL = currentURL
         isLoadingPage = false
         webContentRecoveryTask?.cancel()
@@ -632,6 +659,7 @@ final class FocusBrowserViewModel: ObservableObject {
         let resolvedURL = webView.url.map(FocusNavigationPolicy.canonicalWebURL(for:))
         alignNavigationSessionIfNeeded(to: resolvedURL)
         currentURL = resolvedURL
+        appBackSourceURL = resolvedURL
         pendingURL = resolvedURL
         canGoBack = webView.canGoBack
         canGoForward = webView.canGoForward
@@ -800,7 +828,10 @@ final class FocusBrowserViewModel: ObservableObject {
     }
 
     func entryRedirect(for url: URL) -> FocusEntry? {
-        router.redirectTarget(for: url)
+        FocusKMPRouterAdapter.redirectTarget(
+            for: url,
+            settings: settingsStore.settings
+        )
     }
 
     func requestNativeEntry(_ entry: FocusEntry) {
@@ -1751,6 +1782,7 @@ final class FocusBrowserViewModel: ObservableObject {
 
     private func resetAppBackStack() {
         appBackStack.removeAll()
+        appBackSourceURL = nil
         pendingAppBackTarget = nil
         isHandlingAppBackNavigation = false
     }
@@ -1763,7 +1795,10 @@ final class FocusBrowserViewModel: ObservableObject {
     }
 
     private func shouldPushAppBackEntry(from currentURL: URL?, to targetURL: URL, navigationType: WKNavigationType) -> Bool {
-        guard let currentURL, currentURL != targetURL else {
+        // A retained WKWebView still exposes the previous session's URL until
+        // its new entry commits. That URL is history, not this route's parent.
+        guard isSessionActive, let currentURL,
+              currentURL == appBackSourceURL, currentURL != targetURL else {
             return false
         }
 
@@ -2002,6 +2037,25 @@ final class FocusBrowserViewModel: ObservableObject {
         pageAugmentationRetryAfter.removeAll()
     }
 
+    func resetForSessionChange() {
+        invalidatePageAugmentation()
+        invalidateBrowserCallbacks()
+        pageAugmentCache.removeAll()
+        pageAugmentCacheSessionVersion = nil
+        resetPlayerState()
+    }
+
+    func reconcileSessionVersion(_ version: UInt64) {
+        guard nativePageAugmentService?.sessionVersion == version else { return }
+        invalidatePageAugmentation()
+        nativeVideoFollowTask?.cancel()
+        nativeVideoFollowTask = nil
+        isUpdatingNativeVideoFollow = false
+        pageAugmentCache.removeAll()
+        pageAugmentCacheSessionVersion = version
+        if isSessionActive { schedulePageAugmentationRefresh() }
+    }
+
     private func loadURLIfNeeded(_ url: URL, on webView: WKWebView, reason: String, force: Bool = false) {
         let canonicalURL = FocusNavigationPolicy.canonicalWebURL(for: url)
         let activeURL = webView.url.map(FocusNavigationPolicy.canonicalWebURL(for:))
@@ -2083,10 +2137,15 @@ final class FocusBrowserViewModel: ObservableObject {
             return
         }
         scheduledPageAugmentationKey = scheduleKey
+        let sessionVersion = service.sessionVersion
+        if pageAugmentCacheSessionVersion != sessionVersion {
+            pageAugmentCache.removeAll()
+            pageAugmentCacheSessionVersion = sessionVersion
+        }
         let cacheKey = kind.cacheKey(for: canonicalURL)
         let revision = pageAugmentationRevision
 
-        if let cachedPayload = pageAugmentCache[cacheKey] {
+        if let cachedPayload = pageAugmentCache.payload(for: cacheKey) {
             nativeVideoLoadingMaskTask?.cancel()
             nativeVideoLoadingMaskTask = nil
             nativeVideoPlaceholderTask?.cancel()
@@ -2109,7 +2168,7 @@ final class FocusBrowserViewModel: ObservableObject {
             }
 
             let payload = await service.loadPayload(for: canonicalURL, kind: kind)
-            guard !Task.isCancelled else {
+            guard !Task.isCancelled, service.sessionVersion == sessionVersion else {
                 return
             }
 
@@ -2155,7 +2214,7 @@ final class FocusBrowserViewModel: ObservableObject {
                 self.nativeVideoPlaceholderTask = nil
                 self.pageAugmentationFailureCounts[scheduleKey] = nil
                 self.pageAugmentationRetryAfter[scheduleKey] = nil
-                self.pageAugmentCache[cacheKey] = payload
+                self.pageAugmentCache.store(payload, for: cacheKey)
                 self.syncNativeVideoMetadata(from: payload)
                 self.applyPageAugmentation(payload, for: canonicalURL, revision: revision)
             }
@@ -2882,16 +2941,22 @@ final class FocusBrowserViewModel: ObservableObject {
 
         let targetMID = nativeVideoAuthorMID
         let shouldFollow = !nativeVideoAuthorIsFollowing
+        let sessionID = browserSessionID
+        let sessionVersion = service.sessionVersion
         isUpdatingNativeVideoFollow = true
 
-        Task { [weak self] in
+        nativeVideoFollowTask = Task { [weak self] in
             guard let self else {
                 return
             }
 
             do {
-                let result = try await service.updateFollowState(mid: targetMID, shouldFollow: shouldFollow)
+                let result = try await service.updateFollowState(mid: targetMID, shouldFollow: shouldFollow, expectedSessionVersion: sessionVersion)
                 await MainActor.run {
+                    guard !Task.isCancelled, self.browserSessionID == sessionID,
+                          service.sessionVersion == sessionVersion,
+                          self.nativeVideoAuthorMID == targetMID else { return }
+                    self.nativeVideoFollowTask = nil
                     self.isUpdatingNativeVideoFollow = false
                     self.applyNativeVideoAuthorFollowState(
                         mid: targetMID,
@@ -2901,6 +2966,9 @@ final class FocusBrowserViewModel: ObservableObject {
                 }
             } catch {
                 await MainActor.run {
+                    guard !Task.isCancelled, self.browserSessionID == sessionID,
+                          service.sessionVersion == sessionVersion else { return }
+                    self.nativeVideoFollowTask = nil
                     self.isUpdatingNativeVideoFollow = false
                     self.debugLog(
                         "nativeVideoAuthorFollow.failed",
@@ -2925,8 +2993,8 @@ final class FocusBrowserViewModel: ObservableObject {
            kind == .video
         {
             let cacheKey = kind.cacheKey(for: FocusNavigationPolicy.canonicalWebURL(for: currentURL))
-            if case let .video(existingPayload)? = pageAugmentCache[cacheKey] {
-                pageAugmentCache[cacheKey] = .video(
+            if case let .video(existingPayload)? = pageAugmentCache.payload(for: cacheKey), existingPayload.authorMID == mid {
+                pageAugmentCache.store(.video(
                     FocusNativeVideoAugmentPayload(
                         title: existingPayload.title,
                         authorName: existingPayload.authorName,
@@ -2939,7 +3007,7 @@ final class FocusBrowserViewModel: ObservableObject {
                         groups: existingPayload.groups,
                         comments: existingPayload.comments
                     )
-                )
+                ), for: cacheKey)
             }
         }
 
@@ -3879,75 +3947,86 @@ final class FocusBrowserViewModel: ObservableObject {
     }
 }
 
-final class WebViewCookieSnapshotProvider: @unchecked Sendable, CookieSnapshotProvider {
+extension Notification.Name {
+    static let focusSessionDidChange = Notification.Name("FocusSessionDidChange")
+}
+
+final class WebViewCookieSnapshotProvider: NSObject, @unchecked Sendable, CookieSnapshotProvider {
+    let websiteDataStore: WKWebsiteDataStore
     private let cookieStore: WKHTTPCookieStore
-    private let performsLoginWarmup: Bool
-    private let lock = NSLock()
-    private var snapshot: [HTTPCookie] = []
-    private var hasCompletedInitialWarmup = false
+    private let coordinator: CookieSessionCoordinator
+    private let observer: StoreObserver
+    private let transitionLock = NSLock()
+    private var pendingAccountReset = false
+
+    @MainActor
+    private final class StoreObserver: NSObject, WKHTTPCookieStoreObserver {
+        weak var owner: WebViewCookieSnapshotProvider?
+        func cookiesDidChange(in cookieStore: WKHTTPCookieStore) {
+            guard let owner else { return }
+            owner.coordinator.invalidate()
+            Task { _ = await owner.coordinator.loadSnapshot() }
+        }
+    }
 
     @MainActor
     init(
         websiteDataStore: WKWebsiteDataStore = .default(),
         performsLoginWarmup: Bool = true
     ) {
-        self.cookieStore = websiteDataStore.httpCookieStore
-        self.performsLoginWarmup = performsLoginWarmup
-    }
-
-    func loadCookies() async -> [HTTPCookie] {
-        let cookies = await refreshSnapshotIfNeeded()
-
-        lock.withLock {
-            snapshot = cookies
-        }
-
-        return cookies
-    }
-
-    func refreshSnapshotIfNeeded() async -> [HTTPCookie] {
-        var cookies = await currentCookies()
-        let shouldWarmUp = lock.withLock { !hasCompletedInitialWarmup }
-
-        if performsLoginWarmup, shouldWarmUp, !containsLikelyLoginCookies(in: cookies) {
-            for delay in [180_000_000, 350_000_000, 700_000_000, 1_100_000_000] {
-                try? await Task.sleep(nanoseconds: UInt64(delay))
-                cookies = await currentCookies()
-                if containsLikelyLoginCookies(in: cookies) {
-                    break
+        self.websiteDataStore = websiteDataStore
+        let store = websiteDataStore.httpCookieStore
+        self.cookieStore = store
+        self.coordinator = CookieSessionCoordinator(
+            reader: { @MainActor in
+                await withCheckedContinuation { continuation in
+                    store.getAllCookies { continuation.resume(returning: $0) }
                 }
+            },
+            warmupDelays: performsLoginWarmup ? [180_000_000, 350_000_000, 700_000_000, 1_100_000_000] : []
+        )
+        self.observer = StoreObserver()
+        super.init()
+        observer.owner = self
+        store.add(observer)
+        coordinator.setTransitionHandler { [weak self] transition in
+            // A newer tracking-cookie event can overtake the account-change
+            // notification. Preserve its reset obligation until a current event
+            // is delivered instead of losing it to the generation guard.
+            self?.transitionLock.withLock {
+                if transition.requiresAccountReset { self?.pendingAccountReset = true }
+            }
+            Task { @MainActor [weak self] in
+                guard let self, self.sessionVersion == transition.version else { return }
+                let requiresReset = self.transitionLock.withLock {
+                    let reset = self.pendingAccountReset
+                    self.pendingAccountReset = false
+                    return reset
+                }
+                NotificationCenter.default.post(
+                    name: .focusSessionDidChange, object: self,
+                    userInfo: ["version": transition.version, "readiness": transition.readiness.rawValue,
+                               "requiresAccountReset": requiresReset]
+                )
             }
         }
-
-        lock.withLock {
-            snapshot = cookies
-            hasCompletedInitialWarmup = true
-        }
-
-        return cookies
     }
 
-    @MainActor
-    private func currentCookies() async -> [HTTPCookie] {
-        await withCheckedContinuation { continuation in
-            cookieStore.getAllCookies { cookies in
-                continuation.resume(returning: cookies)
-            }
-        }
+    deinit {
+        let store = cookieStore
+        let observer = observer
+        Task { @MainActor in store.remove(observer) }
     }
 
-    func attachCookies(to request: URLRequest) -> URLRequest {
-        let cookies = lock.withLock {
-            snapshot
-        }
-        return DynamicFeedService.attach(cookies: cookies, to: request)
-    }
-
-    private func containsLikelyLoginCookies(in cookies: [HTTPCookie]) -> Bool {
-        let names = Set(cookies.map(\.name))
-        return names.contains("SESSDATA")
-            || names.contains("DedeUserID")
-            || names.contains("bili_jct")
+    var sessionVersion: UInt64 { coordinator.sessionVersion }
+    var sessionReadiness: CookieSessionReadiness { coordinator.sessionReadiness }
+    func loadCookies() async -> [HTTPCookie] { await coordinator.loadCookies() }
+    func loadSnapshot() async -> CookieSessionSnapshot { await coordinator.loadSnapshot() }
+    func refreshSnapshotIfNeeded() async -> [HTTPCookie] { await loadCookies() }
+    func noteServerSessionExpired(version: UInt64) { coordinator.noteServerSessionExpired(version: version) }
+    func attachCookies(to request: URLRequest) -> URLRequest { coordinator.attachCookies(to: request) }
+    static func containsUsableLoginSession(in cookies: [HTTPCookie], now: Date = Date()) -> Bool {
+        CookieSessionCoordinator.hasUsableSession(cookies, now: now)
     }
 }
 

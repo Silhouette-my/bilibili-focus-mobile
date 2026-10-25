@@ -66,12 +66,12 @@ final class FocusSearchResultsViewModel: ObservableObject {
     }
 
     func reload() {
+        suspend()
         guard let query = currentQuery, !query.keyword.isEmpty else {
             state = .idle
             return
         }
 
-        task?.cancel()
         let filter = selectedFilter
         let videoSort = filter == .video ? selectedVideoSort : .default
         state = .loading
@@ -93,11 +93,6 @@ final class FocusSearchResultsViewModel: ObservableObject {
 
                 cachePage(page, for: filter)
                 state = .loaded(page.sections)
-            } catch let error as SearchResultService.ServiceError {
-                guard !Task.isCancelled else {
-                    return
-                }
-                state = .failed(error.localizedDescription)
             } catch {
                 guard !Task.isCancelled else {
                     return
@@ -111,6 +106,7 @@ final class FocusSearchResultsViewModel: ObservableObject {
         cache[selectedFilter] = nil
         nextPageByFilter[selectedFilter] = nil
         reload()
+        await task?.value
     }
 
     func selectFilter(_ filter: SearchResultFilter) {
@@ -118,6 +114,7 @@ final class FocusSearchResultsViewModel: ObservableObject {
             return
         }
 
+        suspend()
         selectedFilter = filter
         if let cachedPage = cache[filter] {
             cachePage(cachedPage, for: filter)
@@ -255,18 +252,7 @@ final class FocusSearchResultsViewModel: ObservableObject {
             return incoming
         }
 
-        return existing.map { section in
-            guard section.filter == targetFilter,
-                  let incomingSection = incoming.first(where: { $0.filter == targetFilter })
-            else {
-                return section
-            }
-
-            return SearchResultSection(
-                filter: section.filter,
-                items: mergeItems(existing: section.items, incoming: incomingSection.items)
-            )
-        }
+        return merge(currentSections: existing, extraSections: incoming, targetFilter: targetFilter)
     }
 
     private func mergeItems(existing: [SearchResultItem], incoming: [SearchResultItem]) -> [SearchResultItem] {

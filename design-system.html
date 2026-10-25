@@ -3,12 +3,12 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Bilibili Focus — 设计系统</title>
+<title>Bilibili Focus — 早期设计探索</title>
 <style>
 /* ============================================================
-   Bilibili Focus Design System
+   Bilibili Focus historical design exploration
    iOS 18 (HIG)  ·  Material Design 3
-   Two complete, structurally independent UI systems.
+   Static mockups; implementation tokens live in the platform sources.
    ============================================================ */
 
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -558,7 +558,7 @@ main { max-width: 1200px; margin: 0 auto; padding: var(--sp-3xl) var(--sp-2xl); 
 <body data-platform="ios">
 
 <div class="topbar">
-  <h1>Bilibili Focus 设计系统</h1>
+  <h1>Bilibili Focus 设计探索归档</h1>
   <div class="platform-tabs">
     <button class="platform-tab active" data-plat="ios">iOS 18</button>
     <button class="platform-tab" data-plat="md3">Material Design 3</button>
@@ -573,6 +573,12 @@ main { max-width: 1200px; margin: 0 auto; padding: var(--sp-3xl) var(--sp-2xl); 
 </nav>
 
 <main>
+<div class="note">
+  <strong>早期视觉方案。</strong>当前样式入口：
+  <a href="App/BilibiliFocus/FocusSharedUI.swift">iOS 共用组件</a>、
+  <a href="focus-android/src/main/kotlin/org/bilibilifocus/android/ui/theme/Theme.kt">Android 主题</a>。
+  以下保留早期色板和 WebView 播放页草图；当前视频详情采用原生渲染。
+</div>
 
 <!-- ============================================================
      TOKENS
@@ -580,15 +586,15 @@ main { max-width: 1200px; margin: 0 auto; padding: var(--sp-3xl) var(--sp-2xl); 
 <section class="sec" id="tokens">
   <div class="sec-hdr">
     <h2>设计令牌</h2>
-    <p>颜色、字体、间距 — 各平台值取自原生系统规范，适配 Bilibili 品牌语境。</p>
+    <p>早期方案中的示意颜色、字体与间距。</p>
   </div>
 
   <div class="sec-inner">
     <h3>色彩系统</h3>
     <div class="note">
-      <strong>iOS 18</strong> — 主色 #FB7299（哔哩哔哩粉），背景层级使用系统原生 systemGroupedBackground (#F2F2F7) + secondarySystemGroupedBackground (#FFF)，不改动系统色。
+      <strong>iOS 草图</strong> — 主色 #FB7299，浅色背景用 #F2F2F7 与 #FFF 模拟系统分组层级。
       <br>
-      <strong>MD3</strong> — 以 Bilibili 品牌粉 #FB7299 为 Key Color 推导完整 Tonal Palette。Primary #904255 / Primary Container #FFD9E2。使用 Surface Container 系列实现高程表达。
+      <strong>MD3 草图</strong> — 示意主色 #904255、容器色 #FFD9E2，以浅色面板表达高程。
     </div>
     <div class="swatch-grid" id="color-swatches"></div>
   </div>
@@ -843,7 +849,7 @@ main { max-width: 1200px; margin: 0 auto; padding: var(--sp-3xl) var(--sp-2xl); 
 <section class="sec" id="screens">
   <div class="sec-hdr">
     <h2>界面方案 — iOS 18</h2>
-    <p>基于 Human Interface Guidelines，使用系统原生组件语义（ultraThinMaterial / groupedBackground / SF Symbols）。</p>
+    <p>参考 iOS 分组背景、半透明导航和卡片布局的 HTML 草图。</p>
   </div>
 
   <div class="mockup-grid ios-mockups">
@@ -960,7 +966,7 @@ main { max-width: 1200px; margin: 0 auto; padding: var(--sp-3xl) var(--sp-2xl); 
 <section class="sec">
   <div class="sec-hdr">
     <h2>界面方案 — Material Design 3</h2>
-    <p>基于 MD3 规范，使用 Surface Container 高程体系、Top App Bar、Navigation Bar (pill indicator)、FilterChip、Elevated Card 等原生组件。</p>
+    <p>参考 MD3 导航、筛选标签和卡片布局的 HTML 草图。</p>
   </div>
 
   <div class="mockup-grid md3-mockups">
@@ -1144,13 +1150,13 @@ main { max-width: 1200px; margin: 0 auto; padding: var(--sp-3xl) var(--sp-2xl); 
      ============================================================ -->
 <section class="sec" id="spec">
   <div class="sec-hdr">
-    <h2>平台对照表</h2>
-    <p>iOS 18 (HIG) 与 Material Design 3 在关键设计维度的逐项对比。</p>
+    <h2>早期方案参数对照</h2>
+    <p>本页两组草图采用的参数。</p>
   </div>
 
   <div style="overflow-x:auto;">
     <table class="token-table">
-      <thead><tr><th>维度</th><th>iOS 18 (HIG)</th><th>Material Design 3</th></tr></thead>
+      <thead><tr><th>维度</th><th>iOS 方案</th><th>MD3 方案</th></tr></thead>
       <tbody>
         <tr><td style="font-weight:600;">导航栏</td><td>44pt · inline title · SF Pro Semibold 15pt · blur backdrop</td><td>64dp Top App Bar · Headline 22sp · Surface Container</td></tr>
         <tr><td style="font-weight:600;">底部导航</td><td>Tab Bar 50pt+safe · ultraThinMaterial · SF Symbols filled/outlined</td><td>NavigationBar 80dp · pill active indicator · icon+label</td></tr>
@@ -1158,7 +1164,7 @@ main { max-width: 1200px; margin: 0 auto; padding: var(--sp-3xl) var(--sp-2xl); 
         <tr><td style="font-weight:600;">筛选标签</td><td>Capsule 填充 · accentColor 12% 底 + 描边</td><td>FilterChip · 未选中=outlined / 选中=PrimaryContainer 填充</td></tr>
         <tr><td style="font-weight:600;">动态卡片</td><td>18pt continuous · secondarySystemGroupedBackground · 微妙投影</td><td>12dp · Surface (Elevated level 1) · 阴影层级</td></tr>
         <tr><td style="font-weight:600;">视频卡片</td><td>18pt continuous · 图在上文字在下 · 占位 placeholder</td><td>12dp · Elevated · 缩略图+内边距标题</td></tr>
-        <tr><td style="font-weight:600;">开关</td><td>Toggle 48×28pt · 绿色 #34C759 (on)</td><td>Switch 52×32dp · Primary 色 track · thumb 带 icon</td></tr>
+        <tr><td style="font-weight:600;">开关</td><td>Toggle 51×31pt · 绿色 #34C759 (on)</td><td>Switch 52×32dp · Primary 色 track · thumb 带 icon</td></tr>
         <tr><td style="font-weight:600;">按钮</td><td>Bordered / BorderedProminent · 全圆角</td><td>Filled / Tonal / Outlined / Text · 40dp 高 · 全圆角</td></tr>
         <tr><td style="font-weight:600;">列表分组</td><td>Inset Grouped · 8pt 圆角 · 行间 0.5px separator</td><td>List + subhead · 12dp 独立卡片 · 2px 间距</td></tr>
         <tr><td style="font-weight:600;">高程表达</td><td>blur (材质) + 半透明叠加 · 无纯黑阴影</td><td>分层投影 + Surface Container 色阶 (lowest→highest)</td></tr>
@@ -1198,7 +1204,7 @@ document.querySelectorAll('.platform-tab').forEach(tab => {
 });
 
 const saved = localStorage.getItem('bf-platform');
-if (saved) {
+if (saved === 'ios' || saved === 'md3') {
   document.body.setAttribute('data-platform', saved);
   document.querySelectorAll('.platform-tab').forEach(t => t.classList.remove('active'));
   const a = document.querySelector(`[data-plat="${saved}"]`);
@@ -1266,8 +1272,6 @@ function renderSpaceScale() {
 
 // Section nav highlighting
 const secLinks = document.querySelectorAll('.section-nav a');
-new IntersectionObserver(entries => { entries.forEach(e => { if (e.isIntersecting) { secLinks.forEach(l => l.classList.remove('active')); const link = document.querySelector(`.section-nav a[href="#${e.target.id}"]`); if (link) link.classList.add('active'); }}); }, { threshold: 0.3 }).observe(document.querySelectorAll('.sec'));
-document.querySelectorAll('.sec').forEach(s => observer.observe(s)); // no-op line, IntersectionObserver already created
 
 // IntersectionObserver for sections
 const secObs = new IntersectionObserver(entries => {

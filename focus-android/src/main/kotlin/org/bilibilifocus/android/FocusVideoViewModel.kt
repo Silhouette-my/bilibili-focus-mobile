@@ -1,5 +1,6 @@
 package org.bilibilifocus.android
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -88,6 +89,8 @@ class FocusVideoViewModel(
                     is VideoInfoService.ServiceError.Api -> VideoUiState.Error("API错误 ${e.code}: ${e.message}")
                     VideoInfoService.ServiceError.InvalidResponse -> VideoUiState.Error("接口数据异常")
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 _state.value = VideoUiState.Error(e.message ?: "加载失败")
             }
@@ -173,6 +176,8 @@ class FocusVideoViewModel(
         danmakuViewJob = scope.launch {
             val view = try {
                 service.fetchDanmakuView(context.aid, context.cid)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (_: Exception) {
                 val total = if (context.durationMillis > 0) {
                     ((context.durationMillis + DEFAULT_DANMAKU_SEGMENT_MILLIS - 1) /
@@ -223,6 +228,8 @@ class FocusVideoViewModel(
                         .flatten()
                         .sortedWith(compareBy<VideoDanmaku> { it.progressMillis }.thenByDescending { it.weight }),
                 )
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (_: Exception) {
                 if (revision != danmakuRevision || context != danmakuContext) return@launch
                 if (danmakuSegmentCache.isEmpty()) {
@@ -278,6 +285,8 @@ class FocusVideoViewModel(
                 updateStats { stats ->
                     stats.copy(likes = (stats.likes + if (!current.liked) 1 else -1).coerceAtLeast(0))
                 }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (_: Exception) {
             }
         }
@@ -292,6 +301,8 @@ class FocusVideoViewModel(
                 actionService.coin(info.aid)
                 _interactionState.value = current.copy(coined = true, loading = false)
                 updateStats { stats -> stats.copy(coins = stats.coins + 1) }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (_: Exception) {
             }
         }
@@ -315,6 +326,8 @@ class FocusVideoViewModel(
                 updateStats { stats ->
                     stats.copy(favorites = (stats.favorites + if (!current.favorited) 1 else -1).coerceAtLeast(0))
                 }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (_: Exception) {
             }
         }
@@ -325,6 +338,8 @@ class FocusVideoViewModel(
             try {
                 val (comments, _) = service.fetchComments(oid)
                 _comments.value = comments
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (_: Exception) {
             }
         }
@@ -335,6 +350,8 @@ class FocusVideoViewModel(
             _interactionState.value = _interactionState.value.copy(loading = true)
             try {
                 _interactionState.value = actionService.fetchInteractionState(aid)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (_: Exception) {
                 _interactionState.value = _interactionState.value.copy(loading = false)
             }

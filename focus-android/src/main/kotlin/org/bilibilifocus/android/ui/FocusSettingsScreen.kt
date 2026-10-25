@@ -62,7 +62,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
-import org.bilibilifocus.android.AndroidCookieProvider
 import org.bilibilifocus.android.BuildConfig
 import org.bilibilifocus.android.FocusFollowingAuthorsViewModel
 import org.bilibilifocus.android.FocusSettingsViewModel
@@ -74,7 +73,6 @@ import org.bilibilifocus.core.model.FocusSettings
 import org.bilibilifocus.core.model.FocusThemeMode
 import org.bilibilifocus.core.service.FollowingAuthorsService
 import org.bilibilifocus.core.service.InMemoryNetworkEventSink
-import org.bilibilifocus.core.service.KtorHttpClient
 import org.bilibilifocus.core.service.LoginHealthService
 import org.bilibilifocus.android.ui.theme.focusAccentColor
 
@@ -91,6 +89,7 @@ private val AccentColorPresets = listOf(
 fun FocusSettingsScreen(
     settings: FocusSettings,
     knownAuthors: List<DynamicCard.Author>,
+    followingAuthorsService: FollowingAuthorsService,
     loginHealthService: LoginHealthService,
     networkEvents: InMemoryNetworkEventSink,
     onBack: () -> Unit,
@@ -101,12 +100,9 @@ fun FocusSettingsScreen(
 ) {
     var showAuthorSettings by remember { mutableStateOf(false) }
     var showDiagnostics by remember { mutableStateOf(false) }
-    val authorsViewModel = remember {
+    val authorsViewModel = remember(followingAuthorsService) {
         FocusFollowingAuthorsViewModel(
-            service = FollowingAuthorsService(
-                cookieProvider = AndroidCookieProvider(),
-                httpClient = KtorHttpClient(),
-            ),
+            service = followingAuthorsService,
             fallbackAuthors = knownAuthors,
         )
     }
@@ -293,7 +289,7 @@ private fun DynamicAuthorSettingsScreen(
     onSetAuthorKind: (DynamicCard.Author, FocusDynamicFilterKind, Boolean) -> Unit,
     authorKinds: (DynamicCard.Author) -> Set<FocusDynamicFilterKind>,
 ) {
-    LaunchedEffect(Unit) { viewModel.loadIfNeeded() }
+    LaunchedEffect(viewModel) { viewModel.loadIfNeeded() }
     val state by viewModel.state.collectAsState()
     var query by remember { mutableStateOf("") }
 

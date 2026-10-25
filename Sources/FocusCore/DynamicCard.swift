@@ -1,14 +1,14 @@
 import Foundation
 
-public struct DynamicCard: Identifiable, Equatable, Sendable {
-    public enum Kind: String, Equatable, Sendable {
+public struct DynamicCard: Identifiable, Equatable, Codable, Sendable {
+    public enum Kind: String, Equatable, Codable, Sendable {
         case text
         case image
         case video
         case articleLike
     }
 
-    public struct Author: Equatable, Sendable {
+    public struct Author: Equatable, Codable, Sendable {
         public let mid: Int64
         public let name: String
         public let avatarURL: URL?

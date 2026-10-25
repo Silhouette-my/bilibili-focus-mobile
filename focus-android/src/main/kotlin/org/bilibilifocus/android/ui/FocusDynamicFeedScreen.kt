@@ -69,19 +69,14 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.geometry.Size
 import coil.compose.AsyncImage
-import coil.compose.AsyncImagePainter
 import coil.compose.rememberAsyncImagePainter
 import coil.request.ImageRequest
-import org.bilibilifocus.android.AndroidCookieProvider
 import org.bilibilifocus.android.FocusFeedViewModel
 import org.bilibilifocus.android.FeedUiState
 import org.bilibilifocus.core.model.DynamicCard
 import org.bilibilifocus.core.model.FocusDynamicFilterKind
 import org.bilibilifocus.core.model.FocusSettings
-import org.bilibilifocus.core.service.DynamicFeedService
-import org.bilibilifocus.core.service.KtorHttpClient
 
 private val DynamicCoverCornerRadius = RoundedCornerShape(6.dp)
 
@@ -98,17 +93,17 @@ fun FocusDynamicFeedScreen(
     contentPadding: PaddingValues = PaddingValues(),
     settings: FocusSettings = FocusSettings.DEFAULTS,
 ) {
-    LaunchedEffect(Unit) {
+    LaunchedEffect(viewModel) {
         viewModel.loadIfNeeded()
     }
 
     val state by viewModel.state.collectAsState()
     val isLoadingMore by viewModel.isLoadingMore.collectAsState()
     val selectedFilter by viewModel.selectedFilter.collectAsState()
-    var isRefreshing by remember { mutableStateOf(false) }
+    var isRefreshing by remember(viewModel) { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     var searchQuery by remember { mutableStateOf("") }
-    var galleryRequest by remember { mutableStateOf<FocusImageGalleryRequest?>(null) }
+    var galleryRequest by remember(viewModel) { mutableStateOf<FocusImageGalleryRequest?>(null) }
     val showScrollTop by remember { derivedStateOf { listState.firstVisibleItemIndex > 3 } }
     val topContentPadding = contentPadding.calculateTopPadding()
     val pullToRefreshState = rememberPullToRefreshState()
@@ -212,11 +207,9 @@ fun FocusDynamicFeedScreen(
                 }
 
                 is FeedUiState.Loaded -> {
-                    val filteredCards = visibleCards(
-                        cards = s.cards,
-                        selectedFilter = selectedFilter,
-                        settings = settings,
-                    )
+                    val filteredCards = remember(s.cards, selectedFilter, settings) {
+                        visibleCards(s.cards, selectedFilter, settings)
+                    }
 
                     LaunchedEffect(s.cards.size, filteredCards.size, selectedFilter, settings) {
                         if (s.cards.isNotEmpty() && filteredCards.isEmpty()) {
@@ -631,23 +624,13 @@ private fun FocusSingleImageCover(url: String, modifier: Modifier = Modifier, on
             .crossfade(true)
             .build()
     )
-    val intrinsicSize = (painter.state as? AsyncImagePainter.State.Success)
-        ?.painter
-        ?.intrinsicSize
-    val ratio = normalizedIntrinsicRatio(intrinsicSize)
-    val widthFraction = when {
-        ratio >= 1.15f -> 1f
-        ratio >= 0.95f -> 0.82f
-        else -> 0.68f
-    }
-
     Image(
         painter = painter,
         contentDescription = null,
         modifier = modifier
             .clickable(onClick = onClick)
-            .fillMaxWidth(widthFraction)
-            .aspectRatio(ratio)
+            .fillMaxWidth()
+            .aspectRatio(4f / 3f)
             .clip(DynamicCoverCornerRadius)
             .background(MaterialTheme.colorScheme.surfaceVariant),
         contentScale = Fit,
@@ -678,13 +661,6 @@ private fun FocusCoverImage(
             ),
         contentScale = contentScale,
     )
-}
-
-private fun normalizedIntrinsicRatio(size: Size?): Float {
-    if (size == null || size.width <= 0f || size.height <= 0f) {
-        return 4f / 3f
-    }
-    return (size.width / size.height).coerceIn(0.75f, 2f)
 }
 
 @Composable

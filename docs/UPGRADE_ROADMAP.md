@@ -48,6 +48,7 @@
 - iOS 增加共享本地写入屏障，退出后立即重新进入同一视频时，续播读取一定发生在退出进度写入之后。
 - iOS 原生播放器完成字幕轨道发现、BCC 字幕加载、语言选择、开关与语言偏好持久化；切换分 P 时会按新 cid 重新加载字幕。
 - iOS 评论完成 opaque cursor 楼中楼分页、展开与去重，并支持账号绑定的评论点赞/取消点赞、乐观更新和失败回滚。
+- KMP iOS framework 已更名为静态 `FocusKMP` 并接入 Xcode 构建链；主页重定向 Router 成为首个生产切片，Swift adapter 保留一致性校验和安全回退。
 - 两端增加一致的登录健康状态，区分未登录、会话过期、缺少 CSRF、WBI/风控、网络不可用、健康和未知。
 - 增加二次脱敏的诊断快照；Debug 设置页可以查看并导出摘要，Release 不编译诊断入口、旧调试开关或 WebView 日志桥。
 - 增加显式 opt-in、只读的在线 API smoke；CI 只验证默认跳过路径，不保存账号 Cookie。
@@ -81,17 +82,17 @@
 
 验收标准：进程强杀后可续播；离线期间上报不丢；恢复网络后不重复写操作；切换账号不读取或提交另一账号的播放状态；诊断信息不含 Cookie、query、正文和用户关键词。
 
-### 下一步：KMP iOS 渐进接入（尚未完成）
+### 下一步：KMP iOS 渐进接入（Router 首切片已完成）
 
-当前 iOS 生产路径仍由 Swift `FocusCore` 提供。KMP iOS framework 已有编译与链接门禁，但其产物和 Xcode 原生 framework 目前都叫 `FocusCore`，不能直接共存。
+当前 iOS 仍以 Swift `FocusCore` 为主要生产实现，但静态 `FocusKMP` 已能与其共存并进入 App 运行路径。Xcode 在 Compile Sources 前构建 KMP framework，只在 App 链接阶段使用，不把静态 framework 误放进 Embed Frameworks。
 
-- 先将 KMP iOS framework 改名为 `FocusKMP`，保持静态链接；原生 Swift `FocusCore` 的模块名和现有调用保持不变。
-- 在 App target 的 Compile Sources 之前运行 Gradle Xcode framework 任务，只把 `FocusKMP.framework` 加入链接阶段，不加入 Embed Frameworks。
-- 首个生产切片只迁移同步、无网络的主页 `FocusRouter.redirectTarget`；由单独 Swift adapter 同时导入 `FocusCore` 与 `FocusKMP`，映射设置和路由结果，并用双实现 fixture 做一致性测试。
-- Router 稳定后再迁移网络服务。迁移前必须先补齐 Kotlin 异常到 Swift `Error` 的安全边界、Cookie provider adapter、静态 framework 资源装载和 KMP DTO 到 Swift `Sendable` 领域模型的映射。
-- 每个 feature 独立切换和回归；SwiftUI 不直接持有 Kotlin DTO，未迁移的功能继续使用 Swift `FocusCore`。不要把现有 KMP 编译门禁描述为已经完成 iOS 运行时接入。
+- 主页 `FocusRouter.redirectTarget` 已迁移到 KMP；Swift adapter 只桥接布尔开关、默认入口和规范化 URL，不让 SwiftUI 直接持有 Kotlin DTO。
+- 双实现 fixture 覆盖主页域名、入口开关、端口、userinfo、query/fragment 和非主页路径；未知 KMP 枚举或语义不一致时回退 Swift 基线。
+- 原生 Swift `FocusNavigationPolicy` 暂不迁移，避免在尾斜杠、端口和 query 过滤语义完全对齐前扩大切片。
+- 下一步迁移网络服务前，必须先补齐 Kotlin 异常到 Swift `Error` 的安全边界、Cookie provider adapter、静态 framework 资源装载和 KMP DTO 到 Swift `Sendable` 领域模型的映射。
+- 每个 feature 独立切换和回归；未迁移的功能继续使用 Swift `FocusCore`。
 
-验收标准：Simulator 与真机架构均能链接两个不同模块；首个 Router 切片与 Swift 结果完全一致；App 不出现重复 framework、重复符号或静态 framework 误嵌入；网络迁移前任何 Kotlin 业务异常都不会在 Swift 侧触发 fatal。
+当前验收：Simulator 与 arm64 device 架构均能链接两个不同模块；Router fixture 与 Swift 结果一致；App 产物不嵌入 `FocusKMP.framework`，也不产生动态依赖。后续网络切片仍需保证任何 Kotlin 业务异常都不会在 Swift 侧触发 fatal。
 
 ### 16–20 周：视频与评论能力
 
@@ -105,11 +106,12 @@
 
 ### 20–28 周：离线只读与性能
 
-- 将 feed、history、watch later、favorite 元数据从内存缓存升级为账号隔离的持久缓存。
+- iOS feed 已有账号隔离的持久快照（最多 3 个账号、每账号 300 条、7 天和 8 MiB 总量），并已有分阶段性能诊断与有界图片预取。实现和离线验证见 [性能基础](PERFORMANCE_FOUNDATION.md)、[后续优化](PERFORMANCE_FOLLOWUP.md)；动态返回的后续布局修复见 [专项记录](DYNAMIC_SCROLL_RETURN_FIX.md)。这些历史合成结果不替代真机性能测量。
+- 下一步评估 Android feed，以及两端 history、watch later、favorite 元数据的账号隔离持久缓存。
 - 评估 SQLDelight 作为 KMP 数据层；iOS 在迁移完成前保持 repository protocol，避免 UI 直接依赖具体数据库。
 - 增加封面磁盘预算、LRU 清理、列表预取上限和低数据模式。
 - 支持最近观看、稍后再看与收藏的离线只读；恢复网络后按 generation 刷新。
-- 建立启动、首屏、滚动和播放器首帧基准，防止功能增长带来持续回退。
+- 在现有阶段诊断与合成回归上补充真机启动、首屏、滚动和播放器首帧基准，防止功能增长带来持续回退。
 
 验收标准：无网可打开最近数据；不同账号缓存不串线；存储和图片都有明确容量上限；关键性能指标进入自动化基线。
 

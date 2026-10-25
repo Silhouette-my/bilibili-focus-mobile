@@ -7,7 +7,7 @@ import org.bilibilifocus.core.model.PlayUrlResult
 
 /**
  * 取视频 DASH 流地址，供 ExoPlayer 播放。基于 x/player/wbi/playurl（需 WBI 签名）。
- * 优先选 AVC(H.264, codecid=7) 视频轨以保证设备/模拟器兼容；音频取最高码率。
+ * 优先选 AVC(H.264, codecid=7) 视频轨以保证设备/模拟器兼容；音频取接口返回的首轨。
  * 流地址下载时必须带 Referer + User-Agent。
  */
 class PlayUrlService(

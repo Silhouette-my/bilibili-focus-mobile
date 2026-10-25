@@ -1,15 +1,34 @@
 package org.bilibilifocus.core.service
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.test.runTest
 import org.bilibilifocus.core.cookie.Cookie
 import org.bilibilifocus.core.cookie.CookieProvider
 import org.bilibilifocus.core.model.CommentCursor
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class VideoInfoServiceTests {
+    @Test
+    fun `optional player metadata and comments preserve request cancellation`() = runTest {
+        val http = object : HttpClient {
+            override suspend fun get(url: String, headers: Map<String, String>): HttpResponse = when {
+                "/x/web-interface/view" in url -> HttpResponse(200, VIDEO_DETAIL)
+                "/x/web-interface/nav" in url -> HttpResponse(200, NAV_RESPONSE)
+                else -> throw CancellationException("request cancelled")
+            }
+
+            override suspend fun post(url: String, body: String, headers: Map<String, String>): HttpResponse =
+                error("Unexpected POST")
+        }
+        assertFailsWith<CancellationException> { service(http).fetchVideoInfo("BV1TEST00001") }
+        assertFailsWith<CancellationException> { service(http).fetchPlayerUrl("BV1TEST00001", 101) }
+        assertFailsWith<CancellationException> { service(http).fetchCommentPage(42) }
+    }
+
     @Test
     fun `video detail includes server playback progress`() = runTest {
         val http = FixtureHttpClient(
@@ -50,6 +69,17 @@ class VideoInfoServiceTests {
         )
 
         assertEquals(1, page.comments.size)
+        val mainComment = page.comments.single()
+        assertEquals("测试评论", mainComment.content)
+        assertEquals("测试评论", (mainComment.contentRuns.single() as org.bilibilifocus.core.model.RichTextRun.Text).text)
+        assertEquals(
+            listOf("https://i0.hdslb.com/main.jpg", "https://i0.hdslb.com/second.jpg"),
+            mainComment.imageURLs,
+        )
+        val imageOnlyReply = mainComment.replies.single()
+        assertEquals("", imageOnlyReply.content)
+        assertTrue(imageOnlyReply.contentRuns.isEmpty())
+        assertEquals(listOf("https://i0.hdslb.com/reply.jpg"), imageOnlyReply.imageURLs)
         assertEquals(3_000_000_000L, page.totalCount)
         assertEquals("next-opaque-token", page.cursor.nextOffset)
         val commentUrl = http.requestedUrls.first { "/x/v2/reply/wbi/main" in it }
@@ -113,11 +143,29 @@ class VideoInfoServiceTests {
                           "rpid":3547000000000001,
                           "mid":3547000000000002,
                           "member":{"uname":"测试用户","avatar":"https://i0.hdslb.com/a.jpg"},
-                          "content":{"message":"测试评论"},
+                          "content":{
+                            "message":"测试评论",
+                            "pictures":[
+                              {"img_src":"http://i0.hdslb.com/main.jpg","img_width":640,"img_height":480,"img_size":10,"play_gif_thumbnail":false,"top_right_icon":""},
+                              {"img_src":"//i0.hdslb.com/second.jpg","img_width":320,"img_height":240}
+                            ]
+                          },
                           "like":3000000001,
                           "rcount":2,
                           "ctime":1700000000,
-                          "replies":[]
+                          "replies":[{
+                            "rpid":3547000000000003,
+                            "mid":3547000000000004,
+                            "member":{"uname":"图片回复","avatar":""},
+                            "content":{"message":"","pictures":[
+                              {"img_src":"//i0.hdslb.com/reply.jpg"},
+                              {"img_src":"javascript:alert(1)"},
+                              {"img_src":"data:image/png;base64,AA"},
+                              {"img_src":"https://"},
+                              {"img_src":"//"}
+                            ]},
+                            "like":0,"rcount":0,"ctime":1700000001,"replies":[]
+                          }]
                         }]
                       }
                     }

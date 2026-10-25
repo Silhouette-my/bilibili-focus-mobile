@@ -41,7 +41,7 @@ private const val DANMAKU_DISPLAY_MILLIS = 5_000L
 internal fun VideoDanmakuOverlay(
     state: VideoDanmakuUiState,
     enabled: Boolean,
-    playbackPositionMillis: Long,
+    playbackPositionMillis: () -> Long,
     modifier: Modifier = Modifier,
 ) {
     if (!enabled || state.danmakus.isEmpty()) return
@@ -79,12 +79,15 @@ internal fun VideoDanmakuOverlay(
                 PreparedDanmaku(danmaku, lane, layout)
             }
         }
+        val progressTimes = remember(prepared) {
+            LongArray(prepared.size) { prepared[it].danmaku.progressMillis }
+        }
 
         Canvas(modifier = Modifier.fillMaxSize()) {
-            val time = playbackPositionMillis
-            prepared.forEach { preparedDanmaku ->
+            val time = playbackPositionMillis()
+            for (index in activeDanmakuRange(progressTimes, time)) {
+                val preparedDanmaku = prepared[index]
                 val elapsed = time - preparedDanmaku.danmaku.progressMillis
-                if (elapsed !in 0L until DANMAKU_DISPLAY_MILLIS) return@forEach
                 val textWidth = preparedDanmaku.layout.size.width.toFloat()
                 val x = when (preparedDanmaku.danmaku.mode) {
                     VideoDanmakuMode.SCROLLING -> {
@@ -104,6 +107,24 @@ internal fun VideoDanmakuOverlay(
             }
         }
     }
+}
+
+/** Input follows the view model's ascending progress order; seeks need no retained cursor. */
+internal fun activeDanmakuRange(progressTimes: LongArray, positionMillis: Long): IntRange {
+    fun insertionIndex(target: Long, afterEqual: Boolean): Int {
+        var low = 0
+        var high = progressTimes.size
+        while (low < high) {
+            val middle = low + (high - low) / 2
+            val progress = progressTimes[middle]
+            if (progress < target || (afterEqual && progress == target)) low = middle + 1
+            else high = middle
+        }
+        return low
+    }
+    val start = insertionIndex((positionMillis - DANMAKU_DISPLAY_MILLIS + 1).coerceAtLeast(0), false)
+    val end = insertionIndex(positionMillis, true)
+    return start until end
 }
 
 @Composable

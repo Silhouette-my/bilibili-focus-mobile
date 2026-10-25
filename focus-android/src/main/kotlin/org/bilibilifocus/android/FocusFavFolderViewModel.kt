@@ -1,5 +1,6 @@
 package org.bilibilifocus.android
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -37,6 +38,8 @@ class FocusFavFolderViewModel(
                 val items = service.fetchFolderContents(mediaId)
                 loadedMediaId = mediaId
                 _state.value = FavFolderUiState.Loaded(items)
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 _state.value = FavFolderUiState.Failed(e.message ?: "加载失败")
             }

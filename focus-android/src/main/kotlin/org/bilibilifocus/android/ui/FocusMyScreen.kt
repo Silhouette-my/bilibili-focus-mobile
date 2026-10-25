@@ -62,7 +62,7 @@ fun FocusMyScreen(
     onOpenFolder: (FavFolder) -> Unit = {},
     contentPadding: PaddingValues = PaddingValues(),
 ) {
-    LaunchedEffect(Unit) { viewModel.loadIfNeeded() }
+    LaunchedEffect(viewModel) { viewModel.loadIfNeeded() }
 
     val state by viewModel.state.collectAsState()
     val watchLaterState by watchLaterViewModel.state.collectAsState()
@@ -219,7 +219,7 @@ fun FocusMyScreen(
                                     items = previewItems,
                                     columns = previewColumns,
                                     onOpenVideo = { item ->
-                                        onOpenVideo("https://www.bilibili.com/video/${item.bvid}")
+                                        onOpenVideo(historyItemVideoURL(item))
                                     },
                                 )
                             }

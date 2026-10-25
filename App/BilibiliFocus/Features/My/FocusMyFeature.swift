@@ -6,7 +6,7 @@ import Foundation
 import SwiftUI
 import UIKit
 
-struct FocusMyProfile {
+struct FocusMyProfile: Sendable {
     let mid: Int64
     let name: String
     let avatarURL: URL?
@@ -15,7 +15,7 @@ struct FocusMyProfile {
     let followers: Int64
 }
 
-struct FocusMyHistoryItem: Identifiable {
+struct FocusMyHistoryItem: Identifiable, Sendable {
     let id: String
     let title: String
     let coverURL: URL?
@@ -33,7 +33,7 @@ struct FocusMyHistoryItem: Identifiable {
     }
 }
 
-struct FocusMyFolder: Identifiable {
+struct FocusMyFolder: Identifiable, Sendable {
     let id: Int64
     let title: String
     let mediaCount: Int
@@ -41,14 +41,14 @@ struct FocusMyFolder: Identifiable {
     let previews: [FocusMyFavoriteItem]
 }
 
-struct FocusMyPage {
+struct FocusMyPage: Sendable {
     let profile: FocusMyProfile
     let history: [FocusMyHistoryItem]
     let folders: [FocusMyFolder]
     let watchLater: [FocusWatchLaterItem]
 }
 
-struct FocusMyFavoriteItem: Identifiable {
+struct FocusMyFavoriteItem: Identifiable, Sendable {
     let id: String
     let title: String
     let coverURL: URL?
@@ -283,38 +283,37 @@ private enum FocusMyServiceError: Error {
 }
 
 final class FocusMyDataService: @unchecked Sendable {
-    private let cookieProvider: WebViewCookieSnapshotProvider
-    private let session: URLSession
+    private let cookieProvider: any CookieSnapshotProvider
 
-    init(cookieProvider: WebViewCookieSnapshotProvider) {
+    var sessionVersion: UInt64 { cookieProvider.sessionVersion }
+    var sessionReadiness: CookieSessionReadiness { cookieProvider.sessionReadiness }
+
+    func prepareSessionVersion() async -> UInt64 {
+        await cookieProvider.loadSnapshot().version
+    }
+    private let requestLoader: FocusWatchLaterService.RequestLoader
+
+    init(
+        cookieProvider: any CookieSnapshotProvider,
+        requestLoader: FocusWatchLaterService.RequestLoader? = nil
+    ) {
         self.cookieProvider = cookieProvider
-        let configuration = URLSessionConfiguration.default
-        configuration.timeoutIntervalForRequest = 16
-        configuration.timeoutIntervalForResource = 24
-        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
-        session = URLSession(configuration: configuration)
+        self.requestLoader = requestLoader ?? { request in try await BiliAPINetwork.data(for: request) }
     }
 
     func resolveLoggedInNavData() async throws -> [String: Any] {
-        for delay in [0 as UInt64, 220_000_000, 520_000_000, 950_000_000] {
-            if delay > 0 {
-                try? await Task.sleep(nanoseconds: delay)
-            }
-
-            _ = await cookieProvider.refreshSnapshotIfNeeded()
-            let nav = try await requestObject(
-                urlString: "https://api.bilibili.com/x/web-interface/nav",
-                referer: "https://www.bilibili.com/"
-            )
-            let code = nav.intValue(at: "code") ?? -1
-            let data = nav.dictionaryValue(at: "data")
-            let isLogin = code == 0 && (data?.boolValue(at: "isLogin") ?? false)
-            if isLogin, let data {
-                return data
-            }
+        // Restoration is shared by the provider, not retried by each page.
+        let nav = try await requestObject(
+            urlString: "https://api.bilibili.com/x/web-interface/nav",
+            referer: "https://www.bilibili.com/"
+        )
+        let code = nav.intValue(at: "code") ?? -1
+        if code == -101 { throw FocusMyServiceError.loginRequired }
+        guard code == 0, let data = nav.dictionaryValue(at: "data") else {
+            throw FocusMyServiceError.message(nav.stringValue(at: "message") ?? "账号资料暂时不可用")
         }
-
-        throw FocusMyServiceError.loginRequired
+        guard data.boolValue(at: "isLogin") == true else { throw FocusMyServiceError.loginRequired }
+        return data
     }
 
     func fetchRelation(mid: Int64) async throws -> (following: Int64, followers: Int64) {
@@ -322,6 +321,13 @@ final class FocusMyDataService: @unchecked Sendable {
             urlString: "https://api.bilibili.com/x/relation/stat?vmid=\(mid)",
             referer: "https://space.bilibili.com/\(mid)"
         )
+        let code = relation.intValue(at: "code") ?? -1
+        if code == -101 {
+            throw FocusMyServiceError.loginRequired
+        }
+        guard code == 0 else {
+            throw FocusMyServiceError.message(relation.stringValue(at: "message") ?? "关注数据加载失败")
+        }
         return (
             relation.int64Value(at: "data", "following") ?? 0,
             relation.int64Value(at: "data", "follower") ?? 0
@@ -412,13 +418,12 @@ final class FocusMyDataService: @unchecked Sendable {
             guard let id = folder.int64Value(at: "id") else {
                 continue
             }
-            let previews = (try? await fetchFolderContents(mediaID: id, page: 1, pageSize: 6)) ?? []
             folders.append(FocusMyFolder(
                 id: id,
                 title: folder.stringValue(at: "title") ?? "",
                 mediaCount: folder.intValue(at: "media_count") ?? 0,
                 coverURL: URL(string: Self.normalizedURLString(folder.stringValue(at: "cover")) ?? ""),
-                previews: previews
+                previews: []
             ))
         }
         return folders
@@ -478,14 +483,24 @@ final class FocusMyDataService: @unchecked Sendable {
         var request = URLRequest(url: url)
         request.timeoutInterval = 18
         request.httpMethod = "GET"
+        request.httpShouldHandleCookies = false
         request.setValue(FocusNativePageAugmentService.userAgent, forHTTPHeaderField: "User-Agent")
         request.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
         request.setValue(referer, forHTTPHeaderField: "Referer")
 
-        let cookies = await cookieProvider.loadCookies()
-        request = CookieRequestPolicy.attach(cookies: cookies, to: request)
+        let snapshot = await cookieProvider.loadSnapshot()
+        let version = snapshot.version
+        guard version == cookieProvider.sessionVersion else { throw CancellationError() }
+        if snapshot.readiness == .expired { throw FocusMyServiceError.loginRequired }
+        if snapshot.cookies.isEmpty && (snapshot.readiness == .restoring || snapshot.readiness == .unconfirmed) {
+            throw URLError(.resourceUnavailable)
+        }
+        request = CookieRequestPolicy.attach(cookies: snapshot.cookies, to: request)
 
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await requestLoader(request)
+        try Task.checkCancellation()
+        guard version == cookieProvider.sessionVersion else { throw CancellationError() }
+        if (response as? HTTPURLResponse)?.statusCode == 401 { throw FocusMyServiceError.loginRequired }
         guard let httpResponse = response as? HTTPURLResponse, (200 ... 299).contains(httpResponse.statusCode) else {
             throw FocusMyServiceError.message("网络请求失败")
         }
@@ -652,44 +667,6 @@ final class FocusMyDataService: @unchecked Sendable {
         }
         flush()
         return blocks
-    }
-
-    private static func parseLegacyArticleHTML(_ source: String) -> [FocusArticleBlock] {
-        let normalized = source
-            .replacingOccurrences(of: #"(?is)<(script|style)[^>]*>.*?</\1>"#, with: "", options: .regularExpression)
-            .replacingOccurrences(of: #"(?i)<br\s*/?>"#, with: "\n", options: .regularExpression)
-            .replacingOccurrences(of: #"(?i)</(p|div|h[1-6]|blockquote|li|ul|ol|pre)>"#, with: "\n\n", options: .regularExpression)
-        let tokenized = normalized.replacingOccurrences(
-            of: #"(?i)<img[^>]+(?:data-src|data-original|src)=[\"']([^\"']+)[\"'][^>]*>"#,
-            with: "\n\n[[FOCUS_IMAGE::$1]]\n\n",
-            options: .regularExpression
-        )
-        return tokenized.components(separatedBy: "\n\n").compactMap { rawSegment in
-            let segment = rawSegment.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !segment.isEmpty else { return nil }
-            if segment.hasPrefix("[[FOCUS_IMAGE::"), segment.hasSuffix("]]") {
-                let rawURL = String(segment.dropFirst("[[FOCUS_IMAGE::".count).dropLast(2))
-                guard let url = normalizedArticleURL(rawURL) else { return nil }
-                return .image(url: url, width: 0, height: 0, caption: "")
-            }
-            let text = cleanText(segment)
-            guard !text.isEmpty else { return nil }
-            let runs: [FocusRichTextRun] = [.text(
-                value: text,
-                bold: segment.range(of: #"(?i)<(strong|b)"#, options: .regularExpression) != nil,
-                italic: segment.range(of: #"(?i)<(em|i)"#, options: .regularExpression) != nil,
-                strikethrough: segment.range(of: #"(?i)<(del|s)"#, options: .regularExpression) != nil
-            )]
-            if let match = segment.range(of: #"(?i)<h[1-6]"#, options: .regularExpression),
-               let level = String(segment[match]).last?.wholeNumberValue
-            {
-                return .heading(runs, level: level)
-            }
-            if segment.range(of: #"(?i)<blockquote"#, options: .regularExpression) != nil { return .quote(runs) }
-            if segment.range(of: #"(?i)<li"#, options: .regularExpression) != nil { return .list(ordered: false, items: [runs]) }
-            if segment.range(of: #"(?i)<pre"#, options: .regularExpression) != nil { return .code(language: "", content: text) }
-            return .paragraph(runs, alignment: .leading)
-        }
     }
 
     private static func parseStructuredArticleHTML(_ source: String) -> [FocusArticleBlock] {
@@ -1119,14 +1096,43 @@ final class FocusMyViewModel: ObservableObject {
         case loaded(FocusMyPage)
     }
 
+    enum Section: String, CaseIterable, Sendable {
+        case relation, history, folders, previews, watchLater
+
+        var title: String {
+            switch self {
+            case .relation: return "关注与粉丝"
+            case .history: return "播放历史"
+            case .folders: return "收藏夹"
+            case .previews: return "收藏夹预览"
+            case .watchLater: return "稍后再看"
+            }
+        }
+    }
+
+    enum SectionState: Equatable {
+        case loading, loaded, failed(String)
+    }
+
     @Published private(set) var state: State = .idle
+    @Published private(set) var isRefreshing = false
+    @Published private(set) var refreshErrorMessage: String?
+    @Published private(set) var sectionStates: [Section: SectionState] = [:]
+    @Published private(set) var previewErrors: [Int64: String] = [:]
     @Published private(set) var watchLaterActionsInFlight: Set<Int64> = []
     @Published var actionErrorMessage: String?
 
     private let service: FocusMyDataService
     private let watchLaterService: FocusWatchLaterService
     private var task: Task<Void, Never>?
+    private var generation = UUID()
+    private var loadedSessionVersion: UInt64?
+    private var requestSessionVersion: UInt64?
+    private var sectionTasks: [Section: Task<Void, Never>] = [:]
     private var watchLaterActionTasks: [Int64: Task<Void, Never>] = [:]
+
+    static let previewFolderLimit = 6
+    static let previewConcurrency = 2
 
     init(
         service: FocusMyDataService,
@@ -1142,32 +1148,60 @@ final class FocusMyViewModel: ObservableObject {
     }
 
     func suspend() {
+        generation = UUID()
         task?.cancel()
         task = nil
+        sectionTasks.values.forEach { $0.cancel() }
+        sectionTasks.removeAll()
         watchLaterActionTasks.values.forEach { $0.cancel() }
         watchLaterActionTasks.removeAll()
         watchLaterActionsInFlight.removeAll()
-        if case .loading = state {
-            state = .idle
+        isRefreshing = false
+        if case .loading = state { state = .idle }
+    }
+
+    func resetForSessionChange() {
+        suspend()
+        state = .idle
+        loadedSessionVersion = nil
+        sectionStates.removeAll()
+        previewErrors.removeAll()
+        refreshErrorMessage = nil
+        actionErrorMessage = nil
+    }
+
+    func reconcileSessionVersion(_ version: UInt64) {
+        // The shared coordinator calls this only after confirming unchanged
+        // credentials, never while a cookie read is merely uncertain.
+        guard version == service.sessionVersion else { return }
+        if page != nil { loadedSessionVersion = version }
+        let hasActiveWork = task != nil || (!sectionTasks.isEmpty && sectionStates.values.contains(.loading))
+        if hasActiveWork, requestSessionVersion != version {
+            reload()
+        } else if case .loading = state, task == nil {
+            reload()
         }
     }
 
     func removeFromWatchLater(aid: Int64) {
-        guard aid > 0, watchLaterActionsInFlight.insert(aid).inserted else {
+        guard case .loaded = state, loadedSessionVersion == service.sessionVersion,
+              aid > 0, watchLaterActionsInFlight.insert(aid).inserted else {
             return
         }
         actionErrorMessage = nil
+        let actionGeneration = generation
+        let actionVersion = service.sessionVersion
         let actionTask = Task { [weak self] in
-            guard let self else {
-                return
-            }
+            guard let self else { return }
             defer {
-                watchLaterActionsInFlight.remove(aid)
-                watchLaterActionTasks[aid] = nil
+                if generation == actionGeneration {
+                    watchLaterActionsInFlight.remove(aid)
+                    watchLaterActionTasks[aid] = nil
+                }
             }
             do {
                 try await watchLaterService.remove(aid: aid)
-                guard !Task.isCancelled, case let .loaded(page) = state else {
+                guard isCurrent(actionGeneration, version: actionVersion), case let .loaded(page) = state else {
                     return
                 }
                 state = .loaded(
@@ -1181,6 +1215,7 @@ final class FocusMyViewModel: ObservableObject {
             } catch is CancellationError {
                 return
             } catch {
+                guard isCurrent(actionGeneration, version: actionVersion) else { return }
                 actionErrorMessage = error.localizedDescription
             }
         }
@@ -1203,69 +1238,235 @@ final class FocusMyViewModel: ObservableObject {
     }
 
     func refreshForAppearance() {
+        if loadedSessionVersion != nil && loadedSessionVersion != service.sessionVersion,
+           service.sessionReadiness == .expired || service.sessionReadiness == .anonymous {
+            resetForSessionChange()
+        }
         switch state {
-        case .idle, .loginRequired, .failed:
-            reload()
-        case .loading, .loaded:
-            break
+        case .idle, .loginRequired, .failed: reload()
+        case .loaded:
+            if task == nil && sectionStates.values.contains(.loading) { reload() }
+        case .loading: break
         }
     }
 
     func reload() {
-        task?.cancel()
-        task = Task { [weak self] in
-            await self?.performLoad()
+        suspend()
+        requestSessionVersion = service.sessionVersion
+        let requestID = generation
+        task = Task { [weak self] in await self?.performLoad(requestID: requestID) }
+    }
+
+    func refresh() async {
+        reload()
+        await task?.value
+    }
+
+    func retrySection(_ section: Section) {
+        guard case .loaded = state, sectionStates[section] != .loading,
+              let version = loadedSessionVersion, version == service.sessionVersion else { return }
+        let requestID = generation
+        sectionStates[section] = .loading
+        sectionTasks[section]?.cancel()
+        sectionTasks[section] = Task { [weak self] in
+            await self?.loadSection(section, requestID: requestID, version: version)
         }
     }
 
-    private func performLoad() async {
-        state = .loading
+    private func isCurrent(_ requestID: UUID, version: UInt64) -> Bool {
+        !Task.isCancelled && generation == requestID && service.sessionVersion == version
+    }
 
+    private var page: FocusMyPage? {
+        guard case let .loaded(page) = state else { return nil }
+        return page
+    }
+
+    private func updatePage(
+        profile: FocusMyProfile? = nil,
+        history: [FocusMyHistoryItem]? = nil,
+        folders: [FocusMyFolder]? = nil,
+        watchLater: [FocusWatchLaterItem]? = nil
+    ) {
+        guard let page else { return }
+        state = .loaded(FocusMyPage(
+            profile: profile ?? page.profile, history: history ?? page.history,
+            folders: folders ?? page.folders, watchLater: watchLater ?? page.watchLater
+        ))
+    }
+
+    private func expireSession() {
+        suspend()
+        loadedSessionVersion = nil
+        sectionStates.removeAll()
+        previewErrors.removeAll()
+        state = .loginRequired
+    }
+
+    private func displayError(_ error: Error) -> String {
+        if case let FocusMyServiceError.message(message) = error { return message }
+        return error.localizedDescription
+    }
+
+    private func performLoad(requestID: UUID) async {
+        if loadedSessionVersion != nil && loadedSessionVersion != service.sessionVersion,
+           service.sessionReadiness == .expired || service.sessionReadiness == .anonymous {
+            state = .idle
+        }
+        isRefreshing = page != nil
+        refreshErrorMessage = nil
+        if page == nil { state = .loading }
+        defer {
+            if generation == requestID { isRefreshing = false; task = nil }
+        }
+        let version = await service.prepareSessionVersion()
+        guard isCurrent(requestID, version: version) else { return }
+        let span = BiliPerformanceStore.shared.begin(.myProfile, correlationID: requestID)
         do {
-            let page = try await fetchPage()
-            guard !Task.isCancelled else {
+            let data = try await service.resolveLoggedInNavData()
+            guard isCurrent(requestID, version: version) else {
+                BiliPerformanceStore.shared.end(span, outcome: .stale)
                 return
             }
-            state = .loaded(page)
-        } catch let error as FocusMyServiceError {
-            guard !Task.isCancelled else {
-                return
-            }
-            switch error {
-            case .loginRequired:
-                state = .loginRequired
-            case let .message(message):
-                state = .failed(message)
-            }
-        } catch {
-            guard !Task.isCancelled else {
-                return
-            }
-            state = .failed(error.localizedDescription)
-        }
-    }
-
-    private func fetchPage() async throws -> FocusMyPage {
-        let data = try await service.resolveLoggedInNavData()
-        let mid = data.int64Value(at: "mid") ?? 0
-        let relation = (try? await service.fetchRelation(mid: mid)) ?? (following: 0, followers: 0)
-        let history = (try? await service.fetchHistoryPage(pageSize: 12))?.items ?? []
-        let folders = (try? await service.fetchFolders(mid: mid)) ?? []
-        let watchLater = (try? await watchLaterService.fetchList())?.items ?? []
-
-        return FocusMyPage(
-            profile: FocusMyProfile(
-                mid: mid,
-                name: data.stringValue(at: "uname") ?? "",
+            let mid = data.int64Value(at: "mid") ?? 0
+            let previous = page?.profile.mid == mid ? page : nil
+            let profile = FocusMyProfile(
+                mid: mid, name: data.stringValue(at: "uname") ?? "",
                 avatarURL: URL(string: FocusMyDataService.normalizedURLString(data.stringValue(at: "face")) ?? ""),
                 level: data.intValue(at: "level_info", "current_level") ?? 0,
-                following: relation.following,
-                followers: relation.followers
-            ),
-            history: history,
-            folders: folders,
-            watchLater: watchLater
-        )
+                following: previous?.profile.following ?? 0,
+                followers: previous?.profile.followers ?? 0
+            )
+            loadedSessionVersion = version
+            sectionStates = Dictionary(uniqueKeysWithValues: Section.allCases.map { ($0, .loading) })
+            previewErrors.removeAll()
+            state = .loaded(FocusMyPage(
+                profile: profile, history: previous?.history ?? [],
+                folders: previous?.folders ?? [], watchLater: previous?.watchLater ?? []
+            ))
+            BiliPerformanceStore.shared.end(span)
+            // Each branch publishes on completion; none is on the basic-profile path.
+            async let relation: Void = loadSection(.relation, requestID: requestID, version: version)
+            async let history: Void = loadSection(.history, requestID: requestID, version: version)
+            async let folders: Void = loadSection(.folders, requestID: requestID, version: version)
+            async let watchLater: Void = loadSection(.watchLater, requestID: requestID, version: version)
+            _ = await (relation, history, folders, watchLater)
+        } catch {
+            BiliPerformanceStore.shared.end(span, outcome: error is CancellationError ? .cancelled : .failure)
+            guard isCurrent(requestID, version: version) else { return }
+            if case FocusMyServiceError.loginRequired = error { expireSession() }
+            else if page != nil { refreshErrorMessage = displayError(error) }
+            else { state = .failed(displayError(error)) }
+        }
+    }
+
+    private func loadSection(_ section: Section, requestID: UUID, version: UInt64) async {
+        guard isCurrent(requestID, version: version), let currentPage = page else { return }
+        if section == .previews {
+            await loadPreviews(requestID: requestID, version: version)
+            return
+        }
+        let stage: BiliPerformanceStage
+        switch section {
+        case .relation: stage = .myFollowing
+        case .history: stage = .myHistory
+        case .folders: stage = .myFavorites
+        case .watchLater: stage = .myWatchLater
+        case .previews: stage = .favoritePreviews
+        }
+        let span = BiliPerformanceStore.shared.begin(stage, correlationID: requestID)
+        do {
+            switch section {
+            case .relation:
+                let relation = try await service.fetchRelation(mid: currentPage.profile.mid)
+                guard isCurrent(requestID, version: version) else { throw CancellationError() }
+                let profile = currentPage.profile
+                updatePage(profile: FocusMyProfile(
+                    mid: profile.mid, name: profile.name, avatarURL: profile.avatarURL,
+                    level: profile.level, following: relation.following, followers: relation.followers
+                ))
+            case .history:
+                let history = try await service.fetchHistoryPage(pageSize: 12).items
+                guard isCurrent(requestID, version: version) else { throw CancellationError() }
+                updatePage(history: history)
+            case .folders:
+                let folders = try await service.fetchFolders(mid: currentPage.profile.mid)
+                guard isCurrent(requestID, version: version) else { throw CancellationError() }
+                let previousPreviews = Dictionary(uniqueKeysWithValues: currentPage.folders.map { ($0.id, $0.previews) })
+                updatePage(folders: folders.map { folder in
+                    FocusMyFolder(id: folder.id, title: folder.title, mediaCount: folder.mediaCount,
+                                  coverURL: folder.coverURL, previews: previousPreviews[folder.id] ?? [])
+                })
+            case .watchLater:
+                let items = try await watchLaterService.fetchList().items
+                guard isCurrent(requestID, version: version) else { throw CancellationError() }
+                updatePage(watchLater: items)
+            case .previews: break
+            }
+            sectionStates[section] = .loaded
+            BiliPerformanceStore.shared.end(span)
+            if section == .folders {
+                await loadPreviews(requestID: requestID, version: version)
+            }
+        } catch {
+            BiliPerformanceStore.shared.end(span, outcome: error is CancellationError ? .cancelled : .failure)
+            guard isCurrent(requestID, version: version) else { return }
+            if case FocusMyServiceError.loginRequired = error { expireSession(); return }
+            if case FocusWatchLaterService.ServiceError.loginRequired = error { expireSession(); return }
+            sectionStates[section] = .failed(displayError(error))
+            if section == .folders { sectionStates[.previews] = .failed("请先重试收藏夹列表") }
+        }
+    }
+
+    private enum PreviewResult: Sendable {
+        case value(Int64, [FocusMyFavoriteItem]), failure(Int64, String), expired, cancelled
+    }
+
+    private nonisolated static func preview(service: FocusMyDataService, id: Int64) async -> PreviewResult {
+        do { return .value(id, try await service.fetchFolderContents(mediaID: id, pageSize: 3)) }
+        catch is CancellationError { return .cancelled }
+        catch FocusMyServiceError.loginRequired { return .expired }
+        catch { return .failure(id, error.localizedDescription) }
+    }
+
+    private func loadPreviews(requestID: UUID, version: UInt64) async {
+        guard isCurrent(requestID, version: version), let page else { return }
+        let folders = Array(page.folders.prefix(Self.previewFolderLimit))
+        let span = BiliPerformanceStore.shared.begin(.favoritePreviews, correlationID: requestID)
+        sectionStates[.previews] = .loading
+        previewErrors.removeAll()
+        await withTaskGroup(of: PreviewResult.self) { group in
+            var next = 0
+            for folder in folders.prefix(Self.previewConcurrency) {
+                next += 1
+                group.addTask { [service] in await Self.preview(service: service, id: folder.id) }
+            }
+            for await result in group {
+                guard isCurrent(requestID, version: version) else { group.cancelAll(); break }
+                switch result {
+                case let .value(id, items):
+                    updatePage(folders: self.page?.folders.map { folder in
+                        guard folder.id == id else { return folder }
+                        return FocusMyFolder(id: id, title: folder.title, mediaCount: folder.mediaCount,
+                                             coverURL: folder.coverURL, previews: items)
+                    })
+                case let .failure(id, message): previewErrors[id] = message
+                case .expired: expireSession(); group.cancelAll()
+                case .cancelled: break
+                }
+                if isCurrent(requestID, version: version), next < folders.count {
+                    let id = folders[next].id
+                    next += 1
+                    group.addTask { [service] in await Self.preview(service: service, id: id) }
+                }
+            }
+        }
+        guard isCurrent(requestID, version: version) else {
+            BiliPerformanceStore.shared.end(span, outcome: .cancelled)
+            return
+        }
+        sectionStates[.previews] = previewErrors.isEmpty ? .loaded : .failed("部分收藏夹预览加载失败，列表仍可打开")
+        BiliPerformanceStore.shared.end(span, outcome: previewErrors.isEmpty ? .success : .failure, count: folders.count)
     }
 }
 
@@ -1307,6 +1508,12 @@ final class FocusHistoryViewModel: ObservableObject {
         }
     }
 
+    func resetForSessionChange() {
+        suspend()
+        state = .idle
+        nextCursor = nil
+    }
+
     var navigationTitle: String {
         "播放历史"
     }
@@ -1329,8 +1536,7 @@ final class FocusHistoryViewModel: ObservableObject {
     }
 
     func reload() {
-        task?.cancel()
-        loadMoreTask?.cancel()
+        suspend()
         task = Task { [weak self] in
             await self?.performLoad()
         }
@@ -1366,6 +1572,7 @@ final class FocusHistoryViewModel: ObservableObject {
             } catch {
                 // 保留当前历史列表，下一次滚动或下拉刷新时继续尝试。
             }
+            guard !Task.isCancelled else { return }
             self.isLoadingMore = false
         }
     }
@@ -1637,6 +1844,14 @@ final class FocusFavoriteFolderViewModel: ObservableObject {
         }
     }
 
+    func resetForSessionChange() {
+        suspend()
+        state = .idle
+        folder = nil
+        currentPage = 1
+        hasMore = false
+    }
+
     func open(_ folder: FocusMyFolder) {
         self.folder = folder
         reload()
@@ -1646,8 +1861,7 @@ final class FocusFavoriteFolderViewModel: ObservableObject {
         guard let folder else {
             return
         }
-        task?.cancel()
-        loadMoreTask?.cancel()
+        suspend()
         task = Task { [weak self] in
             await self?.performLoad(folder: folder)
         }
@@ -1684,6 +1898,7 @@ final class FocusFavoriteFolderViewModel: ObservableObject {
             } catch {
                 // 保留已加载结果。
             }
+            guard !Task.isCancelled else { return }
             isLoadingMore = false
         }
     }
@@ -2978,77 +3193,6 @@ final class FocusArticleService: @unchecked Sendable {
         FocusArticleRouting.extractCVID(from: url)
     }
 
-    private static func normalizedArticleHTML(_ html: String) -> String {
-        guard !html.isEmpty else {
-            return ""
-        }
-        return html
-            .replacingOccurrences(of: #"(?i)src="//"#, with: #"src="https://"#, options: .regularExpression)
-            .replacingOccurrences(of: #"(?i)href="//"#, with: #"href="https://"#, options: .regularExpression)
-            .replacingOccurrences(of: #"(?i)data-src="//"#, with: #"src="https://"#, options: .regularExpression)
-            .replacingOccurrences(of: #"(?i)data-src="/"#, with: #"src="https://www.bilibili.com/"#, options: .regularExpression)
-            .replacingOccurrences(of: #"(?i)data-original="//"#, with: #"src="https://"#, options: .regularExpression)
-            .replacingOccurrences(of: #"(?i)poster="//"#, with: #"poster="https://"#, options: .regularExpression)
-            .replacingOccurrences(of: #"(?i)src="/"#, with: #"src="https://www.bilibili.com/"#, options: .regularExpression)
-            .replacingOccurrences(of: #"(?i)href="/"#, with: #"href="https://www.bilibili.com/"#, options: .regularExpression)
-            .replacingOccurrences(of: #"(?i)<script[^>]*?>[\s\S]*?</script>"#, with: "", options: .regularExpression)
-    }
-
-    private static func parseArticleParagraphs(from html: String) -> [FocusOpusParagraph] {
-        guard !html.isEmpty else {
-            return []
-        }
-
-        var paragraphs: [FocusOpusParagraph] = []
-        let normalized = html
-            .replacingOccurrences(of: #"(?i)<br\s*/?>"#, with: "\n", options: .regularExpression)
-            .replacingOccurrences(of: #"(?i)</(p|div|h[1-6]|blockquote|li|ul|ol)>"#, with: "\n\n", options: .regularExpression)
-
-        let tokenized = normalized.replacingOccurrences(
-            of: #"(?i)<img[^>]+src=\"([^\"]+)\"[^>]*>"#,
-            with: "\n\n[[FOCUS_IMAGE::$1]]\n\n",
-            options: .regularExpression
-        )
-
-        let segments = tokenized
-            .components(separatedBy: "\n\n")
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-
-        for segment in segments {
-            if segment.hasPrefix("[[FOCUS_IMAGE::"), segment.hasSuffix("]]") {
-                let rawURL = String(segment.dropFirst("[[FOCUS_IMAGE::".count).dropLast(2))
-                if let normalizedURL = Self.normalizedURLString(rawURL) {
-                    paragraphs.append(
-                        FocusOpusParagraph(
-                            blocks: [.image([FocusOpusImage(id: normalizedURL, url: URL(string: normalizedURL), width: 0, height: 0)])]
-                        )
-                    )
-                }
-                continue
-            }
-
-            let text = segment
-                .replacingOccurrences(of: #"<[^>]+>"#, with: "", options: .regularExpression)
-                .replacingOccurrences(of: "&nbsp;", with: " ")
-                .replacingOccurrences(of: "&quot;", with: "\"")
-                .replacingOccurrences(of: "&amp;", with: "&")
-                .replacingOccurrences(of: "&lt;", with: "<")
-                .replacingOccurrences(of: "&gt;", with: ">")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !text.isEmpty else {
-                continue
-            }
-            paragraphs.append(
-                FocusOpusParagraph(
-                    blocks: [.text([.text(value: text)])]
-                )
-            )
-        }
-
-        return paragraphs
-    }
-
     private static func firstString(in rawValue: Any?) -> String? {
         if let string = rawValue as? String, !string.isEmpty {
             return string
@@ -3125,6 +3269,15 @@ final class FocusOpusDetailViewModel: ObservableObject {
     var navigationTitle: String {
         "图文动态"
     }
+
+#if DEBUG
+    // Exercise the real rich-detail layout without credentials or live APIs.
+    func installFixtureDetail(_ page: FocusOpusDetailPage) {
+        precondition(FocusTestRuntime.isRunningFixtures)
+        suspend()
+        state = .loaded(page)
+    }
+#endif
 
     func open(_ url: URL) {
         let canonicalURL = FocusNavigationPolicy.canonicalWebURL(for: url)
@@ -3681,6 +3834,18 @@ struct FocusMyView: View {
                 VStack(alignment: .leading, spacing: 16) {
                     FocusMyProfileCard(profile: page.profile)
 
+                    if viewModel.isRefreshing { ProgressView("正在刷新，保留已加载内容…") }
+                    if let message = viewModel.refreshErrorMessage {
+                        HStack {
+                            Text(message).font(.footnote).foregroundStyle(.secondary)
+                            Spacer()
+                            Button("重试", action: viewModel.reload)
+                        }
+                    }
+                    ForEach(FocusMyViewModel.Section.allCases, id: \.self) { section in
+                        sectionStatus(section)
+                    }
+
                     if !page.watchLater.isEmpty {
                         VStack(alignment: .leading, spacing: 12) {
                             Text("稍后再看")
@@ -3782,8 +3947,26 @@ struct FocusMyView: View {
                 await prefetchAssets(for: page)
             }
             .refreshable {
-                viewModel.reload()
+                await viewModel.refresh()
             }
+        }
+    }
+
+    @ViewBuilder
+    private func sectionStatus(_ section: FocusMyViewModel.Section) -> some View {
+        switch viewModel.sectionStates[section] {
+        case .loading:
+            ProgressView("\(section.title)加载中…").font(.footnote)
+        case let .failed(message):
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("\(section.title)暂不可用").font(.subheadline)
+                    Text(message).font(.footnote).foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 8)
+                Button("重试") { viewModel.retrySection(section) }
+            }
+        case .loaded, .none: EmptyView()
         }
     }
 
@@ -5076,108 +5259,6 @@ private struct FocusArticleStatItem: View {
     }
 }
 
-private struct FocusArticleHTMLCard: View {
-    let htmlContent: String
-
-    var body: some View {
-        Text(Self.nativeText(from: htmlContent))
-            .font(.body)
-            .foregroundStyle(.primary)
-            .lineSpacing(7)
-            .textSelection(.enabled)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(16)
-            .background(
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .fill(Color(uiColor: .secondarySystemGroupedBackground))
-            )
-    }
-
-    private static func nativeText(from html: String) -> String {
-        var text = html
-        text = text.replacingOccurrences(
-            of: #"(?is)<(script|style)[^>]*>.*?</\1>"#,
-            with: "",
-            options: .regularExpression
-        )
-        text = text.replacingOccurrences(
-            of: #"(?i)<img[^>]*alt=[\"']([^\"']+)[\"'][^>]*>"#,
-            with: "\n[图片：$1]\n",
-            options: .regularExpression
-        )
-        text = text.replacingOccurrences(
-            of: #"(?i)<img[^>]*>"#,
-            with: "\n[图片]\n",
-            options: .regularExpression
-        )
-        text = text.replacingOccurrences(
-            of: #"(?i)<li[^>]*>"#,
-            with: "\n• ",
-            options: .regularExpression
-        )
-        text = text.replacingOccurrences(
-            of: #"(?i)<br\s*/?>|</(p|div|section|article|li|h[1-6]|blockquote|pre|tr)>"#,
-            with: "\n",
-            options: .regularExpression
-        )
-        text = text.replacingOccurrences(
-            of: #"<[^>]+>"#,
-            with: "",
-            options: .regularExpression
-        )
-        text = decodeHTMLEntities(text)
-        text = text.replacingOccurrences(
-            of: #"[ \t]+\n"#,
-            with: "\n",
-            options: .regularExpression
-        )
-        text = text.replacingOccurrences(
-            of: #"\n{3,}"#,
-            with: "\n\n",
-            options: .regularExpression
-        )
-        return text.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private static func decodeHTMLEntities(_ value: String) -> String {
-        var result = value
-        let namedEntities = [
-            "&nbsp;": " ",
-            "&amp;": "&",
-            "&lt;": "<",
-            "&gt;": ">",
-            "&quot;": "\"",
-            "&#39;": "'",
-            "&apos;": "'"
-        ]
-        namedEntities.forEach { result = result.replacingOccurrences(of: $0.key, with: $0.value) }
-
-        guard let expression = try? NSRegularExpression(pattern: #"&#(x?[0-9A-Fa-f]+);"#) else {
-            return result
-        }
-        while let match = expression.firstMatch(
-            in: result,
-            range: NSRange(result.startIndex..., in: result)
-        ), let fullRange = Range(match.range(at: 0), in: result),
-           let valueRange = Range(match.range(at: 1), in: result)
-        {
-            let rawValue = String(result[valueRange])
-            let scalarValue: UInt32?
-            if rawValue.lowercased().hasPrefix("x") {
-                scalarValue = UInt32(rawValue.dropFirst(), radix: 16)
-            } else {
-                scalarValue = UInt32(rawValue, radix: 10)
-            }
-            let replacement = scalarValue
-                .flatMap(UnicodeScalar.init)
-                .map(String.init)
-                ?? ""
-            result.replaceSubrange(fullRange, with: replacement)
-        }
-        return result
-    }
-}
-
 private struct FocusUserSpaceArticleRow: View {
     let article: FocusUserSpaceArticle
 
@@ -5310,7 +5391,18 @@ struct FocusOpusDetailView: View {
                                 .padding(.horizontal, 2)
 
                             ForEach(Array(page.comments.enumerated()), id: \.offset) { item in
-                                FocusOpusCommentCard(comment: item.element, onOpenURL: onOpenURL)
+                                FocusOpusCommentCard(
+                                    comment: item.element,
+                                    onOpenURL: onOpenURL,
+                                    onOpenImages: { rawURLs, index in
+                                        let urls = rawURLs.compactMap(URL.init(string:))
+                                        galleryRequest = FocusImageGalleryRequest(
+                                            urls: urls,
+                                            initialIndex: index,
+                                            referer: "https://www.bilibili.com/opus/\(page.id)"
+                                        )
+                                    }
+                                )
                             }
                         }
                     }
@@ -5477,6 +5569,7 @@ private struct FocusOpusImageTile: View {
 private struct FocusOpusCommentCard: View {
     let comment: FocusNativeCommentPayload
     let onOpenURL: (URL) -> Void
+    let onOpenImages: ([String], Int) -> Void
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -5505,6 +5598,12 @@ private struct FocusOpusCommentCard: View {
 
                 FocusInlineRichText(runs: comment.contentRuns, onOpenURL: onOpenURL)
 
+                FocusCommentImageStrip(
+                    urls: comment.imageURLs.compactMap(URL.init(string:)),
+                    referer: "https://www.bilibili.com/",
+                    onSelect: { onOpenImages(comment.imageURLs, $0) }
+                )
+
                 ForEach(Array(comment.previewReplies.prefix(2).enumerated()), id: \.offset) { _, reply in
                     HStack(alignment: .top, spacing: 2) {
                         Text("\(reply.author)：")
@@ -5517,6 +5616,12 @@ private struct FocusOpusCommentCard: View {
                             onOpenURL: onOpenURL
                         )
                     }
+                    .padding(.leading, 8)
+                    FocusCommentImageStrip(
+                        urls: reply.imageURLs.compactMap(URL.init(string:)),
+                        referer: "https://www.bilibili.com/",
+                        onSelect: { onOpenImages(reply.imageURLs, $0) }
+                    )
                     .padding(.leading, 8)
                 }
 

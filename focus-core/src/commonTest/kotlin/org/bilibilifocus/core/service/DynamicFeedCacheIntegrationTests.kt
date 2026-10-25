@@ -5,8 +5,40 @@ import org.bilibilifocus.core.cookie.Cookie
 import org.bilibilifocus.core.cookie.CookieProvider
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 
 class DynamicFeedCacheIntegrationTests {
+    @Test
+    fun `authentication rejection cannot become stale success or keep a fresh page`() = runTest {
+        val client = FeedHttpClient(ArrayDeque(listOf(
+            HttpResponse(200, feedBody("before-expiry")),
+            HttpResponse(200, """{"code":-101}"""),
+            HttpResponse(200, feedBody("new-page")),
+        )))
+        val service = DynamicFeedService(MutableCookieProvider("fixture"), client)
+        assertEquals("before-expiry", service.fetchFollowingFeedPage().nextOffset)
+        assertFailsWith<DynamicFeedService.ServiceError.LoginRequired> {
+            service.refreshFollowingFeedPage()
+        }
+        assertEquals("new-page", service.fetchFollowingFeedPage().nextOffset)
+        assertEquals(3, client.requests.size)
+    }
+
+    @Test
+    fun `sessions with colliding string hashes never share a feed page`() = runTest {
+        assertEquals("Aa".hashCode(), "BB".hashCode())
+        val cookies = MutableCookieProvider("Aa")
+        val client = FeedHttpClient(ArrayDeque(listOf(
+            HttpResponse(200, feedBody("account-a")),
+            HttpResponse(200, feedBody("account-b")),
+        )))
+        val service = DynamicFeedService(cookies, client)
+        assertEquals("account-a", service.fetchFollowingFeedPage().nextOffset)
+        cookies.session = "BB"
+        assertEquals("account-b", service.fetchFollowingFeedPage().nextOffset)
+        assertEquals(2, client.requests.size)
+    }
+
     @Test
     fun `feed cache is session scoped and serves stale model after refresh error`() = runTest {
         val cookieProvider = MutableCookieProvider("session-one")

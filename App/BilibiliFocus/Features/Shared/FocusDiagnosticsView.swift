@@ -52,6 +52,30 @@ struct FocusDiagnosticsView: View {
             }
 
             Section {
+                if let snapshot, !snapshot.performanceEvents.isEmpty {
+                    ForEach(Array(snapshot.performanceEvents.suffix(60).reversed()), id: \.id) { event in
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("\(event.stage.rawValue) · \(event.outcome.rawValue)")
+                                .font(.caption.monospaced())
+                            Text(String(format: "%.1f ms · count %d", event.durationMilliseconds, event.count))
+                                .font(.caption2)
+                            if let error = event.positionErrorPoints {
+                                Text(String(format: "锚点误差 %.2f pt", error)).font(.caption2)
+                            }
+                            Text(String(event.correlationID.uuidString.prefix(8)))
+                                .font(.caption2.monospaced()).foregroundStyle(.secondary)
+                        }
+                    }
+                } else {
+                    Text("暂无阶段计时").foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("本地阶段计时")
+            } footer: {
+                Text("最多保留 256 条；关联标记随机生成，与账号和内容无关。数据、readyToPlay 和可显示首帧分别记录。")
+            }
+
+            Section {
                 if let exportText {
                     ShareLink(
                         item: exportText,
@@ -65,6 +89,7 @@ struct FocusDiagnosticsView: View {
                 Button {
                     Task {
                         await eventStore.clear()
+                        BiliPerformanceStore.shared.clear()
                         await reload()
                     }
                 } label: {

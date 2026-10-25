@@ -1,5 +1,6 @@
 package org.bilibilifocus.android
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
@@ -118,6 +119,8 @@ class FocusSearchViewModel internal constructor(
                     if (it.filter == SearchResultFilter.VIDEO) mergedSection else it
                 }
                 _state.value = SearchUiState.Loaded(mergedSections)
+            } catch (e: CancellationException) {
+                throw e
             } catch (_: Exception) {
             } finally {
                 if (generation == requestGeneration) {
@@ -160,6 +163,8 @@ class FocusSearchViewModel internal constructor(
                 } else {
                     _state.value = SearchUiState.Failed(e.message ?: "搜索失败")
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 if (generation == requestGeneration) {
                     _state.value = SearchUiState.Failed(e.message ?: "搜索失败")

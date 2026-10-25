@@ -33,11 +33,11 @@ class FocusNavigationPolicy(settings: FocusSettings = FocusSettings.DEFAULTS) {
 
         val lowercasedPath = parsed.path.lowercase()
         val lowercasedURL = url.lowercase()
-        val isBilibiliFamilyHost = "bilibili.com" in host || "hdslb.com" in host
+        val isBilibiliFamilyHost = isHostWithin(host, "bilibili.com") || isHostWithin(host, "hdslb.com")
         val cameFromVideoPage = currentURL?.let {
             val currentParsed = BiliUrl.parse(it)
             currentParsed.path.startsWith("/video/") ||
-                (currentParsed.host?.contains("bilibili.com") == true &&
+                (isHostWithin(currentParsed.host.orEmpty(), "bilibili.com") &&
                     it.lowercase().contains("/video/"))
         } ?: false
 
@@ -47,6 +47,9 @@ class FocusNavigationPolicy(settings: FocusSettings = FocusSettings.DEFAULTS) {
 
         return false
     }
+
+    private fun isHostWithin(host: String, domain: String): Boolean =
+        host == domain || host.endsWith(".$domain")
 
     companion object {
         private val blockedSchemes = setOf(

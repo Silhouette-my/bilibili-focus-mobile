@@ -27,7 +27,7 @@
 
 为了方便无法在本地配置开发环境的读者，本项目在 Release 页面直接提供编译好的成品包：
 
-当前版本：**1.0.1**
+已发布版本：**1.0.1**。本地 iOS 候选为 **1.0.2（build 5）**，包含动态自动刷新、动态与搜索返回修复、手机全屏控件布局、弹幕刷新节奏及起播优化，尚未发布。构建与验证范围见 [动态返回专项](docs/DYNAMIC_SCROLL_RETURN_FIX.md) 和 [播放器与性能记录](docs/PERFORMANCE_FOLLOWUP.md)。下方 Release 下载仍为 1.0.1，不包含这些本地改动。
 
 👉 **[前往 Releases 页面下载 1.0.1](https://github.com/Silhouette-my/bilibili-focus-mobile/releases/tag/1.0.1)**
 
@@ -68,9 +68,10 @@
 └── docs                  # 升级路线、在线 smoke 与维护说明
 ```
 
-iOS 生产代码当前仍使用 Swift `FocusCore`。KMP 的 iOS framework 已进入编译/链接
-门禁，但尚未接入 App 运行路径；计划先将其 framework 改名为 `FocusKMP`，通过
-Router adapter 完成首个共存切片，再逐项迁移网络服务。具体边界见升级路线图。
+iOS 现以 Swift `FocusCore` 为主要生产实现，同时链接静态 `FocusKMP` framework。
+主页重定向已经通过 Router adapter 进入 KMP 运行路径，并与 Swift 结果做一致性
+校验和安全回退；网络服务仍由 Swift 提供，后续按 feature 渐进迁移。具体边界见
+升级路线图。
 
 ---
 
@@ -84,6 +85,10 @@ Router adapter 完成首个共存切片，再逐项迁移网络服务。具体�
 2. 选择 `BilibiliFocus` scheme。
 3. 在 `Signing & Capabilities` 中配置你自己的个人开发 Team（Personal Team）。
 4. 连接真机或选择模拟器，点击 **Run** 即可。
+
+App target 会在编译 Swift 源码前通过 `Scripts/build_kmp_for_xcode.sh` 构建
+`FocusKMP.framework`。请安装 JDK 17–24，推荐 Android Studio 自带的 JBR 21；
+当 `JAVA_HOME` 未设置时，脚本会优先自动使用该 JBR。
 
 *命令行源码构建：*
 
@@ -108,7 +113,27 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
 
 ## 🧪 自动化测试
 
-项目包含完善的测试集，确保 B 站接口或网页结构变动时能快速定位问题。
+本地迭代先跑改动对应的测试；提交前看 Debug 回归，发布候选再做完整 Release 验收。
+
+### 第 1 层：只跑改动相关测试
+
+例如修改导航策略，分别验证实际改动的平台，不必每次重跑全部平台：
+
+```bash
+# Swift FocusCore：按测试类型过滤；也可进一步指定单个测试方法。
+FOCUS_INCLUDE_TESTS=1 swift test --disable-sandbox --filter FocusNavigationPolicyTests
+
+# KMP：只运行导航策略测试类，不附带其他模块的测试任务。
+./gradlew :focus-core:testDebugUnitTest --tests 'org.bilibilifocus.core.routing.FocusNavigationPolicyTests'
+```
+
+测试输出应包含所选类型，零项匹配不能当作通过。修改 Web 注入或 API 契约时，
+另跑下方对应的同步／语法检查；涉及 Swift/KMP 共享行为时，两边对应测试都跑。
+
+### 第 2 层：提交前的核心回归
+
+Pull Request 和 `main` 分支更新自动执行 Debug 回归与构建。修改共享配置、
+跨模块接口、登录或持久化时，不只依赖单个测试；运行受影响平台的完整核心测试。
 
 * **iOS 核心测试**：`FOCUS_INCLUDE_TESTS=1 swift test --disable-sandbox`
 * **iOS Release 边界测试**：`FOCUS_INCLUDE_TESTS=1 swift test -c release --disable-sandbox`
@@ -116,11 +141,19 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
 * **Android 单元测试**：`./gradlew :focus-android:testDebugUnitTest :focus-core:testDebugUnitTest`
 * **KMP iOS 编译/链接门禁**：`./gradlew :focus-core:compileKotlinIosSimulatorArm64 :focus-core:linkDebugFrameworkIosSimulatorArm64`
 * **跨平台运行时一致性**：`./Scripts/sync_focus_runtime.sh --check`
+* **Kotlin 内嵌 JavaScript 语法**：`node Scripts/check_kotlin_feature_scripts.mjs`（不访问网络）
 * **Bilibili API 契约一致性**：`./Scripts/sync_bilibili_api_contracts.mjs --check`
 * **在线 API smoke（默认跳过）**：`node ./Scripts/run_online_smoke.mjs`
 
-GitHub Actions 会在 Pull Request 和 `main` 分支更新时运行上述检查，并额外执行
-Xcode 单元测试、Android Lint 与 Debug APK 构建。
+Pull Request 和 `main` 分支更新运行 Debug 核心测试、运行时／API 契约检查、
+FocusVerifier、KMP iOS 编译链接、Xcode 单元测试、Android Lint 与 Debug APK 构建。
+
+### 第 3 层：发布候选完整验收
+
+发布候选在 GitHub Actions 手动运行 **CI**（`workflow_dispatch`）。它会在第 2 层
+之外执行 Release Swift 测试、无签名 iOS Release 构建与 Android Release 编译，
+这三项不再随每次提交重复执行。单独执行命令保持可用。真实账号在线 smoke
+仍须显式选择，按下方在线 Smoke 说明执行，不因本地测试通过而自动发起。
 
 ### Web 注入运行时同步
 
@@ -138,7 +171,7 @@ Gradle 的测试与 assemble 任务也依赖同一份一致性门禁，未同步
 ### API 契约与升级路线
 
 Swift 与 KMP 共享一份 independently maintained、facts-only 的 Bilibili API
-端点子集。开发时可以用同级 `bilibili-api` 仓库校验当前 48 个端点：
+端点子集。开发时可以用同级 `bilibili-api` 仓库校验当前 48 个端点的 URL 与 HTTP method：
 
 ```bash
 ./Scripts/sync_bilibili_api_contracts.mjs --validate-source ../bilibili-api

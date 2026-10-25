@@ -7,6 +7,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.bilibilifocus.core.cookie.Cookie
 import org.bilibilifocus.core.cookie.CookieProvider
+import org.bilibilifocus.core.crypto.sha256Hex
 import org.bilibilifocus.core.model.DynamicCard
 import org.bilibilifocus.core.repository.AsyncExpiringCache
 import org.bilibilifocus.core.repository.CachePolicy
@@ -60,10 +61,15 @@ class DynamicFeedService(
             key = cacheKey,
             policy = FEED_CACHE_POLICY,
             forceRefresh = forceRefresh,
+            canUseStaleOnError = { error ->
+                error !is ServiceError || error is ServiceError.InvalidResponse
+            },
         ) {
             val url = buildEndpoint(offset)
             val response = httpClient.get(url, buildHeaders(url, cookies))
 
+            if (response.statusCode == 401) throw ServiceError.LoginRequired
+            if (response.statusCode == 403) throw ServiceError.Api(403, "动态接口拒绝访问")
             if (response.statusCode !in 200..299) {
                 throw ServiceError.InvalidResponse
             }
@@ -100,17 +106,15 @@ class DynamicFeedService(
         )
     }
 
-    private fun sessionFingerprint(cookies: List<Cookie>): Int =
-        cookies
+    private fun sessionFingerprint(cookies: List<Cookie>): String {
+        val identityMaterial = cookies
             .sortedWith(compareBy(Cookie::domain, Cookie::path, Cookie::name, Cookie::value))
-            .fold(1) { fingerprint, cookie ->
-                var result = fingerprint
-                result = 31 * result + cookie.domain.hashCode()
-                result = 31 * result + cookie.path.hashCode()
-                result = 31 * result + cookie.name.hashCode()
-                result = 31 * result + cookie.value.hashCode()
-                result
+            .joinToString("") { cookie ->
+                listOf(cookie.domain, cookie.path, cookie.name, cookie.value)
+                    .joinToString("") { value -> "${value.length}:$value" }
             }
+        return sha256Hex(identityMaterial)
+    }
 
     fun decodeFeedPage(rawJson: String): FeedPage {
         val payload = try {
@@ -471,7 +475,7 @@ class DynamicFeedService(
     }
 
     private data class FeedCacheKey(
-        val sessionFingerprint: Int,
+        val sessionFingerprint: String,
         val timezoneOffsetMinutes: Int,
         val offset: String,
     )

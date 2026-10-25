@@ -126,7 +126,7 @@ function validateSource(sourceRootArgument) {
     encoding: "utf8",
   }).trim();
   process.stdout.write(
-    `Validated ${Object.keys(local.endpoints).length} local endpoint facts against sibling bilibili-api ${commit}\n`,
+    `Validated ${Object.keys(local.endpoints).length} endpoint URLs/methods against sibling bilibili-api ${commit}\n`,
   );
 }
 

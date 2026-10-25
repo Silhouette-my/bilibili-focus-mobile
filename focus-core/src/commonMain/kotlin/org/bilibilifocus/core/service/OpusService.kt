@@ -1,5 +1,6 @@
 package org.bilibilifocus.core.service
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import org.bilibilifocus.core.cookie.CookieProvider
@@ -133,6 +134,8 @@ class OpusService(
                 }.getOrNull()
                 WbiRequestResult(payload, response.statusCode, payload?.intValueAt("code"))
             }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (_: Exception) {
             return null
         }
@@ -259,6 +262,7 @@ class OpusService(
             replyCount = obj.longValueAt("rcount") ?: 0L,
             publishTime = obj.longValueAt("ctime") ?: 0L,
             replies = subReplies.mapNotNull { parseComment(it as? JsonObject) },
+            imageURLs = CommentRichTextParser.parseImageURLs(content),
         )
     }
 

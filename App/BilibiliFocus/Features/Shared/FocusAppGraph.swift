@@ -1,6 +1,7 @@
 #if canImport(UIKit)
 import FocusCore
 import Foundation
+import WebKit
 
 enum FocusPlaybackHistorySubmissionEligibility {
     private static let endpoint = BiliAPIContractCatalog.require(
@@ -31,6 +32,12 @@ enum FocusPlaybackHistorySubmissionEligibility {
     }
 }
 
+private actor FocusFixturePlaybackPersistence: FocusPlaybackStatePersistence {
+    private var data: Data?
+    func loadPlaybackState() -> Data? { data }
+    func savePlaybackState(_ data: Data) { self.data = data }
+}
+
 /// The app's composition root. Long-lived services and their account-aware
 /// cookie providers are created exactly once here and shared by every feature.
 @MainActor
@@ -59,11 +66,15 @@ final class FocusAppGraph {
 
     init(
         settingsStore: FocusSettingsStore,
-        playbackProgressStore: FocusPlaybackProgressStore = .shared
+        playbackProgressStore: FocusPlaybackProgressStore? = nil,
+        cookieProvider injectedCookieProvider: WebViewCookieSnapshotProvider? = nil
     ) {
         let browserViewModel = FocusBrowserViewModel(settingsStore: settingsStore)
-        let cookieProvider = WebViewCookieSnapshotProvider()
-        let videoCookieProvider = WebViewCookieSnapshotProvider(performsLoginWarmup: false)
+        let cookieProvider = injectedCookieProvider ?? WebViewCookieSnapshotProvider(
+            websiteDataStore: FocusTestRuntime.isRunningFixtures ? .nonPersistent() : .default(),
+            performsLoginWarmup: !FocusTestRuntime.isRunningFixtures
+        )
+        let videoCookieProvider = cookieProvider
         let nativePageAugmentService = FocusNativePageAugmentService(
             cookieProvider: cookieProvider
         )
@@ -91,14 +102,22 @@ final class FocusAppGraph {
         self.userCollectionService = FocusUserSpaceService(cookieProvider: cookieProvider)
         self.articleService = FocusArticleService(cookieProvider: cookieProvider)
         self.opusDetailService = FocusOpusDetailService(cookieProvider: cookieProvider)
-        self.videoDetailService = FocusVideoDetailService(cookieProvider: videoCookieProvider)
+        let playerInfoRepository = FocusPlayerInfoRepository(cookieProvider: videoCookieProvider)
+        self.videoDetailService = FocusVideoDetailService(
+            cookieProvider: videoCookieProvider, playerInfoRepository: playerInfoRepository
+        )
         self.videoActionService = FocusVideoActionService(cookieProvider: videoCookieProvider)
-        self.videoSubtitleService = FocusVideoSubtitleService(cookieProvider: videoCookieProvider)
+        self.videoSubtitleService = FocusVideoSubtitleService(
+            cookieProvider: videoCookieProvider, playerInfoRepository: playerInfoRepository
+        )
         self.videoCommentService = FocusVideoCommentService(cookieProvider: videoCookieProvider)
         self.loginHealthService = LoginHealthService(cookieProvider: cookieProvider)
-        self.playbackProgressStore = playbackProgressStore
+        self.playbackProgressStore = playbackProgressStore ?? (FocusTestRuntime.isRunningFixtures
+            ? FocusPlaybackProgressStore(persistence: FocusFixturePlaybackPersistence())
+            : .shared)
         self.playbackProgressWriteCoordinator = FocusPlaybackProgressWriteCoordinator()
 
+        browserViewModel.websiteDataStore = cookieProvider.websiteDataStore
         browserViewModel.nativePageAugmentService = nativePageAugmentService
     }
 

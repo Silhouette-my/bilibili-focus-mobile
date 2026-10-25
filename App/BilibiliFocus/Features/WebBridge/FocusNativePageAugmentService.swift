@@ -54,6 +54,41 @@ enum FocusNativePageAugmentPayload: Sendable {
     }
 }
 
+/// Keep only recent page payloads; comments and account-specific relations must refresh.
+struct FocusNativePageAugmentCache {
+    private struct Entry {
+        let payload: FocusNativePageAugmentPayload
+        let expiresAt: Date
+        var lastAccess: UInt64
+    }
+
+    private var entries: [String: Entry] = [:]
+    private var accessCounter: UInt64 = 0
+
+    mutating func payload(for key: String, now: Date = Date()) -> FocusNativePageAugmentPayload? {
+        guard var entry = entries[key] else { return nil }
+        guard entry.expiresAt > now else {
+            entries[key] = nil
+            return nil
+        }
+        accessCounter &+= 1
+        entry.lastAccess = accessCounter
+        entries[key] = entry
+        return entry.payload
+    }
+
+    mutating func store(_ payload: FocusNativePageAugmentPayload, for key: String, now: Date = Date()) {
+        entries = entries.filter { $0.value.expiresAt > now }
+        accessCounter &+= 1
+        entries[key] = Entry(payload: payload, expiresAt: now.addingTimeInterval(60), lastAccess: accessCounter)
+        if entries.count > 32, let oldest = entries.min(by: { $0.value.lastAccess < $1.value.lastAccess })?.key {
+            entries[oldest] = nil
+        }
+    }
+
+    mutating func removeAll() { entries.removeAll() }
+}
+
 struct FocusNativeVideoAugmentPayload: Encodable, Sendable {
     let title: String
     let authorName: String
@@ -94,13 +129,20 @@ struct FocusNativeCommentPayload: Encodable, Sendable {
     let avatarURL: String
     let content: String
     let contentRuns: [FocusRichTextRun]
+    let imageURLs: [String]
     let likeText: String
     let replyText: String
     let timeText: String
     let previewReplies: [FocusNativeCommentPayload]
 }
 
-actor FocusNativePageAugmentService {
+protocol FocusNativePageAugmentServing: Sendable {
+    var sessionVersion: UInt64 { get }
+    func loadPayload(for url: URL, kind: FocusNativePageKind) async -> FocusNativePageAugmentPayload?
+    func updateFollowState(mid: Int64, shouldFollow: Bool, expectedSessionVersion: UInt64) async throws -> (isFollowing: Bool, followers: Int64)
+}
+
+actor FocusNativePageAugmentService: FocusNativePageAugmentServing {
     private typealias JSONObject = [String: Any]
 
     static let userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
@@ -116,6 +158,8 @@ actor FocusNativePageAugmentService {
     private var cachedWbiKey: String?
     private var cachedWbiExpiration = Date.distantPast
 
+    nonisolated var sessionVersion: UInt64 { cookieProvider.sessionVersion }
+
     init(cookieProvider: WebViewCookieSnapshotProvider) {
         self.cookieProvider = cookieProvider
         let configuration = URLSessionConfiguration.default
@@ -126,12 +170,15 @@ actor FocusNativePageAugmentService {
     }
 
     func loadPayload(for url: URL, kind: FocusNativePageKind) async -> FocusNativePageAugmentPayload? {
+        let version = sessionVersion
+        let payload: FocusNativePageAugmentPayload?
         switch kind {
         case .video:
-            return await loadVideoPayload(for: url).map(FocusNativePageAugmentPayload.video)
+            payload = await loadVideoPayload(for: url).map(FocusNativePageAugmentPayload.video)
         case .opus:
-            return await loadOpusPayload(for: url).map(FocusNativePageAugmentPayload.opus)
+            payload = await loadOpusPayload(for: url).map(FocusNativePageAugmentPayload.opus)
         }
+        return !Task.isCancelled && version == sessionVersion ? payload : nil
     }
 
     private func loadVideoPayload(for url: URL) async -> FocusNativeVideoAugmentPayload? {
@@ -379,8 +426,8 @@ actor FocusNativePageAugmentService {
         )
     }
 
-    func updateFollowState(mid: Int64, shouldFollow: Bool) async throws -> (isFollowing: Bool, followers: Int64) {
-        try await modifyRelation(mid: mid, shouldFollow: shouldFollow)
+    func updateFollowState(mid: Int64, shouldFollow: Bool, expectedSessionVersion: UInt64) async throws -> (isFollowing: Bool, followers: Int64) {
+        try await modifyRelation(mid: mid, shouldFollow: shouldFollow, expectedSessionVersion: expectedSessionVersion)
         async let followStateTask = fetchFollowState(mid: mid, referer: "https://space.bilibili.com/\(mid)")
         async let relationTask = fetchRelation(mid: mid)
         let isFollowing = try await followStateTask
@@ -388,8 +435,10 @@ actor FocusNativePageAugmentService {
         return (isFollowing: isFollowing, followers: relation.followers)
     }
 
-    private func modifyRelation(mid: Int64, shouldFollow: Bool) async throws {
+    private func modifyRelation(mid: Int64, shouldFollow: Bool, expectedSessionVersion: UInt64) async throws {
         let cookies = await cookieProvider.loadCookies()
+        try Task.checkCancellation()
+        guard sessionVersion == expectedSessionVersion else { throw CancellationError() }
         guard let csrf = cookies.first(where: { $0.name == "bili_jct" })?.value.nilIfBlank else {
             throw URLError(.userAuthenticationRequired)
         }
@@ -443,17 +492,21 @@ actor FocusNativePageAugmentService {
         }
 
         let replies = root.arrayValue(at: "data", "replies") ?? []
-        return replies.compactMap(parseComment(from:))
+        return replies.compactMap(Self.parseComment(from:))
     }
 
-    private func parseComment(from object: JSONObject) -> FocusNativeCommentPayload? {
+    nonisolated static func parseComment(from object: [String: Any]) -> FocusNativeCommentPayload? {
         guard
             let member = object.dictionaryValue(at: "member"),
-            let content = object.dictionaryValue(at: "content"),
-            let message = content.stringValue(at: "message")?.nilIfBlank
+            let content = object.dictionaryValue(at: "content")
         else {
             return nil
         }
+        let message = content.stringValue(at: "message")?.nilIfBlank ?? ""
+        let imageURLs = (content.arrayValue(at: "pictures") ?? []).compactMap { picture in
+            normalizedCommentImageURLString(picture.stringValue(at: "img_src"))
+        }
+        guard !message.isEmpty || !imageURLs.isEmpty else { return nil }
 
         let likeCount = object.int64Value(at: "like") ?? 0
         let replyCount = object.int64Value(at: "rcount") ?? 0
@@ -464,6 +517,7 @@ actor FocusNativePageAugmentService {
             avatarURL: member.stringValue(at: "avatar") ?? "",
             content: message,
             contentRuns: Self.parseCommentRuns(content: content, message: message),
+            imageURLs: imageURLs,
             likeText: likeCount > 0 ? "\(Self.formatCount(likeCount))赞" : "",
             replyText: replyCount > 0 ? "\(Self.formatCount(replyCount))回复" : "",
             timeText: Self.formatCommentTime(publishTime),
@@ -557,6 +611,14 @@ actor FocusNativePageAugmentService {
         else if value.lowercased().hasPrefix("http://") { value = "https://" + value.dropFirst("http://".count) }
         else if value.hasPrefix("/") { value = "https://www.bilibili.com\(value)" }
         return value
+    }
+
+    private nonisolated static func normalizedCommentImageURLString(_ raw: String?) -> String? {
+        guard var value = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { return nil }
+        if value.hasPrefix("//") { value = "https:\(value)" }
+        else if value.lowercased().hasPrefix("http://") { value = "https://" + value.dropFirst("http://".count) }
+        guard let url = URL(string: value), let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme), url.host?.isEmpty == false else { return nil }
+        return url.absoluteString
     }
 
     private func requestObject(urlString: String, referer: String?) async throws -> JSONObject {

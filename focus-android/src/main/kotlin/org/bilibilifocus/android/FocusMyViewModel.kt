@@ -1,5 +1,6 @@
 package org.bilibilifocus.android
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -52,6 +53,8 @@ class FocusMyViewModel(
                 // 个性签名（可选，失败忽略）
                 val sign = try {
                     userService.fetchUserInfo(account.mid).sign
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
                 } catch (_: Exception) {
                     ""
                 }
@@ -68,16 +71,22 @@ class FocusMyViewModel(
                 // 历史与收藏夹各自容错，互不影响主资料展示
                 val history = try {
                     historyService.fetchHistory().items
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
                 } catch (_: Exception) {
                     emptyList()
                 }
                 val folders = try {
                     favoriteService.fetchFolders(account.mid)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
                 } catch (_: Exception) {
                     emptyList()
                 }
 
                 _state.value = MyUiState.Loaded(profile, history, folders)
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 _state.value = MyUiState.Failed(e.message ?: "加载失败")
             }

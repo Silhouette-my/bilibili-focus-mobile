@@ -13,13 +13,21 @@ struct FocusNativeVideoDetailView: View {
     let onOpenVideo: (URL) -> Void
     let onOpenURL: (URL) -> Void
     let onOpenWeb: (URL) -> Void
+    var accentColor: Color = FocusSharedDesign.primary
     @State private var isDescriptionExpanded = true
+    @State private var commentGalleryRequest: FocusImageGalleryRequest?
+    @State private var inlinePlayerSurfaceID = UUID()
+    @State private var inlineReadyItemID: ObjectIdentifier?
+    @State private var controlsBottomInset: CGFloat = 90
 
     var body: some View {
         content
             .background(Color(uiColor: .systemGroupedBackground))
             .fullScreenCover(isPresented: $viewModel.isFullscreen) {
-                FocusNativeVideoFullscreenView(viewModel: viewModel)
+                FocusNativeVideoFullscreenView(viewModel: viewModel, accentColor: accentColor)
+            }
+            .fullScreenCover(item: $commentGalleryRequest) { request in
+                FocusImageGalleryView(request: request)
             }
             .alert(
                 "操作未完成",
@@ -41,6 +49,10 @@ struct FocusNativeVideoDetailView: View {
             .onReceive(NotificationCenter.default.publisher(for: UIDevice.orientationDidChangeNotification)) { _ in
                 viewModel.handleDeviceOrientationChange(UIDevice.current.orientation)
             }
+            .onChange(of: viewModel.isFullscreen) { _ in
+                inlinePlayerSurfaceID = UUID()
+                inlineReadyItemID = nil
+            }
     }
 
     @ViewBuilder
@@ -48,7 +60,14 @@ struct FocusNativeVideoDetailView: View {
         switch viewModel.state {
         case .idle, .loading:
             VStack(spacing: 0) {
-                playerPlaceholder(coverURL: nil)
+                playerPlaceholder(coverURL: viewModel.routePreview?.coverURL)
+                if let title = viewModel.routePreview?.title.nilIfBlank {
+                    Text(title)
+                        .font(.headline)
+                        .lineLimit(2)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding()
+                }
                 ProgressView("加载视频详情…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -105,18 +124,40 @@ struct FocusNativeVideoDetailView: View {
     private func player(detail: FocusVideoDetail) -> some View {
         ZStack {
             Color.black
-            if viewModel.hasPreparedPlayer, !viewModel.isFullscreen {
-                FocusNativePlayerSurface(player: viewModel.player, showsPlaybackControls: false)
-            } else {
-                FocusRemoteImage(url: detail.coverURL, referer: viewModel.currentURL?.absoluteString ?? "https://www.bilibili.com/") { phase in
-                    switch phase {
-                    case let .success(image):
-                        image
-                            .resizable()
-                            .scaledToFit()
-                            .opacity(0.72)
-                    case .empty, .failure:
-                        Color.black
+            let currentItemID = viewModel.player.currentItem.map(ObjectIdentifier.init)
+            let requestID = viewModel.playbackDiagnosticID
+            let inlinePlayerIsReadyForDisplay = viewModel.hasPreparedPlayer &&
+                currentItemID != nil && inlineReadyItemID == currentItemID
+            if !viewModel.isFullscreen {
+                FocusNativePlayerSurface(
+                    surfaceID: inlinePlayerSurfaceID,
+                    player: viewModel.player,
+                    showsPlaybackControls: false,
+                    onReadyForDisplayChange: { callbackSurfaceID, itemID, isReady in
+                        guard callbackSurfaceID == inlinePlayerSurfaceID else { return }
+                        inlineReadyItemID = isReady ? itemID : nil
+                        viewModel.recordSurfaceReadiness(surface: callbackSurfaceID, itemID: itemID,
+                                                         isReady: isReady, requestID: requestID)
+                    }
+                )
+                .id(inlinePlayerSurfaceID)
+                .accessibilityHidden(true)
+                .onAppear { viewModel.activatePresentationSurface(inlinePlayerSurfaceID) }
+                .onDisappear { viewModel.deactivatePresentationSurface(inlinePlayerSurfaceID) }
+                if !viewModel.hasPreparedPlayer || !inlinePlayerIsReadyForDisplay {
+                    FocusRemoteImage(
+                        url: detail.coverURL,
+                        referer: viewModel.currentURL?.absoluteString ?? "https://www.bilibili.com/"
+                    ) { phase in
+                        switch phase {
+                        case let .success(image):
+                            image
+                                .resizable()
+                                .scaledToFit()
+                                .opacity(0.72)
+                        case .empty, .failure:
+                            Color.black
+                        }
                     }
                 }
             }
@@ -124,17 +165,25 @@ struct FocusNativeVideoDetailView: View {
             if !viewModel.isFullscreen {
                 FocusNativeDanmakuOverlay(viewModel: viewModel)
                     .allowsHitTesting(false)
-                FocusNativeSubtitleOverlay(viewModel: viewModel, isFullscreen: false)
-                    .allowsHitTesting(false)
                 FocusNativeDanmakuStatusOverlay(viewModel: viewModel)
                     .frame(maxHeight: .infinity, alignment: .top)
                     .padding(.top, 8)
             }
 
-            if viewModel.isLoadingPlayback {
+            if viewModel.isLoadingPlayback ||
+                (viewModel.hasPreparedPlayer && !viewModel.hasPlaybackEnded && !viewModel.isFullscreen && !inlinePlayerIsReadyForDisplay)
+            {
                 ProgressView()
                     .tint(.white)
                     .scaleEffect(1.15)
+            }
+
+            if !viewModel.isFullscreen {
+                FocusNativePlaybackControls(viewModel: viewModel, isFullscreen: false, title: detail.title,
+                                            accentColor: accentColor,
+                                            onBottomOcclusionChange: { controlsBottomInset = $0 })
+                FocusNativeSubtitleOverlay(viewModel: viewModel, isFullscreen: false, bottomInset: controlsBottomInset)
+                    .allowsHitTesting(false)
             }
 
             if let message = viewModel.playerErrorMessage {
@@ -164,7 +213,6 @@ struct FocusNativeVideoDetailView: View {
         .frame(maxWidth: .infinity)
         .aspectRatio(max(detail.aspectRatio, 0.5), contentMode: .fit)
         .clipped()
-        .accessibilityLabel("原生视频播放器")
     }
 
     private func playerPlaceholder(coverURL: URL?) -> some View {
@@ -433,158 +481,42 @@ struct FocusNativeVideoDetailView: View {
 
     @ViewBuilder
     private var commentsSection: some View {
-        if !viewModel.comments.isEmpty {
-            VStack(alignment: .leading, spacing: 14) {
+        if !viewModel.comments.isEmpty || viewModel.commentsErrorMessage != nil {
+            Group {
                 Text("评论 · \(viewModel.displayedCommentCount)")
                     .font(.headline)
                 ForEach(viewModel.comments) { comment in
                     FocusNativeVideoCommentRow(
                         viewModel: viewModel,
                         comment: comment,
-                        onOpenURL: onOpenURL
-                    )
-                }
-                if viewModel.hasMoreComments {
-                    Button(action: viewModel.loadMoreComments) {
-                        HStack(spacing: 8) {
-                            if viewModel.isLoadingMoreComments {
-                                ProgressView()
-                                    .controlSize(.small)
-                            }
-                            Text(viewModel.isLoadingMoreComments ? "正在加载…" : "加载更多评论")
-                        }
-                        .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(viewModel.isLoadingMoreComments)
-                }
-            }
-        }
-    }
-}
-
-struct FocusNativeVideoControlDock: View {
-    @ObservedObject var viewModel: FocusNativeVideoViewModel
-
-    var body: some View {
-        HStack(spacing: 8) {
-            FocusVideoControlButton(
-                systemImage: viewModel.isPlaying ? "pause.fill" : "play.fill",
-                title: viewModel.isPlaying ? "暂停" : "播放",
-                accessibilityLabel: viewModel.isPlaying ? "暂停视频" : "播放视频",
-                action: viewModel.togglePlayback
-            )
-            FocusVideoControlButton(
-                systemImage: "speedometer",
-                title: FocusNativeVideoFormatting.rate(viewModel.playbackRate),
-                accessibilityLabel: "切换播放速度",
-                action: viewModel.cyclePlaybackRate
-            )
-            FocusVideoControlButton(
-                systemImage: "text.bubble",
-                title: viewModel.isDanmakuEnabled ? "开" : "关",
-                isActive: viewModel.isDanmakuEnabled,
-                accessibilityLabel: viewModel.isDanmakuEnabled ? "关闭弹幕" : "开启弹幕",
-                action: viewModel.toggleDanmaku
-            )
-            FocusNativeSubtitleControl(viewModel: viewModel)
-            FocusVideoControlButton(
-                systemImage: "arrow.up.left.and.arrow.down.right",
-                title: "全屏",
-                accessibilityLabel: "进入全屏",
-                action: viewModel.requestFullscreen
-            )
-        }
-        .padding(8)
-        .frame(maxWidth: .infinity)
-        .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(FocusSharedDesign.chromePanelBackground.opacity(0.32))
-        )
-    }
-}
-
-private struct FocusNativeSubtitleControl: View {
-    @Environment(\.colorScheme) private var colorScheme
-    @ObservedObject var viewModel: FocusNativeVideoViewModel
-
-    var body: some View {
-        Menu {
-            if viewModel.isSubtitleEnabled {
-                Button {
-                    viewModel.disableSubtitles()
-                } label: {
-                    Label("关闭字幕", systemImage: "captions.bubble")
-                }
-            } else {
-                Button {
-                    viewModel.enableSubtitles()
-                } label: {
-                    Label("开启字幕", systemImage: "captions.bubble.fill")
-                }
-            }
-
-            if !viewModel.subtitleTracks.isEmpty {
-                Divider()
-                ForEach(viewModel.subtitleTracks) { track in
-                    Button {
-                        viewModel.selectSubtitleTrack(track)
-                    } label: {
-                        if viewModel.isSubtitleEnabled,
-                           viewModel.selectedSubtitleTrackID == track.id
-                        {
-                            Label(track.displayName, systemImage: "checkmark")
-                        } else {
-                            Text(track.displayName)
-                        }
-                    }
-                    .disabled(track.isLocked)
-                }
-            }
-
-            switch viewModel.subtitleLoadState {
-            case .failed:
-                Divider()
-                Button("重新加载字幕", action: viewModel.retrySubtitles)
-            case .unavailable:
-                Text("当前分集暂无字幕")
-            case .idle, .loadingTracks, .loadingDocument, .ready:
-                EmptyView()
-            }
-        } label: {
-            HStack(spacing: 7) {
-                Image(systemName: viewModel.isSubtitleEnabled
-                    ? "captions.bubble.fill"
-                    : "captions.bubble")
-                    .font(.system(size: 15, weight: .semibold))
-                Text(viewModel.subtitleControlTitle)
-                    .font(.subheadline.weight(.semibold))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.72)
-            }
-            .foregroundStyle(
-                viewModel.isSubtitleEnabled
-                    ? FocusSharedDesign.primary
-                    : FocusSharedDesign.videoControlForeground
-            )
-            .frame(maxWidth: .infinity, minHeight: 42)
-            .background(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(
-                        viewModel.isSubtitleEnabled
-                            ? FocusSharedDesign.primary.opacity(0.16)
-                            : FocusSharedDesign.chromeButtonBackground.opacity(
-                                colorScheme == .dark ? 0.86 : 0.92
+                        onOpenURL: onOpenURL,
+                        onOpenImages: { urls, index in
+                            commentGalleryRequest = FocusImageGalleryRequest(
+                                urls: urls,
+                                initialIndex: index,
+                                referer: viewModel.currentURL?.absoluteString ?? "https://www.bilibili.com/"
                             )
+                        }
                     )
-            )
+                    .onAppear { viewModel.commentDidAppear(comment.id) }
+                }
+                if let message = viewModel.commentsErrorMessage {
+                    Text(message)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    Button("重试加载评论", action: viewModel.retryComments)
+                        .buttonStyle(.bordered)
+                } else if viewModel.hasMoreComments {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("正在加载评论…")
+                    }
+                    .frame(maxWidth: .infinity)
+                    .onAppear { viewModel.loadMoreComments() }
+                }
+            }
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel(
-            viewModel.isSubtitleEnabled
-                ? "字幕已开启，\(viewModel.selectedSubtitleTrack?.displayName ?? "正在加载")"
-                : "字幕已关闭"
-        )
     }
 }
 
@@ -668,6 +600,7 @@ private struct FocusNativeVideoCommentRow: View {
     @ObservedObject var viewModel: FocusNativeVideoViewModel
     let comment: FocusVideoComment
     let onOpenURL: (URL) -> Void
+    let onOpenImages: ([URL], Int) -> Void
 
     var body: some View {
         let thread = viewModel.commentThreadState(for: comment.id)
@@ -704,13 +637,20 @@ private struct FocusNativeVideoCommentRow: View {
                 )
                 .fixedSize(horizontal: false, vertical: true)
 
+                FocusCommentImageStrip(
+                    urls: comment.imageURLs,
+                    referer: "https://www.bilibili.com/",
+                    onSelect: { onOpenImages(comment.imageURLs, $0) }
+                )
+
                 if !viewModel.replies(for: comment).isEmpty {
                     VStack(alignment: .leading, spacing: 9) {
                         ForEach(viewModel.replies(for: comment)) { reply in
                             FocusNativeVideoReplyRow(
                                 viewModel: viewModel,
                                 reply: reply,
-                                onOpenURL: onOpenURL
+                                onOpenURL: onOpenURL,
+                                onOpenImages: onOpenImages
                             )
                         }
                     }
@@ -800,6 +740,7 @@ private struct FocusNativeVideoReplyRow: View {
     @ObservedObject var viewModel: FocusNativeVideoViewModel
     let reply: FocusVideoComment
     let onOpenURL: (URL) -> Void
+    let onOpenImages: ([URL], Int) -> Void
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
@@ -841,6 +782,12 @@ private struct FocusNativeVideoReplyRow: View {
                     onOpenURL: onOpenURL
                 )
                 .fixedSize(horizontal: false, vertical: true)
+
+                FocusCommentImageStrip(
+                    urls: reply.imageURLs,
+                    referer: "https://www.bilibili.com/",
+                    onSelect: { onOpenImages(reply.imageURLs, $0) }
+                )
             }
         }
     }
@@ -886,6 +833,7 @@ private struct FocusNativeCommentLikeButton: View {
 private struct FocusNativeSubtitleOverlay: View {
     @ObservedObject var viewModel: FocusNativeVideoViewModel
     let isFullscreen: Bool
+    let bottomInset: CGFloat
 
     var body: some View {
         TimelineView(
@@ -897,6 +845,18 @@ private struct FocusNativeSubtitleOverlay: View {
             let content = viewModel.subtitleText(
                 at: viewModel.subtitlePlaybackPositionMilliseconds
             )
+            FocusNativeSubtitleCaption(content: content, isFullscreen: isFullscreen, bottomInset: bottomInset)
+        }
+        .accessibilityHidden(true)
+    }
+}
+
+struct FocusNativeSubtitleCaption: View {
+    let content: String
+    let isFullscreen: Bool
+    let bottomInset: CGFloat
+
+    var body: some View {
             VStack {
                 Spacer(minLength: 0)
                 if !content.isEmpty {
@@ -925,35 +885,35 @@ private struct FocusNativeSubtitleOverlay: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .padding(.bottom, isFullscreen ? 64 : 14)
-        }
-        .accessibilityHidden(true)
+            .padding(.bottom, max(14, bottomInset + 8))
     }
 }
 
-private struct FocusNativeDanmakuOverlay: View {
+struct FocusNativeDanmakuOverlay: View {
     @ObservedObject var viewModel: FocusNativeVideoViewModel
+    @State private var placements: [FocusNativeDanmakuLayout.Placement] = []
+    #if DEBUG
+    var onFixtureFrame: ((CFTimeInterval, Int64) -> Void)?
+    #endif
 
     var body: some View {
         GeometryReader { geometry in
             let laneHeight: CGFloat = 32
             let usableHeight = geometry.size.height * 0.75
             let laneCount = max(Int(usableHeight / laneHeight), 1)
-            let placements = FocusNativeDanmakuLayout.placements(
-                for: viewModel.danmakus,
-                laneCount: laneCount
-            )
-
-            TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !viewModel.isPlaying)) { _ in
-                let playbackMilliseconds = viewModel.isPlaying
-                    ? viewModel.danmakuPlaybackPositionMilliseconds
-                    : viewModel.playbackPositionMilliseconds
+            // Let SwiftUI follow the display cadence, including ProMotion.
+            // A 30 Hz ceiling makes the travel steps especially visible at 3x.
+            TimelineView(.animation(paused: !viewModel.isPlaying || !viewModel.isDanmakuEnabled)) { _ in
+                let playbackMilliseconds = viewModel.danmakuPlaybackPositionMilliseconds
                 Canvas { context, size in
-                    for placement in placements {
+                    guard viewModel.isDanmakuEnabled else { return }
+                    #if DEBUG
+                    onFixtureFrame?(CACurrentMediaTime(), playbackMilliseconds)
+                    #endif
+                    for placement in FocusNativeDanmakuLayout.activePlacements(
+                        in: placements, at: playbackMilliseconds
+                    ) {
                         let elapsed = playbackMilliseconds - placement.danmaku.progressMilliseconds
-                        guard elapsed >= 0, elapsed < FocusNativeDanmakuLayout.displayMilliseconds else {
-                            continue
-                        }
 
                         let color = FocusNativeDanmakuLayout.color(placement.danmaku.colorRGB)
                         let fontScale = min(max(CGFloat(placement.danmaku.fontSize) / 25, 0.72), 1.44)
@@ -964,14 +924,10 @@ private struct FocusNativeDanmakuOverlay: View {
                         let textSize = resolvedText.measure(
                             in: CGSize(width: .greatestFiniteMagnitude, height: laneHeight)
                         )
-                        let x: CGFloat
-                        switch placement.danmaku.mode {
-                        case .scrolling:
-                            let progress = CGFloat(elapsed) / CGFloat(FocusNativeDanmakuLayout.displayMilliseconds)
-                            x = size.width - progress * (size.width + textSize.width)
-                        case .top, .bottom:
-                            x = (size.width - textSize.width) / 2
-                        }
+                        let x = FocusNativeDanmakuLayout.horizontalPosition(
+                            mode: placement.danmaku.mode, elapsedMilliseconds: elapsed,
+                            viewportWidth: size.width, textWidth: textSize.width
+                        )
                         let y: CGFloat
                         switch placement.danmaku.mode {
                         case .bottom:
@@ -998,10 +954,19 @@ private struct FocusNativeDanmakuOverlay: View {
                     }
                 }
             }
+            .onAppear { rebuildPlacements(laneCount: laneCount) }
+            .onChange(of: laneCount) { rebuildPlacements(laneCount: $0) }
+            .onChange(of: viewModel.danmakus) { _ in rebuildPlacements(laneCount: laneCount) }
         }
         .opacity(viewModel.isDanmakuEnabled ? 1 : 0)
         .clipped()
         .accessibilityHidden(true)
+    }
+
+    private func rebuildPlacements(laneCount: Int) {
+        // Player progress publishes several times a second. Only new comments
+        // or a different viewport need to scan and assign the complete timeline.
+        placements = FocusNativeDanmakuLayout.placements(for: viewModel.danmakus, laneCount: laneCount)
     }
 }
 
@@ -1037,9 +1002,40 @@ private struct FocusNativeDanmakuStatusOverlay: View {
 enum FocusNativeDanmakuLayout {
     static let displayMilliseconds: Int64 = 5_000
 
+    static func horizontalPosition(mode: FocusVideoDanmakuMode, elapsedMilliseconds: Int64,
+                                   viewportWidth: CGFloat, textWidth: CGFloat) -> CGFloat {
+        switch mode {
+        case .scrolling:
+            let progress = CGFloat(elapsedMilliseconds) / CGFloat(displayMilliseconds)
+            return viewportWidth - progress * (viewportWidth + textWidth)
+        case .top, .bottom:
+            return (viewportWidth - textWidth) / 2
+        }
+    }
+
     struct Placement {
         let danmaku: FocusVideoDanmaku
         let lane: Int
+    }
+
+    /// Placements preserve the view model's ascending progress order. Binary
+    /// bounds keep every frame proportional to visible comments, including seeks.
+    static func activePlacements(in placements: [Placement], at position: Int64) -> ArraySlice<Placement> {
+        guard position >= 0 else { return placements[0..<0] }
+        func upperBound(_ timestamp: Int64) -> Int {
+            var lower = 0
+            var upper = placements.count
+            while lower < upper {
+                let middle = lower + (upper - lower) / 2
+                if placements[middle].danmaku.progressMilliseconds <= timestamp {
+                    lower = middle + 1
+                } else {
+                    upper = middle
+                }
+            }
+            return lower
+        }
+        return placements[upperBound(position - displayMilliseconds)..<upperBound(position)]
     }
 
     static func placements(
@@ -1094,11 +1090,17 @@ private extension FocusVideoDanmakuMode {
     }
 }
 
-private struct FocusNativePlayerSurface: UIViewControllerRepresentable {
+struct FocusNativePlayerSurface: UIViewControllerRepresentable {
+    let surfaceID: UUID
     let player: AVPlayer
     let showsPlaybackControls: Bool
+    let onReadyForDisplayChange: (UUID, ObjectIdentifier?, Bool) -> Void
 
-    func makeUIViewController(context _: Context) -> AVPlayerViewController {
+    func makeCoordinator() -> Coordinator {
+        Coordinator(surfaceID: surfaceID, onReadyForDisplayChange: onReadyForDisplayChange)
+    }
+
+    func makeUIViewController(context: Context) -> AVPlayerViewController {
         let controller = AVPlayerViewController()
         controller.player = player
         controller.showsPlaybackControls = showsPlaybackControls
@@ -1109,10 +1111,15 @@ private struct FocusNativePlayerSurface: UIViewControllerRepresentable {
         controller.entersFullScreenWhenPlaybackBegins = false
         controller.exitsFullScreenWhenPlaybackEnds = false
         controller.view.backgroundColor = .black
+        context.coordinator.attach(controller: controller, player: player)
         return controller
     }
 
-    func updateUIViewController(_ controller: AVPlayerViewController, context _: Context) {
+    func updateUIViewController(_ controller: AVPlayerViewController, context: Context) {
+        context.coordinator.update(
+            surfaceID: surfaceID,
+            onReadyForDisplayChange: onReadyForDisplayChange
+        )
         if controller.player !== player {
             controller.player = player
         }
@@ -1122,36 +1129,260 @@ private struct FocusNativePlayerSurface: UIViewControllerRepresentable {
         controller.canStartPictureInPictureAutomaticallyFromInline = true
         controller.updatesNowPlayingInfoCenter = false
         controller.view.backgroundColor = .black
+        context.coordinator.update(player: player)
     }
 
-    static func dismantleUIViewController(_ controller: AVPlayerViewController, coordinator _: Void) {
+    static func dismantleUIViewController(_ controller: AVPlayerViewController, coordinator: Coordinator) {
+        coordinator.detach(controller: controller)
         controller.player = nil
+    }
+
+    @MainActor
+    final class Coordinator {
+        private var surfaceID: UUID
+        private weak var controller: AVPlayerViewController?
+        private weak var player: AVPlayer?
+        private var item: AVPlayerItem?
+        private var readinessObservation: NSKeyValueObservation?
+        private var itemObservation: NSKeyValueObservation?
+        private var onReadyForDisplayChange: (UUID, ObjectIdentifier?, Bool) -> Void
+        private var lastReportedReadiness = false
+        private var lastReportedItemID: ObjectIdentifier?
+        private var callbackGeneration = 0
+
+        init(
+            surfaceID: UUID,
+            onReadyForDisplayChange: @escaping (UUID, ObjectIdentifier?, Bool) -> Void
+        ) {
+            self.surfaceID = surfaceID
+            self.onReadyForDisplayChange = onReadyForDisplayChange
+        }
+
+        func attach(controller: AVPlayerViewController, player: AVPlayer) {
+            self.controller = controller
+            self.player = player
+            item = player.currentItem
+
+            readinessObservation = controller.observe(\.isReadyForDisplay, options: [.initial, .new]) {
+                [weak self, weak controller, weak player] _, _ in
+                let currentItem = player?.currentItem
+                Task { @MainActor [weak self, weak controller, weak player] in
+                    guard let self,
+                          let controller,
+                          let player,
+                          self.controller === controller,
+                          self.player === player,
+                          player.currentItem === currentItem
+                    else {
+                        return
+                    }
+                    self.handleReadiness(controller.isReadyForDisplay, for: currentItem)
+                }
+            }
+
+            itemObservation = player.observe(\.currentItem, options: [.initial, .new]) {
+                [weak self] player, _ in
+                let currentItem = player.currentItem
+                Task { @MainActor [weak self, weak player] in
+                    guard let self,
+                          let player,
+                          self.player === player,
+                          player.currentItem === currentItem
+                    else {
+                        return
+                    }
+                    self.handleItemChange(currentItem)
+                }
+            }
+        }
+
+        func update(
+            surfaceID: UUID,
+            onReadyForDisplayChange: @escaping (UUID, ObjectIdentifier?, Bool) -> Void
+        ) {
+            if self.surfaceID != surfaceID {
+                self.surfaceID = surfaceID
+                callbackGeneration += 1
+                lastReportedReadiness = false
+                lastReportedItemID = nil
+            }
+            self.onReadyForDisplayChange = onReadyForDisplayChange
+        }
+
+        func update(player: AVPlayer) {
+            guard self.player !== player else {
+                if self.item !== player.currentItem {
+                    handleItemChange(player.currentItem)
+                }
+                if let controller { handleReadiness(controller.isReadyForDisplay, for: player.currentItem) }
+                return
+            }
+            if let controller {
+                detach(controller: controller)
+                attach(controller: controller, player: player)
+            }
+        }
+
+        func detach(controller: AVPlayerViewController) {
+            guard self.controller === controller else { return }
+            readinessObservation?.invalidate()
+            itemObservation?.invalidate()
+            readinessObservation = nil
+            itemObservation = nil
+            self.controller = nil
+            player = nil
+            item = nil
+            callbackGeneration += 1
+        }
+
+        private var readinessForCurrentItem: Bool {
+            guard let controller,
+                  let player,
+                  let item,
+                  controller.isReadyForDisplay,
+                  controller.viewIfLoaded?.window != nil,
+                  player.currentItem === item,
+                  controller.player === player
+            else {
+                return false
+            }
+            return true
+        }
+
+        private func handleItemChange(_ newItem: AVPlayerItem?) {
+            guard item !== newItem else { return }
+            item = newItem
+            publishReadiness(isReady: false, for: newItem)
+        }
+
+        func handleReadiness(_ isReady: Bool, for observedItem: AVPlayerItem?) {
+            guard let player,
+                  player.currentItem === observedItem
+            else {
+                return
+            }
+            // KVO tasks for currentItem and readiness may arrive in either order.
+            // Align the item before accepting its already-available first frame.
+            handleItemChange(observedItem)
+            publishReadiness(isReady: isReady && readinessForCurrentItem, for: observedItem)
+        }
+
+        private func publishReadiness(isReady: Bool, for item: AVPlayerItem?) {
+            let itemID = item.map(ObjectIdentifier.init)
+            guard lastReportedReadiness != isReady || lastReportedItemID != itemID else { return }
+            lastReportedReadiness = isReady
+            lastReportedItemID = itemID
+
+            callbackGeneration += 1
+            let generation = callbackGeneration
+            let surfaceID = self.surfaceID
+            let controllerID = controller.map(ObjectIdentifier.init)
+            let playerID = player.map(ObjectIdentifier.init)
+            let itemIDAtSchedule = itemID
+            guard let controllerID, let playerID else { return }
+            Task { @MainActor [weak self, weak controller, weak player, weak item] in
+                await Task.yield()
+                guard let self,
+                      self.callbackGeneration == generation,
+                      self.surfaceID == surfaceID,
+                      let controller,
+                      let player,
+                      self.controller === controller,
+                      self.player === player,
+                      ObjectIdentifier(controller) == controllerID,
+                      ObjectIdentifier(player) == playerID,
+                      player.currentItem === item,
+                      self.item === item
+                else {
+                    return
+                }
+                self.onReadyForDisplayChange(surfaceID, itemIDAtSchedule, isReady)
+            }
+        }
     }
 }
 
-private struct FocusNativeVideoFullscreenView: View {
+struct FocusNativeVideoFullscreenView: View {
     @ObservedObject var viewModel: FocusNativeVideoViewModel
+    let accentColor: Color
+    @State private var playerSurfaceID = UUID()
+    @State private var readyItemID: ObjectIdentifier?
+    @State private var controlsBottomInset: CGFloat = 90
+    @State private var usesSystemControls = false
 
     var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
-            if viewModel.hasPreparedPlayer, !viewModel.isLoadingPlayback {
-                FocusNativePlayerSurface(player: viewModel.player, showsPlaybackControls: true)
-                    .ignoresSafeArea()
-            } else {
-                ProgressView()
-                    .tint(.white)
-                    .scaleEffect(1.15)
+        GeometryReader { viewport in
+            let controlInsets = FocusNativePlaybackControls.contentInsets(isFullscreen: true, safeArea: viewport.safeAreaInsets)
+            ZStack {
+                Color.black
+                let requestID = viewModel.playbackDiagnosticID
+                let currentItemID = viewModel.player.currentItem.map(ObjectIdentifier.init)
+                FocusNativePlayerSurface(
+                    surfaceID: playerSurfaceID,
+                    player: viewModel.player,
+                    showsPlaybackControls: usesSystemControls,
+                    onReadyForDisplayChange: { surface, itemID, ready in
+                        guard surface == playerSurfaceID else { return }
+                        readyItemID = ready ? itemID : nil
+                        viewModel.recordSurfaceReadiness(surface: surface, itemID: itemID,
+                                                         isReady: ready, requestID: requestID,
+                                                         isFullscreenSurface: true)
+                    }
+                )
+                .id(playerSurfaceID)
+                .accessibilityHidden(!usesSystemControls)
+                .onAppear { viewModel.activatePresentationSurface(playerSurfaceID) }
+                .onDisappear { viewModel.deactivatePresentationSurface(playerSurfaceID) }
+                if !viewModel.hasPlaybackEnded && (!viewModel.hasPreparedPlayer || viewModel.isLoadingPlayback || readyItemID != currentItemID) {
+                    ProgressView()
+                        .tint(.white)
+                        .scaleEffect(1.15)
+                }
+                FocusNativeDanmakuOverlay(viewModel: viewModel)
+                    .allowsHitTesting(false)
+                FocusNativeDanmakuStatusOverlay(viewModel: viewModel)
+                    .frame(maxHeight: .infinity, alignment: .top)
+                    .padding(.top, controlInsets.top + 44)
+                if usesSystemControls {
+                    VStack {
+                        HStack {
+                            Button { usesSystemControls = false } label: {
+                                Label("返回播放器控件", systemImage: "chevron.left")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(.white)
+                                    .padding(.horizontal, 14)
+                                    .frame(minHeight: 44)
+                                    .background(.black.opacity(0.6), in: Capsule())
+                            }
+                            Spacer()
+                        }
+                        Spacer()
+                    }
+                    .padding(controlInsets)
+                } else {
+                    FocusNativePlaybackControls(viewModel: viewModel, isFullscreen: true,
+                                                title: viewModel.detail?.title ?? "",
+                                                accentColor: accentColor,
+                                                safeAreaInsets: viewport.safeAreaInsets,
+                                                onShowSystemControls: { usesSystemControls = true },
+                                                onBottomOcclusionChange: { controlsBottomInset = $0 })
+                }
+                FocusNativeSubtitleOverlay(viewModel: viewModel, isFullscreen: true,
+                                           bottomInset: usesSystemControls ? 64 : max(controlsBottomInset, viewport.safeAreaInsets.bottom))
+                    .allowsHitTesting(false)
+                if let message = viewModel.playerErrorMessage {
+                    VStack(spacing: 12) {
+                        Text(message).font(.footnote).foregroundStyle(.white).multilineTextAlignment(.center)
+                        Button("重试播放", action: viewModel.retryPlayback).buttonStyle(.borderedProminent)
+                    }
+                    .padding(20)
+                    .background(.black.opacity(0.75), in: RoundedRectangle(cornerRadius: 12))
+                    .padding(48)
+                }
             }
-            FocusNativeDanmakuOverlay(viewModel: viewModel)
-                .ignoresSafeArea()
-                .allowsHitTesting(false)
-            FocusNativeSubtitleOverlay(viewModel: viewModel, isFullscreen: true)
-                .ignoresSafeArea()
-                .allowsHitTesting(false)
-            FocusNativeDanmakuStatusOverlay(viewModel: viewModel)
-                .frame(maxHeight: .infinity, alignment: .top)
-                .padding(.top, 18)
+            .frame(width: viewport.size.width + viewport.safeAreaInsets.leading + viewport.safeAreaInsets.trailing,
+                   height: viewport.size.height + viewport.safeAreaInsets.top + viewport.safeAreaInsets.bottom)
+            .offset(x: -viewport.safeAreaInsets.leading, y: -viewport.safeAreaInsets.top)
         }
         .statusBarHidden(true)
         .onDisappear {

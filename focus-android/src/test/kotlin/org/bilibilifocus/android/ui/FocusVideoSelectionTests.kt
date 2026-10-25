@@ -2,10 +2,15 @@ package org.bilibilifocus.android.ui
 
 import android.content.pm.ActivityInfo
 import org.bilibilifocus.android.ui.video.FocusPhysicalOrientation
+import org.bilibilifocus.android.ui.video.FocusVideoDeviceType
 import org.bilibilifocus.android.ui.video.FocusVideoFullscreenPolicy
 import org.bilibilifocus.android.ui.video.FocusVideoRotationPolicy
+import org.bilibilifocus.android.ui.video.historyPositionForRequestedPage
 import org.bilibilifocus.android.ui.video.currentVideoEpisodeIndex
+import org.bilibilifocus.android.ui.video.commentImageGalleryRequest
 import org.bilibilifocus.android.ui.video.parseRequestedCid
+import org.bilibilifocus.android.ui.video.parseRequestedHistoryPositionMillis
+import org.bilibilifocus.android.ui.video.parseRequestedPage
 import org.bilibilifocus.android.ui.video.requestedLandscapeOrientation
 import org.bilibilifocus.android.ui.video.resolveActivePage
 import org.bilibilifocus.android.ui.video.videoEpisodeURL
@@ -20,6 +25,125 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class FocusVideoSelectionTests {
+    @Test
+    fun `comment gallery keeps clicked comment image index when URLs repeat`() {
+        val images = listOf("https://i0.hdslb.com/same.jpg", "https://i0.hdslb.com/other.jpg", "https://i0.hdslb.com/same.jpg")
+
+        val request = commentImageGalleryRequest(
+            imageURLs = images,
+            imageIndex = 2,
+            referer = "https://www.bilibili.com/video/BV1TEST00001",
+        )
+
+        assertEquals(images, request.images)
+        assertEquals(2, request.initialIndex)
+    }
+
+    @Test
+    fun `history item link carries its part and saved position`() {
+        val item = org.bilibilifocus.core.model.HistoryItem(
+            title = "测试视频",
+            coverURL = "",
+            bvid = "BV1TEST00001",
+            cid = 202,
+            authorName = "UP",
+            viewAt = 1,
+            progress = 87,
+            duration = 180,
+        )
+        val url = historyItemVideoURL(item)
+
+        assertEquals(
+            "https://www.bilibili.com/video/BV1TEST00001/?cid=202&focus_history_position_ms=87000",
+            url,
+        )
+        assertEquals(202, parseRequestedCid(url))
+        assertEquals(87_000, parseRequestedHistoryPositionMillis(url))
+        assertEquals(
+            null,
+            parseRequestedHistoryPositionMillis("https://www.bilibili.com/video/BV1TEST00001/"),
+        )
+    }
+
+    @Test
+    fun `history item uses page when cid is absent and restarts completed items`() {
+        val item = org.bilibilifocus.core.model.HistoryItem(
+            title = "测试视频",
+            coverURL = "",
+            bvid = "BV1TEST00001",
+            page = 3,
+            authorName = "UP",
+            viewAt = 1,
+            progress = -1,
+            duration = 180,
+        )
+
+        val url = historyItemVideoURL(item)
+
+        assertEquals(
+            "https://www.bilibili.com/video/BV1TEST00001/?p=3&focus_history_position_ms=0",
+            url,
+        )
+        assertEquals(3, parseRequestedPage(url))
+        assertEquals(0, parseRequestedHistoryPositionMillis(url))
+        assertEquals(
+            "https://www.bilibili.com/video/BV1TEST00001/",
+            historyItemVideoURL(item.copy(page = 0, progress = 0)),
+        )
+        assertEquals(
+            "https://www.bilibili.com/video/BV1TEST00001/",
+            historyItemVideoURL(item.copy(page = 0, progress = 87)),
+        )
+        assertEquals(
+            "https://www.bilibili.com/video/BV1TEST00001/?p=3",
+            historyItemVideoURL(item.copy(progress = Long.MAX_VALUE)),
+        )
+    }
+
+    @Test
+    fun `history position is used only for its requested part`() {
+        assertEquals(
+            87_000,
+            historyPositionForRequestedPage(
+                positionMillis = 87_000,
+                requestedPageNumber = null,
+                requestedPageCid = 202,
+                activePageNumber = 2,
+                activePageCid = 202,
+            ),
+        )
+        assertEquals(
+            null,
+            historyPositionForRequestedPage(
+                positionMillis = 87_000,
+                requestedPageNumber = null,
+                requestedPageCid = 202,
+                activePageNumber = 1,
+                activePageCid = 101,
+            ),
+        )
+        assertEquals(
+            87_000,
+            historyPositionForRequestedPage(
+                positionMillis = 87_000,
+                requestedPageNumber = 3,
+                requestedPageCid = null,
+                activePageNumber = 3,
+                activePageCid = 303,
+            ),
+        )
+        assertEquals(
+            null,
+            historyPositionForRequestedPage(
+                positionMillis = 87_000,
+                requestedPageNumber = null,
+                requestedPageCid = null,
+                activePageNumber = 1,
+                activePageCid = 101,
+            ),
+        )
+    }
+
     @Test
     fun `server resume selects the last page unless the url explicitly selects one`() {
         val info = videoInfo()
@@ -130,6 +254,30 @@ class FocusVideoSelectionTests {
             ),
         )
         assertFalse(
+            FocusVideoRotationPolicy.shouldObservePhysicalOrientation(
+                isPhone = true,
+                isVideoLoaded = true,
+                prefersPortraitFullscreen = false,
+                isInPictureInPictureMode = false,
+                isInMultiWindowMode = true,
+            ),
+        )
+        assertFalse(
+            FocusVideoRotationPolicy.shouldApplyActivityOrientation(
+                isInPictureInPictureMode = false,
+                isInMultiWindowMode = true,
+            ),
+        )
+        assertTrue(
+            FocusVideoRotationPolicy.shouldCompleteFullscreenExit(
+                isPhone = true,
+                isCompletingFullscreenExit = true,
+                configurationOrientation = android.content.res.Configuration.ORIENTATION_LANDSCAPE,
+                isInPictureInPictureMode = false,
+                isInMultiWindowMode = true,
+            ),
+        )
+        assertFalse(
             FocusVideoRotationPolicy.shouldCompleteFullscreenExit(
                 isPhone = true,
                 isCompletingFullscreenExit = true,
@@ -139,6 +287,71 @@ class FocusVideoSelectionTests {
         )
         assertFalse(FocusVideoRotationPolicy.shouldApplyActivityOrientation(true))
         assertTrue(FocusVideoRotationPolicy.shouldApplyActivityOrientation(false))
+    }
+
+    @Test
+    fun `multiwindow return ignores the listener snapshot then accepts the next rotation`() {
+        var ignoreInitialOrientation = false
+
+        // Entering the Xiaomi-style app window arms a one-shot ignore that survives exit.
+        if (FocusVideoRotationPolicy.shouldArmInitialOrientationIgnore(
+                isInPictureInPictureMode = false,
+                isInMultiWindowMode = true,
+            )
+        ) {
+            ignoreInitialOrientation = true
+        }
+        // Returning to the full window re-enables the listener; its first landscape report
+        // is only the current posture, not a new rotate gesture.
+        assertTrue(
+            FocusVideoRotationPolicy.shouldIgnoreInitialOrientationEvent(
+                isInitialOrientation = true,
+                ignoreInitialOrientation = ignoreInitialOrientation,
+                orientation = FocusPhysicalOrientation.LandscapeClockwise,
+            ),
+        )
+        ignoreInitialOrientation = false // onInitialOrientationConsumed
+        assertFalse(
+            FocusVideoRotationPolicy.shouldIgnoreInitialOrientationEvent(
+                isInitialOrientation = false,
+                ignoreInitialOrientation = ignoreInitialOrientation,
+                orientation = FocusPhysicalOrientation.LandscapeClockwise,
+            ),
+        )
+    }
+
+    @Test
+    fun `fullscreen exit completes in multiwindow even when it expands past tablet breakpoint`() {
+        val phoneWidthType = FocusVideoDeviceType.fromSmallestWidth(599)
+        val expandedWindowType = FocusVideoDeviceType.fromSmallestWidth(600)
+
+        assertTrue(
+            FocusVideoRotationPolicy.shouldCompleteFullscreenExit(
+                isPhone = phoneWidthType == FocusVideoDeviceType.Phone,
+                isCompletingFullscreenExit = true,
+                configurationOrientation = android.content.res.Configuration.ORIENTATION_LANDSCAPE,
+                isInPictureInPictureMode = false,
+                isInMultiWindowMode = true,
+            ),
+        )
+        assertTrue(
+            FocusVideoRotationPolicy.shouldCompleteFullscreenExit(
+                isPhone = expandedWindowType == FocusVideoDeviceType.Phone,
+                isCompletingFullscreenExit = true,
+                configurationOrientation = android.content.res.Configuration.ORIENTATION_LANDSCAPE,
+                isInPictureInPictureMode = false,
+                isInMultiWindowMode = true,
+            ),
+        )
+        assertFalse(
+            FocusVideoRotationPolicy.shouldCompleteFullscreenExit(
+                isPhone = false,
+                isCompletingFullscreenExit = true,
+                configurationOrientation = android.content.res.Configuration.ORIENTATION_LANDSCAPE,
+                isInPictureInPictureMode = false,
+                isInMultiWindowMode = false,
+            ),
+        )
     }
 
     @Test

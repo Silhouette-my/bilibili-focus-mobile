@@ -11,4 +11,5 @@ data class VideoComment(
     val replyCount: Long,
     val publishTime: Long,
     val replies: List<VideoComment> = emptyList(),
+    val imageURLs: List<String> = emptyList(),
 )

@@ -148,23 +148,48 @@ struct FocusRemoteImage<Content: View>: View {
     let referer: String
     let content: (FocusRemoteImagePhase) -> Content
 
-    @StateObject private var loader = FocusRemoteImageLoader()
+    @StateObject private var loader: FocusRemoteImageLoader
+    @Environment(\.displayScale) private var displayScale
+    @State private var measuredPixelSize: Int?
+
+    private struct LoadID: Hashable {
+        let url: URL?
+        let referer: String
+        let pixels: Int?
+    }
 
     init(
         url: URL?,
         referer: String = "https://www.bilibili.com/",
+        imageRepository: FocusImageRepository = .shared,
         @ViewBuilder content: @escaping (FocusRemoteImagePhase) -> Content
     ) {
         self.url = url
         self.referer = referer
         self.content = content
+        _loader = StateObject(wrappedValue: FocusRemoteImageLoader(repository: imageRepository))
     }
 
     var body: some View {
         content(displayPhase)
-            .task(id: url) {
-                await loader.load(url: url, referer: referer)
+            .background {
+                GeometryReader { geometry in
+                    Color.clear
+                        .onAppear { updateSize(geometry.size) }
+                        .onChange(of: geometry.size) { updateSize($0) }
+                        .onChange(of: displayScale) { _ in updateSize(geometry.size) }
+                }
             }
+            .task(id: LoadID(url: url, referer: referer, pixels: measuredPixelSize)) {
+                if url == nil { await loader.load(url: nil, referer: referer); return }
+                guard let measuredPixelSize else { return }
+                await loader.load(url: url, referer: referer, pixelSize: measuredPixelSize)
+            }
+    }
+
+    private func updateSize(_ size: CGSize) {
+        guard size.width > 0, size.height > 0 else { return }
+        measuredPixelSize = FocusImagePixelSize.bucket(for: size, scale: displayScale)
     }
 
     private var displayPhase: FocusRemoteImagePhase {
@@ -177,6 +202,7 @@ struct FocusInlineRichText: View {
     var font: Font = .body
     var foreground: Color = .primary
     var onOpenURL: (URL) -> Void = { _ in }
+    @Environment(\.displayScale) private var displayScale
 
     var body: some View {
         FocusInlineFlowLayout(spacing: 1) {
@@ -194,7 +220,11 @@ struct FocusInlineRichText: View {
                             if let linkURL { onOpenURL(linkURL) }
                         }
                 case let .emote(alt, url, _, _, _):
-                    FocusAnimatedRemoteImage(url: url, alt: alt)
+                    FocusAnimatedRemoteImage(
+                        url: url,
+                        alt: alt,
+                        pixelSize: FocusImagePixelSize.bucket(for: CGSize(width: 24, height: 24), scale: displayScale)
+                    )
                         .frame(width: 24, height: 24)
                         .accessibilityLabel(alt)
                 case let .resource(label, url):
@@ -303,19 +333,20 @@ private final class FocusEmoteImageView: UIView {
 private struct FocusAnimatedRemoteImage: UIViewRepresentable {
     let url: URL
     let alt: String
+    let pixelSize: Int
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeUIView(context: Context) -> FocusEmoteImageView {
         let view = FocusEmoteImageView()
         view.prepare(alt: alt)
-        context.coordinator.load(url: url, alt: alt, into: view)
+        context.coordinator.load(url: url, alt: alt, pixelSize: pixelSize, into: view)
         return view
     }
 
     func updateUIView(_ uiView: FocusEmoteImageView, context: Context) {
         uiView.prepare(alt: alt)
-        context.coordinator.load(url: url, alt: alt, into: uiView)
+        context.coordinator.load(url: url, alt: alt, pixelSize: pixelSize, into: uiView)
     }
 
     static func dismantleUIView(_ uiView: FocusEmoteImageView, coordinator: Coordinator) {
@@ -326,22 +357,34 @@ private struct FocusAnimatedRemoteImage: UIViewRepresentable {
     @MainActor
     final class Coordinator {
         private var task: Task<Void, Never>?
-        private var currentURL: URL?
+        private var currentRequest: Request?
+        private var generation = UUID()
 
-        func load(url: URL, alt: String, into imageView: FocusEmoteImageView) {
+        private struct Request: Equatable {
+            let url: URL
+            let pixelSize: Int
+        }
+
+        func load(url: URL, alt: String, pixelSize: Int, into imageView: FocusEmoteImageView) {
             imageView.prepare(alt: alt)
-            guard currentURL != url else { return }
-            currentURL = url
+            let request = Request(url: url, pixelSize: FocusImagePixelSize.normalized(pixelSize))
+            guard currentRequest != request else { return }
+            currentRequest = request
+            generation = UUID()
+            let requestGeneration = generation
             task?.cancel()
             imageView.showFallback()
             task = Task { @MainActor [weak imageView] in
-                var request = URLRequest(url: url)
-                request.setValue("https://www.bilibili.com/", forHTTPHeaderField: "Referer")
-                request.setValue("image/avif,image/webp,image/apng,image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
                 guard
-                    let (data, _) = try? await URLSession.shared.data(for: request),
+                    let image = try? await FocusImageRepository.shared.image(
+                        for: url,
+                        preferredReferer: "https://www.bilibili.com/",
+                        quality: .emote,
+                        pixelSize: request.pixelSize,
+                        animated: !UIAccessibility.isReduceMotionEnabled
+                    ),
                     !Task.isCancelled,
-                    let image = Self.decodedImage(data: data)
+                    self.generation == requestGeneration
                 else { return }
                 imageView?.show(
                     image,
@@ -351,37 +394,10 @@ private struct FocusAnimatedRemoteImage: UIViewRepresentable {
         }
 
         func cancel() {
+            generation = UUID()
             task?.cancel()
             task = nil
-            currentURL = nil
-        }
-
-        @MainActor
-        private static func decodedImage(data: Data) -> UIImage? {
-            guard let source = CGImageSourceCreateWithData(data as CFData, nil) else {
-                return UIImage(data: data)
-            }
-            let count = CGImageSourceGetCount(source)
-            guard count > 1, !UIAccessibility.isReduceMotionEnabled else {
-                return CGImageSourceCreateImageAtIndex(source, 0, nil).map(UIImage.init(cgImage:))
-            }
-            var frames: [UIImage] = []
-            var duration: TimeInterval = 0
-            for index in 0 ..< min(count, 120) {
-                guard let cgImage = CGImageSourceCreateImageAtIndex(source, index, nil) else { continue }
-                frames.append(UIImage(cgImage: cgImage))
-                let properties = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any]
-                let gif = properties?[kCGImagePropertyGIFDictionary] as? [CFString: Any]
-                let png = properties?[kCGImagePropertyPNGDictionary] as? [CFString: Any]
-                let delay = (gif?[kCGImagePropertyGIFUnclampedDelayTime] as? Double)
-                    ?? (gif?[kCGImagePropertyGIFDelayTime] as? Double)
-                    ?? (png?[kCGImagePropertyAPNGUnclampedDelayTime] as? Double)
-                    ?? (png?[kCGImagePropertyAPNGDelayTime] as? Double)
-                    ?? 0.1
-                duration += max(delay, 0.02)
-            }
-            guard !frames.isEmpty else { return nil }
-            return UIImage.animatedImage(with: frames, duration: max(duration, 0.1)) ?? frames[0]
+            currentRequest = nil
         }
     }
 }
@@ -391,6 +407,46 @@ struct FocusImageGalleryRequest: Identifiable {
     let urls: [URL]
     let initialIndex: Int
     let referer: String
+}
+
+struct FocusCommentImageStrip: View {
+    let urls: [URL]
+    let referer: String
+    var imageRepository: FocusImageRepository = .shared
+    let onSelect: (Int) -> Void
+
+    var body: some View {
+        if !urls.isEmpty {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(Array(urls.enumerated()), id: \.offset) { index, url in
+                        Button { onSelect(index) } label: {
+                            FocusRemoteImage(url: url, referer: referer, imageRepository: imageRepository) { phase in
+                                Group {
+                                    if case let .success(image) = phase {
+                                        image.resizable().scaledToFill()
+                                    } else {
+                                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                            .fill(Color(uiColor: .tertiarySystemFill))
+                                            .overlay {
+                                                if case .empty = phase { ProgressView().controlSize(.mini) }
+                                                else { Image(systemName: "photo").foregroundStyle(.tertiary) }
+                                            }
+                                    }
+                                }
+                                .frame(width: 82, height: 82)
+                                .clipped()
+                            }
+                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("评论图片 \(index + 1)")
+                    }
+                }
+            }
+            .frame(height: 82)
+        }
+    }
 }
 
 struct FocusImageGalleryView: View {
@@ -614,10 +670,12 @@ private final class FocusGalleryImageLoader: ObservableObject {
         self.requestID = requestID
         phase = .empty
 
-        if let thumbnail = await FocusImageRepository.shared.cachedImage(
+        let thumbnail = await FocusImageRepository.shared.cachedImage(
             for: url,
             quality: .thumbnail
-        ) {
+        )
+        guard !Task.isCancelled, self.requestID == requestID else { return }
+        if let thumbnail {
             phase = .success(thumbnail)
         }
 
@@ -651,9 +709,83 @@ private extension Int {
     }
 }
 
+private final class FocusFixtureOfflineImageProtocol: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
+    }
+    override func stopLoading() {}
+}
+
+enum FocusImagePixelSize {
+    static let buckets = [128, 256, 384, 512, 768, 1_024, 1_536, 2_048, 3_072, 4_096]
+
+    static func bucket(for size: CGSize, scale: CGFloat) -> Int {
+        let pixels = max(size.width, size.height) * max(scale, 1)
+        guard pixels.isFinite, pixels > 0 else { return 128 }
+        return buckets.first { CGFloat($0) >= pixels } ?? 4_096
+    }
+
+    static func normalized(_ pixels: Int) -> Int {
+        buckets.first { $0 >= max(1, pixels) } ?? 4_096
+    }
+}
+
+enum FocusImageRequestPriority: Sendable {
+    case visible, prefetch
+}
+
+/// Only prefetchers wait here; visible requests never enter this queue. Two
+/// prefetch slots leave the session's remaining host connections for visible
+/// images. Pending prefetch has no in-flight repository entry to block a viewer.
+actor FocusImagePrefetchLimiter {
+    static let shared = FocusImagePrefetchLimiter()
+    private struct Waiter {
+        let id: UUID
+        let continuation: CheckedContinuation<Void, Error>
+    }
+    private let limit: Int
+    private var active: Set<UUID> = []
+    private var waiters: [Waiter] = []
+
+    init(limit: Int = 2) { precondition(limit > 0); self.limit = limit }
+
+    func acquire(_ id: UUID) async throws {
+        try Task.checkCancellation()
+        if active.count < limit { active.insert(id); return }
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                waiters.append(Waiter(id: id, continuation: continuation))
+            }
+        } onCancel: {
+            Task { await self.cancelWaiting(id) }
+        }
+        try Task.checkCancellation()
+    }
+
+    private func cancelWaiting(_ id: UUID) {
+        guard let index = waiters.firstIndex(where: { $0.id == id }) else { return }
+        waiters.remove(at: index).continuation.resume(throwing: CancellationError())
+    }
+
+    func release(_ id: UUID) {
+        guard active.remove(id) != nil else { return }
+        if !waiters.isEmpty {
+            let waiter = waiters.removeFirst()
+            active.insert(waiter.id)
+            waiter.continuation.resume()
+        }
+    }
+
+    var activeCount: Int { active.count }
+    var waitingCount: Int { waiters.count }
+}
+
 enum FocusImageLoadQuality: String, Hashable, Sendable {
     case thumbnail
     case gallery
+    case emote
 }
 
 actor FocusImageRepository {
@@ -662,9 +794,11 @@ actor FocusImageRepository {
     private struct RequestKey: Hashable {
         let url: URL
         let quality: FocusImageLoadQuality
+        let pixelSize: Int
+        let animated: Bool
 
         var cacheKey: NSString {
-            "\(url.absoluteString)#focus-\(quality.rawValue)" as NSString
+            "\(url.absoluteString)#focus-\(quality.rawValue)-\(pixelSize)-\(animated)" as NSString
         }
     }
 
@@ -677,7 +811,7 @@ actor FocusImageRepository {
     private let session: URLSession
     private var inFlight: [RequestKey: InFlightRequest] = [:]
 
-    init() {
+    init(session: URLSession? = nil) {
         let cache = NSCache<NSString, UIImage>()
         cache.countLimit = 192
         cache.totalCostLimit = 64 * 1024 * 1024
@@ -691,29 +825,43 @@ actor FocusImageRepository {
         )
         configuration.requestCachePolicy = .returnCacheDataElseLoad
         configuration.timeoutIntervalForRequest = 20
-        configuration.httpCookieAcceptPolicy = .always
-        self.session = URLSession(configuration: configuration)
+        configuration.httpCookieStorage = nil
+        configuration.httpShouldSetCookies = false
+        configuration.httpMaximumConnectionsPerHost = 6
+        if session == nil, FocusTestRuntime.isRunningFixtures {
+            configuration.protocolClasses = [FocusFixtureOfflineImageProtocol.self]
+        }
+        self.session = session ?? URLSession(configuration: configuration)
     }
 
-    func cachedImage(for url: URL, quality: FocusImageLoadQuality) -> UIImage? {
+    var activeConsumerCount: Int { inFlight.values.reduce(0) { $0 + $1.consumers.count } }
+    var inFlightRequestCount: Int { inFlight.count }
+
+    func cachedImage(for url: URL, quality: FocusImageLoadQuality, pixelSize: Int = 1_600) -> UIImage? {
         let canonicalURL = Self.canonicalImageURL(url)
-        return cache.object(forKey: RequestKey(url: canonicalURL, quality: quality).cacheKey)
+        let pixels = quality == .gallery ? 0 : FocusImagePixelSize.normalized(pixelSize)
+        return cache.object(forKey: RequestKey(
+            url: canonicalURL,
+            quality: quality,
+            pixelSize: pixels,
+            animated: quality == .emote
+        ).cacheKey)
     }
 
     func image(
         for url: URL,
         preferredReferer: String,
-        quality: FocusImageLoadQuality = .thumbnail
+        quality: FocusImageLoadQuality = .thumbnail,
+        pixelSize: Int = 1_600,
+        animated: Bool = true,
+        priority: FocusImageRequestPriority = .visible
     ) async throws -> UIImage {
+        try Task.checkCancellation()
         let canonicalURL = Self.canonicalImageURL(url)
-        let key = RequestKey(url: canonicalURL, quality: quality)
-        if let cached = cache.object(forKey: key.cacheKey) {
-            return cached
-        }
-
-        if let cached = cache.object(forKey: key.cacheKey) {
-            return cached
-        }
+        let pixels = quality == .gallery ? 0 : FocusImagePixelSize.normalized(pixelSize)
+        let shouldAnimate = quality == .emote && animated
+        let key = RequestKey(url: canonicalURL, quality: quality, pixelSize: pixels, animated: shouldAnimate)
+        if let cached = cache.object(forKey: key.cacheKey) { return cached }
 
         let consumerID = UUID()
         let fetchTask: Task<UIImage, Error>
@@ -723,12 +871,14 @@ actor FocusImageRepository {
             fetchTask = request.task
         } else {
             let session = self.session
-            fetchTask = Task.detached(priority: .utility) {
+            fetchTask = Task.detached(priority: priority == .visible ? .userInitiated : .utility) {
                 try await Self.fetchImage(
                     from: canonicalURL,
                     preferredReferer: preferredReferer,
                     session: session,
-                    quality: quality
+                    quality: quality,
+                    pixelSize: pixels,
+                    animated: shouldAnimate
                 )
             }
             inFlight[key] = InFlightRequest(
@@ -771,7 +921,9 @@ actor FocusImageRepository {
         from url: URL,
         preferredReferer: String,
         session: URLSession,
-        quality: FocusImageLoadQuality
+        quality: FocusImageLoadQuality,
+        pixelSize: Int,
+        animated: Bool
     ) async throws -> UIImage {
         let referers = [preferredReferer, "https://t.bilibili.com/", "https://www.bilibili.com/", ""]
             .reduce(into: [String]()) { values, referer in
@@ -789,7 +941,7 @@ actor FocusImageRepository {
                     if !referer.isEmpty {
                         request.setValue(referer, forHTTPHeaderField: "Referer")
                     }
-                    request.httpShouldHandleCookies = true
+                    request.httpShouldHandleCookies = false
                     request.setValue(
                         "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
                         forHTTPHeaderField: "User-Agent"
@@ -799,18 +951,20 @@ actor FocusImageRepository {
                     request.setValue("zh-CN,zh-Hans;q=0.9", forHTTPHeaderField: "Accept-Language")
 
                     let (data, response) = try await session.data(for: request)
-                    guard
-                        let response = response as? HTTPURLResponse,
-                        (200 ..< 300).contains(response.statusCode),
-                        let image = decodedImage(from: data, quality: quality)
-                    else {
-                        continue
-                    }
+                    try Task.checkCancellation()
+                    guard let response = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+                    if response.statusCode == 403 || response.statusCode == 404 { continue }
+                    guard (200 ..< 300).contains(response.statusCode) else { throw URLError(.badServerResponse) }
+                    guard let image = decodedImage(from: data, quality: quality, pixelSize: pixelSize, animated: animated) else { continue }
                     return image
                 } catch is CancellationError {
                     throw CancellationError()
+                } catch let error as URLError where error.code == .cancelled {
+                    throw CancellationError()
                 } catch {
-                    continue
+                    // Offline, timeout, TLS and server errors do not become a
+                    // Referer/URL Cartesian-product retry storm.
+                    throw error
                 }
             }
         }
@@ -818,13 +972,45 @@ actor FocusImageRepository {
         throw URLError(.cannotDecodeContentData)
     }
 
-    private static func decodedImage(from data: Data, quality: FocusImageLoadQuality) -> UIImage? {
+    private static func decodedImage(from data: Data, quality: FocusImageLoadQuality, pixelSize: Int, animated: Bool) -> UIImage? {
         switch quality {
         case .thumbnail:
-            return downsampledImage(from: data, maxPixelSize: 1_600)
+            return downsampledImage(from: data, maxPixelSize: pixelSize)
         case .gallery:
             return widthFittedGalleryImage(from: data)
+        case .emote:
+            return animatedEmoteImage(from: data, maxPixelSize: pixelSize, animated: animated)
         }
+    }
+
+    private static func animatedEmoteImage(from data: Data, maxPixelSize: Int, animated: Bool) -> UIImage? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, [
+            kCGImageSourceShouldCache: false
+        ] as CFDictionary) else {
+            return nil
+        }
+        let count = CGImageSourceGetCount(source)
+        guard count > 1, animated else {
+            return downsampledImage(from: source, maxPixelSize: maxPixelSize)
+        }
+        var frames: [UIImage] = []
+        var duration: TimeInterval = 0
+        for index in 0 ..< min(count, 120) {
+            if Task.isCancelled { return nil }
+            guard let frame = downsampledImage(from: source, index: index, maxPixelSize: maxPixelSize) else { continue }
+            frames.append(UIImage(cgImage: frame))
+            let properties = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any]
+            let gif = properties?[kCGImagePropertyGIFDictionary] as? [CFString: Any]
+            let png = properties?[kCGImagePropertyPNGDictionary] as? [CFString: Any]
+            let delay = (gif?[kCGImagePropertyGIFUnclampedDelayTime] as? Double)
+                ?? (gif?[kCGImagePropertyGIFDelayTime] as? Double)
+                ?? (png?[kCGImagePropertyAPNGUnclampedDelayTime] as? Double)
+                ?? (png?[kCGImagePropertyAPNGDelayTime] as? Double)
+                ?? 0.1
+            duration += max(delay, 0.02)
+        }
+        guard let first = frames.first else { return nil }
+        return UIImage.animatedImage(with: frames, duration: max(duration, 0.1)) ?? first
     }
 
     private static func downsampledImage(from data: Data, maxPixelSize: Int) -> UIImage? {
@@ -865,16 +1051,22 @@ actor FocusImageRepository {
         from source: CGImageSource,
         maxPixelSize: Int
     ) -> UIImage? {
+        guard let image = downsampledImage(from: source, index: 0, maxPixelSize: maxPixelSize) else { return nil }
+        return UIImage(cgImage: image)
+    }
+
+    private static func downsampledImage(
+        from source: CGImageSource,
+        index: Int,
+        maxPixelSize: Int
+    ) -> CGImage? {
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
             kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
             kCGImageSourceShouldCacheImmediately: true
         ]
-        guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
-            return nil
-        }
-        return UIImage(cgImage: image)
+        return CGImageSourceCreateThumbnailAtIndex(source, index, options as CFDictionary)
     }
 
     private static func canonicalImageURL(_ url: URL) -> URL {
@@ -898,6 +1090,15 @@ actor FocusImageRepository {
     }
 
     private static func cacheCost(for image: UIImage) -> Int {
+        if let frames = image.images, !frames.isEmpty {
+            return frames.reduce(into: 0) { total, frame in
+                total += decodedCost(for: frame)
+            }
+        }
+        return decodedCost(for: image)
+    }
+
+    private static func decodedCost(for image: UIImage) -> Int {
         guard let image = image.cgImage else {
             return Int(image.size.width * image.size.height * image.scale * image.scale)
         }
@@ -910,9 +1111,14 @@ actor FocusImageRepository {
 final class FocusRemoteImageLoader: ObservableObject {
     @Published fileprivate var phase: FocusRemoteImagePhase = .empty
 
+    private let repository: FocusImageRepository
     private var requestID: UUID?
 
-    func load(url: URL?, referer: String) async {
+    init(repository: FocusImageRepository = .shared) {
+        self.repository = repository
+    }
+
+    func load(url: URL?, referer: String, pixelSize: Int = 1_600) async {
         let requestID = UUID()
         self.requestID = requestID
 
@@ -923,9 +1129,10 @@ final class FocusRemoteImageLoader: ObservableObject {
 
         phase = .empty
         do {
-            let image = try await FocusImageRepository.shared.image(
+            let image = try await repository.image(
                 for: url,
-                preferredReferer: referer
+                preferredReferer: referer,
+                pixelSize: pixelSize
             )
             guard
                 !Task.isCancelled,
@@ -944,15 +1151,46 @@ final class FocusRemoteImageLoader: ObservableObject {
         }
     }
 
-    nonisolated static func prefetch(urls: [URL], referer: String) async {
-        for url in urls {
-            guard !Task.isCancelled else {
-                return
+    nonisolated static func prefetch(
+        urls: [URL], referer: String, pixelSize: Int = 768,
+        repository: FocusImageRepository = .shared,
+        limiter: FocusImagePrefetchLimiter = .shared
+    ) async {
+        var seen: Set<URL> = []
+        var candidates: [URL] = []
+        // A LazyFilterCollection may evaluate its predicate repeatedly while
+        // calculating prefix indices; a mutating dedup predicate is not pure.
+        for url in urls where seen.insert(url).inserted {
+            candidates.append(url)
+            if candidates.count == 24 { break }
+        }
+        await withTaskGroup(of: Bool.self) { group in
+            var next = 0
+            func enqueue(_ url: URL) {
+                group.addTask {
+                    let lease = UUID()
+                    var continueBatch = true
+                    do {
+                        try await limiter.acquire(lease)
+                        try Task.checkCancellation()
+                        _ = try await repository.image(for: url, preferredReferer: referer,
+                                                       pixelSize: pixelSize, priority: .prefetch)
+                    } catch is CancellationError {
+                        continueBatch = false
+                    } catch let error as URLError {
+                        continueBatch = ![.cancelled, .notConnectedToInternet, .timedOut,
+                                          .networkConnectionLost, .cannotFindHost, .dnsLookupFailed]
+                            .contains(error.code)
+                    } catch { /* Other failures remain local to this optional image. */ }
+                    await limiter.release(lease)
+                    return continueBatch
+                }
             }
-            _ = try? await FocusImageRepository.shared.image(
-                for: url,
-                preferredReferer: referer
-            )
+            for url in candidates.prefix(2) { enqueue(url); next += 1 }
+            for await continueBatch in group {
+                if Task.isCancelled || !continueBatch { group.cancelAll(); break }
+                if next < candidates.count { enqueue(candidates[next]); next += 1 }
+            }
         }
     }
 }

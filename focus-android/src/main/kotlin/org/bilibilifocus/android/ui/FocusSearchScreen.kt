@@ -59,14 +59,11 @@ import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import kotlinx.coroutines.flow.distinctUntilChanged
-import org.bilibilifocus.android.AndroidCookieProvider
 import org.bilibilifocus.android.FocusSearchViewModel
 import org.bilibilifocus.android.SearchUiState
 import org.bilibilifocus.core.model.SearchResultFilter
 import org.bilibilifocus.core.model.SearchResultItem
 import org.bilibilifocus.core.model.SearchResultSection
-import org.bilibilifocus.core.service.KtorHttpClient
-import org.bilibilifocus.core.service.SearchResultService
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -85,7 +82,7 @@ fun FocusSearchScreen(
     val resolvedResultColumns = resultColumns.coerceAtLeast(1)
 
     // 从动态页搜索框带入的查询：自动填入并搜索一次
-    LaunchedEffect(initialQuery) {
+    LaunchedEffect(viewModel, initialQuery) {
         val q = initialQuery
         if (!q.isNullOrBlank()) {
             searchQuery = q
@@ -178,15 +175,19 @@ fun FocusSearchScreen(
             is SearchUiState.Loaded -> {
                 val listState = rememberLazyListState()
                 val videoSection = s.sections.firstOrNull { it.filter == SearchResultFilter.VIDEO }
+                val lastVideoRowKey = videoSection?.items?.takeIf { it.isNotEmpty() }?.let { items ->
+                    val firstInLastRow = ((items.size - 1) / resolvedResultColumns) * resolvedResultColumns
+                    "${videoSection.id}:row:${items[firstInLastRow].id}"
+                }
                 val loadMoreThreshold = with(LocalDensity.current) { 240.dp.roundToPx() }
 
-                LaunchedEffect(listState, videoSection?.items?.lastOrNull()?.id) {
+                LaunchedEffect(listState, lastVideoRowKey) {
                     val currentSection = videoSection ?: return@LaunchedEffect
                     val lastItemID = currentSection.items.lastOrNull()?.id ?: return@LaunchedEffect
                     snapshotFlow {
                         val layoutInfo = listState.layoutInfo
                         val visibleSection = layoutInfo.visibleItemsInfo
-                            .firstOrNull { it.key == currentSection.id }
+                            .firstOrNull { it.key == lastVideoRowKey }
                         visibleSection != null &&
                             visibleSection.offset + visibleSection.size <=
                             layoutInfo.viewportEndOffset + loadMoreThreshold
@@ -210,14 +211,26 @@ fun FocusSearchScreen(
                     ),
                     verticalArrangement = Arrangement.spacedBy(16.dp),
                 ) {
-                    items(s.sections, key = { it.id }) { section ->
-                        FocusSearchSection(
-                            section = section,
-                            onOpenItem = onOpenItem,
-                            onOpenPreview = { item -> onOpenItem(item) },
-                            resultColumns = resolvedResultColumns,
-                            isLoadingMore = isLoadingMore && section.filter == SearchResultFilter.VIDEO,
-                        )
+                    s.sections.forEach { section ->
+                        if (section.filter == SearchResultFilter.VIDEO || section.filter == SearchResultFilter.LIVE) {
+                            item(key = section.id) { SearchSectionTitle(section.title) }
+                            // Rows, not an entire paginated section, are lazy items.
+                            items(gridRows(section.items, resolvedResultColumns), key = { row -> "${section.id}:row:${row.first().id}" }) { row ->
+                                SearchVideoRow(row, resolvedResultColumns, onOpenItem)
+                            }
+                            if (isLoadingMore && section.filter == SearchResultFilter.VIDEO) {
+                                item(key = "${section.id}:loading") { SearchLoadingMore() }
+                            }
+                        } else {
+                            item(key = section.id) {
+                                FocusSearchSection(
+                                    section = section,
+                                    onOpenItem = onOpenItem,
+                                    onOpenPreview = onOpenItem,
+                                    resultColumns = resolvedResultColumns,
+                                )
+                            }
+                        }
                     }
                     item { Spacer(modifier = Modifier.height(8.dp)) }
                 }
@@ -270,43 +283,11 @@ private fun FocusSearchSection(
     onOpenItem: (SearchResultItem) -> Unit,
     onOpenPreview: (SearchResultItem) -> Unit,
     resultColumns: Int,
-    isLoadingMore: Boolean,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        Text(
-            text = section.title,
-            style = MaterialTheme.typography.titleSmall,
-            color = MaterialTheme.colorScheme.onBackground,
-        )
+        SearchSectionTitle(section.title)
 
         when (section.filter) {
-            SearchResultFilter.VIDEO, SearchResultFilter.LIVE -> {
-                val rows = gridRows(section.items, resultColumns)
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    rows.forEach { rowItems ->
-                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                            rowItems.forEach { item ->
-                                ElevatedCard(
-                                    onClick = { onOpenItem(item) },
-                                    shape = RoundedCornerShape(16.dp),
-                                    colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surface),
-                                    elevation = CardDefaults.elevatedCardElevation(defaultElevation = 1.dp),
-                                    modifier = Modifier.weight(1f),
-                                ) {
-                                    FocusSearchVideoCard(
-                                        item = item,
-                                        resultColumns = resultColumns,
-                                    )
-                                }
-                            }
-                            repeat(resultColumns - rowItems.size) {
-                                Spacer(modifier = Modifier.weight(1f))
-                            }
-                        }
-                    }
-                }
-            }
-
             SearchResultFilter.USERS -> {
                 val userColumns = resultColumns.coerceAtMost(2)
                 val rows = gridRows(section.items, userColumns)
@@ -382,18 +363,36 @@ private fun FocusSearchSection(
             else -> {}
         }
 
-        if (isLoadingMore) {
-            Box(
-                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
-                contentAlignment = Alignment.Center,
+    }
+}
+
+@Composable
+private fun SearchSectionTitle(title: String) {
+    Text(title, style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onBackground)
+}
+
+@Composable
+private fun SearchVideoRow(row: List<SearchResultItem>, columns: Int, onOpenItem: (SearchResultItem) -> Unit) {
+    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        row.forEach { item ->
+            ElevatedCard(
+                onClick = { onOpenItem(item) },
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surface),
+                elevation = CardDefaults.elevatedCardElevation(defaultElevation = 1.dp),
+                modifier = Modifier.weight(1f),
             ) {
-                CircularProgressIndicator(
-                    modifier = Modifier.size(24.dp),
-                    strokeWidth = 2.dp,
-                    color = MaterialTheme.colorScheme.primary,
-                )
+                FocusSearchVideoCard(item = item, resultColumns = columns)
             }
         }
+        repeat(columns - row.size) { Spacer(modifier = Modifier.weight(1f)) }
+    }
+}
+
+@Composable
+private fun SearchLoadingMore() {
+    Box(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), contentAlignment = Alignment.Center) {
+        CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp, color = MaterialTheme.colorScheme.primary)
     }
 }
 

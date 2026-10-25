@@ -3,6 +3,81 @@ import Foundation
 import Testing
 
 struct DynamicFeedServiceTests {
+    @Test func cancelledSnapshotWriterCannotOverwriteTheAcceptedFeed() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = DynamicFeedSnapshotStore(fileURL: directory.appendingPathComponent("feed.json"))
+        let cookies = DynamicSnapshotSaveCookies()
+        let service = DynamicFeedService(cookieProvider: cookies, snapshotStore: store)
+        let cards = try DynamicFeedService.decodeCards(from: Data(samplePayload.utf8))
+        let oldSave = Task { try await service.saveSnapshot(cards: [cards[0]], nextOffset: "old", version: 0, revision: 0) }
+        await cookies.waitUntilReading()
+        oldSave.cancel()
+        try await store.save(cards: [cards[1]], nextOffset: "accepted", scope: .accountID(42), revision: 0)
+        await cookies.release()
+        await #expect(throws: CancellationError.self) { try await oldSave.value }
+        #expect(await store.load(scope: .accountID(42))?.nextOffset == "accepted")
+
+        // Also exercise cancellation at the actor boundary, independently of
+        // the service's post-cookie suspension check.
+        let queuedSave = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            try await store.save(cards: [cards[0]], nextOffset: "queued-old", scope: .accountID(42), revision: 0)
+        }
+        await #expect(throws: CancellationError.self) { try await queuedSave.value }
+        #expect(await store.load(scope: .accountID(42))?.nextOffset == "accepted")
+    }
+
+    @Test func persistentSnapshotSurvivesReopenAndExpiresWithoutCrossingAccounts() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("feed.json")
+        let store = DynamicFeedSnapshotStore(fileURL: file)
+        let cards = try DynamicFeedService.decodeCards(from: Data(samplePayload.utf8))
+        let account = FocusPlaybackAccountScope.accountID(42)
+        let now = Date(timeIntervalSince1970: 1_000_000)
+        try await store.save(cards: cards, nextOffset: "next", scope: account, revision: 0, now: now)
+        let reopened = DynamicFeedSnapshotStore(fileURL: file)
+        #expect(await reopened.load(scope: account, now: now)?.cards == cards)
+        #expect(await reopened.load(scope: .accountID(43), now: now) == nil)
+        #expect(await reopened.load(scope: account, now: now.addingTimeInterval(8 * 24 * 3600)) == nil)
+        let bytes = try String(contentsOf: file, encoding: .utf8)
+        #expect(!bytes.contains("SESSDATA"))
+        #expect(!bytes.contains("DedeUserID"))
+    }
+
+    @Test func clearingSnapshotsFencesLateWritesAndCapacityKeepsCompletePages() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("feed.json")
+        let store = DynamicFeedSnapshotStore(fileURL: file)
+        let cards = try DynamicFeedService.decodeCards(from: Data(samplePayload.utf8))
+        let account = FocusPlaybackAccountScope.accountID(42)
+        let oldRevision = await store.writeRevision()
+        try await store.save(cards: cards, nextOffset: "valid", scope: account, revision: oldRevision)
+        try await store.save(cards: Array(repeating: cards[0], count: 301), nextOffset: "gap", scope: account, revision: oldRevision)
+        #expect(await store.load(scope: account)?.nextOffset == "valid")
+        try await store.clear()
+        try await store.save(cards: cards, nextOffset: "late", scope: account, revision: oldRevision)
+        #expect(await store.load(scope: account) == nil)
+        #expect(!FileManager.default.fileExists(atPath: file.path))
+        for id in 1...4 {
+            try await store.save(cards: cards, nextOffset: nil, scope: .accountID(Int64(id)), revision: await store.writeRevision(),
+                                 now: Date().addingTimeInterval(Double(id)))
+        }
+        #expect(await store.load(scope: .accountID(1)) == nil)
+        #expect(await store.load(scope: .accountID(4)) != nil)
+    }
+
+    @Test func terminalHasMoreWinsOverAnEchoedCursor() throws {
+        for flag in ["false", "0"] {
+            let data = Data("{\"code\":0,\"data\":{\"items\":[],\"offset\":\"last\",\"has_more\":\(flag)}}".utf8)
+            #expect(try DynamicFeedService.decodeFeedPage(from: data).nextOffset == nil)
+        }
+        let continuing = Data(#"{"code":0,"data":{"items":[],"offset":"next","has_more":true}}"#.utf8)
+        #expect(try DynamicFeedService.decodeFeedPage(from: continuing).nextOffset == "next")
+    }
+
     @Test
     func decodeCardsMapsVideoAndImageDynamics() throws {
         let data = Data(samplePayload.utf8)
@@ -226,6 +301,8 @@ struct DynamicFeedServiceTests {
 }
 
 private struct EmptyCookieProvider: CookieSnapshotProvider {
+    // A completed authoritative empty read, not an uncertain initialization.
+    var sessionReadiness: CookieSessionReadiness { .anonymous }
     func loadCookies() async -> [HTTPCookie] {
         []
     }
@@ -340,6 +417,27 @@ private let samplePayload = """
   }
 }
 """
+
+private actor DynamicSnapshotSaveCookies: CookieSnapshotProvider {
+    nonisolated var sessionReadiness: CookieSessionReadiness { .authenticated }
+    private var continuation: CheckedContinuation<[HTTPCookie], Never>?
+    private var readerWaiters: [CheckedContinuation<Void, Never>] = []
+    func loadCookies() async -> [HTTPCookie] {
+        await withCheckedContinuation { continuation in
+            self.continuation = continuation
+            readerWaiters.forEach { $0.resume() }
+            readerWaiters.removeAll()
+        }
+    }
+    func waitUntilReading() async {
+        if continuation != nil { return }
+        await withCheckedContinuation { readerWaiters.append($0) }
+    }
+    func release() {
+        continuation?.resume(returning: [HTTPCookie(properties: [.domain: ".bilibili.com", .path: "/", .name: "DedeUserID", .value: "42"])!])
+        continuation = nil
+    }
+}
 
 private let genericMajorPayload = """
 {

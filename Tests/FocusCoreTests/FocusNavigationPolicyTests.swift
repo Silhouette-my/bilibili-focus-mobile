@@ -4,6 +4,17 @@ import Testing
 
 struct FocusNavigationPolicyTests {
     @Test
+    func downloadBlockingMatchesDomainBoundariesRatherThanSubstrings() {
+        let policy = FocusNavigationPolicy()
+        for host in ["bilibili.com", "www.bilibili.com", "static.hdslb.com"] {
+            #expect(policy.decision(for: URL(string: "https://\(host)/download")!) == .cancel)
+        }
+        for host in ["notbilibili.com", "bilibili.com.example.org", "nothdslb.com"] {
+            #expect(policy.decision(for: URL(string: "https://\(host)/download")!) == .allow)
+        }
+    }
+
+    @Test
     func canonicalizesDynamicDetailToDesktopOpusPage() {
         let url = URL(string: "https://t.bilibili.com/123456789")!
 
