@@ -4,7 +4,7 @@
 
 ## 范围与工作区保护
 
-工作目录：`/Users/michaeltan/Desktop/Programming/Bilibili-FOCUS/bilibili-FOCUS-iOS`。
+工作目录：本仓库根目录。
 
 原始基线目录（下文记为 `$B`）：`../performance-foundation-baseline-20261016-194504`。原始 `files/`、`manifest.json`、`status.txt`、`worktree.diff`、`index.diff`、`branch.txt`、`head.txt` 及开发期失败证据保留。初始 HEAD 为 `b5e72d07c1db82c70be8e90a72f8f2472c73a668`，分支为 `codex/ios-kmp-integration`。
 

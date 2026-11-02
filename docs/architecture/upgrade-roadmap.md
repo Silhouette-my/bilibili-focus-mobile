@@ -4,7 +4,7 @@
 
 2026-10-29 产品调整：按用户选择，双端已移除“稍后再看”客户端能力，不清空账号远端列表。
 下文相关内容是历史实现记录，不再属于后续路线。新的个人中心、播放与内容管理进展以
-[双端改进记录](CLIENT_MATURITY_IMPLEMENTATION.md) 为准。
+[双端改进记录](../records/2026-10-29-client-maturity.md) 为准。
 
 ## 4–12 周：已完成
 
@@ -110,7 +110,7 @@
 
 ### 20–28 周：离线只读与性能
 
-- iOS feed 已有账号隔离的持久快照（最多 3 个账号、每账号 300 条、7 天和 8 MiB 总量），并已有分阶段性能诊断与有界图片预取。实现和离线验证见 [性能基础](PERFORMANCE_FOUNDATION.md)、[后续优化](PERFORMANCE_FOLLOWUP.md)；动态返回的后续布局修复见 [专项记录](DYNAMIC_SCROLL_RETURN_FIX.md)。这些历史合成结果不替代真机性能测量。
+- iOS feed 已有账号隔离的持久快照（最多 3 个账号、每账号 300 条、7 天和 8 MiB 总量），并已有分阶段性能诊断与有界图片预取。实现和离线验证见 [性能基础](../records/2026-10-16-performance-foundation.md)、[后续优化](../records/2026-10-17-performance-followup.md)；动态返回的后续布局修复见 [专项记录](../records/2026-10-17-dynamic-scroll-return-fix.md)。这些历史合成结果不替代真机性能测量。
 - 下一步评估 Android feed，以及两端 history、favorite 元数据的账号隔离持久缓存。
 - 评估 SQLDelight 作为 KMP 数据层；iOS 在迁移完成前保持 repository protocol，避免 UI 直接依赖具体数据库。
 - 增加封面磁盘预算、LRU 清理、列表预取上限和低数据模式。

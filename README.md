@@ -28,7 +28,7 @@
 
 为了方便无法在本地配置开发环境的读者，本项目在 Release 页面直接提供编译好的成品包：
 
-已发布版本：**1.0.1**。此前本地 iOS 安装包为 **1.0.2（build 6）**，包含进度条、自动画质及前期播放/性能优化。当前源码正在推进双端个人中心与播放器改进，旧安装包不包含这些新改动。构建与验证范围见 [播放器与性能记录](docs/PERFORMANCE_FOLLOWUP.md) 和 [本次实施记录](docs/CLIENT_MATURITY_IMPLEMENTATION.md)。下方 Release 下载仍为 1.0.1。
+已发布版本：**1.0.1**。此前本地 iOS 安装包为 **1.0.2（build 6）**，包含进度条、自动画质及前期播放/性能优化。当前源码正在推进双端个人中心与播放器改进，旧安装包不包含这些新改动。构建与验证范围见 [播放器与性能记录](docs/records/2026-10-17-performance-followup.md) 和 [本次实施记录](docs/records/2026-10-29-client-maturity.md)。下方 Release 下载仍为 1.0.1。
 
 👉 **[前往 Releases 页面下载 1.0.1](https://github.com/Silhouette-my/bilibili-focus-mobile/releases/tag/1.0.1)**
 
@@ -66,13 +66,13 @@
 │   └── ui/video          # 拆分后的播放器、控件、弹幕、详情与评论 UI
 ├── Scripts               # 构建、运行时/契约同步与 opt-in 在线 smoke
 ├── Tests                 # Swift Core 与 iOS 应用层测试
-└── docs                  # 升级路线、在线 smoke 与维护说明
+└── docs                  # 指南、架构、工作记录与设计系统（见 docs/README.md）
 ```
 
 iOS 现以 Swift `FocusCore` 为主要生产实现，同时链接静态 `FocusKMP` framework。
 主页重定向已经通过 Router adapter 进入 KMP 运行路径，并与 Swift 结果做一致性
 校验和安全回退；网络服务仍由 Swift 提供，后续按 feature 渐进迁移。具体边界见
-升级路线图。
+[升级路线图](docs/architecture/upgrade-roadmap.md)。
 
 ---
 
@@ -94,8 +94,7 @@ App target 会在编译 Swift 源码前通过 `Scripts/build_kmp_for_xcode.sh` �
 *命令行源码构建：*
 
 ```bash
-./Scripts/build_unsigned_ipa.sh
-
+./Scripts/build_unsigned_ipa.sh   # 输出到 build/dist/BilibiliFocus-unsigned.ipa
 ```
 
 ### Android 运行
@@ -107,84 +106,30 @@ App target 会在编译 Swift 源码前通过 `Scripts/build_kmp_for_xcode.sh` �
 ```bash
 export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
 ./gradlew :focus-android:assembleDebug
-
 ```
 
 ---
 
 ## 🧪 自动化测试
 
-本地迭代先跑改动对应的测试；提交前看 Debug 回归，发布候选再做完整 Release 验收。
-
-### 第 1 层：只跑改动相关测试
-
-例如修改导航策略，分别验证实际改动的平台，不必每次重跑全部平台：
+提交前的核心回归：
 
 ```bash
-# Swift FocusCore：按测试类型过滤；也可进一步指定单个测试方法。
-FOCUS_INCLUDE_TESTS=1 swift test --disable-sandbox --filter FocusNavigationPolicyTests
-
-# KMP：只运行导航策略测试类，不附带其他模块的测试任务。
-./gradlew :focus-core:testDebugUnitTest --tests 'org.bilibilifocus.core.routing.FocusNavigationPolicyTests'
-```
-
-测试输出应包含所选类型，零项匹配不能当作通过。修改 Web 注入或 API 契约时，
-另跑下方对应的同步／语法检查；涉及 Swift/KMP 共享行为时，两边对应测试都跑。
-
-### 第 2 层：提交前的核心回归
-
-Pull Request 和 `main` 分支更新自动执行 Debug 回归与构建。修改共享配置、
-跨模块接口、登录或持久化时，不只依赖单个测试；运行受影响平台的完整核心测试。
-
-* **iOS 核心测试**：`FOCUS_INCLUDE_TESTS=1 swift test --disable-sandbox`
-* **iOS Release 边界测试**：`FOCUS_INCLUDE_TESTS=1 swift test -c release --disable-sandbox`
-* **Web 注入规则验证**：`swift run FocusVerifier`
-* **Android 单元测试**：`./gradlew :focus-android:testDebugUnitTest :focus-core:testDebugUnitTest`
-* **KMP iOS 编译/链接门禁**：`./gradlew :focus-core:compileKotlinIosSimulatorArm64 :focus-core:linkDebugFrameworkIosSimulatorArm64`
-* **跨平台运行时一致性**：`./Scripts/sync_focus_runtime.sh --check`
-* **Kotlin 内嵌 JavaScript 语法**：`node Scripts/check_kotlin_feature_scripts.mjs`（不访问网络）
-* **Bilibili API 契约一致性**：`./Scripts/sync_bilibili_api_contracts.mjs --check`
-* **在线 API smoke（默认跳过）**：`node ./Scripts/run_online_smoke.mjs`
-
-Pull Request 和 `main` 分支更新运行 Debug 核心测试、运行时／API 契约检查、
-FocusVerifier、KMP iOS 编译链接、Xcode 单元测试、Android Lint 与 Debug APK 构建。
-
-### 第 3 层：发布候选完整验收
-
-发布候选在 GitHub Actions 手动运行 **CI**（`workflow_dispatch`）。它会在第 2 层
-之外执行 Release Swift 测试、无签名 iOS Release 构建与 Android Release 编译，
-这三项不再随每次提交重复执行。单独执行命令保持可用。真实账号在线 smoke
-仍须显式选择，按下方在线 Smoke 说明执行，不因本地测试通过而自动发起。
-
-### Web 注入运行时同步
-
-`Sources/FocusCore/Resources/focus-runtime.js` 是 Web 注入运行时的唯一编辑源；
-`focus-core/src/commonMain/resources/focus-runtime.js` 是供 Kotlin Multiplatform
-打包的提交内镜像。修改运行时后执行：
-
-```bash
-./Scripts/sync_focus_runtime.sh --sync
+FOCUS_INCLUDE_TESTS=1 swift test --disable-sandbox
+./gradlew :focus-android:testDebugUnitTest :focus-core:testDebugUnitTest
 ./Scripts/sync_focus_runtime.sh --check
+./Scripts/sync_bilibili_api_contracts.mjs --check
 ```
 
-Gradle 的测试与 assemble 任务也依赖同一份一致性门禁，未同步时会直接失败。
+分层测试策略、Web 注入运行时同步、API 契约校验和本地产物清理见
+[测试与同步检查](docs/guides/testing.md)。真实账号的只读在线检查使用显式 opt-in，详见
+[在线 Smoke 说明](docs/guides/online-smoke.md)。
 
-### API 契约与升级路线
+## 📚 文档
 
-Swift 与 KMP 共享一份独立维护、仅含协议事实的 Bilibili API 端点子集。
-当前 52 个端点的 URL 与 HTTP method 可用同级 `bilibili-api` 仓库校验；历史搜索、删除与
-清空另有 3 个补充来源，记录在 catalog 的 `source.supplementalEndpoints` 中，
-不会被报告为通过同级仓库校验：
-
-```bash
-./Scripts/sync_bilibili_api_contracts.mjs --validate-source ../bilibili-api
-```
-
-完整的 4–12 周改造成果、许可边界和后续功能顺序见
-[升级路线图](docs/UPGRADE_ROADMAP.md)。
-2026-10-29 双端改进与验收进展见 [本次实施记录](docs/CLIENT_MATURITY_IMPLEMENTATION.md)。
-真实账号的只读在线检查使用显式 opt-in，详见
-[在线 Smoke 说明](docs/ONLINE_SMOKE.md)。
+* [文档索引](docs/README.md)：指南、架构、按日期的工作记录与设计系统
+* [CHANGELOG](CHANGELOG.md)：各版本变化
+* [升级路线图](docs/architecture/upgrade-roadmap.md)：4–12 周改造成果、许可边界和后续功能顺序
 
 ---
 
@@ -192,5 +137,5 @@ Swift 与 KMP 共享一份独立维护、仅含协议事实的 Bilibili API 端�
 
 * **非商业/不考虑上架**：本项目默认按自用侧载方案设计，不以 App Store 或主流 Android 应用商店的审核兼容为目标。
 * **维护依赖度高**：部分页面与数据接口依赖 Bilibili 当前的网页结构和 API，一旦上游发生重大改动，需要及时维护并更新相关规则。
-* **忽略文件说明**：`Build/` 目录、`*.ipa`、`*.apk` 以及各平台的构建缓存默认不会进入 Git 追踪，发布用成品请关注 Releases 页面。
+* **忽略文件说明**：`build/` 目录、`*.ipa`、`*.apk` 以及各平台的构建缓存默认不会进入 Git 追踪，发布用成品请关注 Releases 页面。
 * `localonly/` 目录下的内容仅供本地调试，不属于远端主线的分发物资。

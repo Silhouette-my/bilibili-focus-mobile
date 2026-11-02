@@ -12,7 +12,7 @@
 
 直接 KVO 校正会在同周期 offset/frame 共同重基时产生两次反向校正（`DynamicSuccessRebase.xcresult`）；提交前合并虽通过专项，全量仍有迟到位移。这两种补偿及跳过 rootView 更新的尝试均已撤回，完整环境传递和强化后的重基回归保留。
 
-最终 iOS 18.6 完整回归 **168/168 通过**，见 `build/PhoneLayout-20261025/DynamicPointDelivery.xcresult`。iOS 26.3.1 为 **167/168**，唯一记录失败来自系统 Gestures 的 `InvalidTransition`，相同包的快速返回隔离复测四轮通过、无缺失、最大误差低于 0.001pt；整套结果与隔离结果分别保留。安装包及具体边界见 [build 5 交付证据](PERFORMANCE_FOLLOWUP.md#build-5-交付证据)。
+最终 iOS 18.6 完整回归 **168/168 通过**，见 `build/PhoneLayout-20261025/DynamicPointDelivery.xcresult`。iOS 26.3.1 为 **167/168**，唯一记录失败来自系统 Gestures 的 `InvalidTransition`，相同包的快速返回隔离复测四轮通过、无缺失、最大误差低于 0.001pt；整套结果与隔离结果分别保留。安装包及具体边界见 [build 5 交付证据](2026-10-17-performance-followup.md#build-5-交付证据)。
 
 ## 2026-10-25：build 4 的布局交接修复
 
@@ -34,7 +34,7 @@
 - iOS 18.6 完整 App 回归：**156/156 通过，0 失败、0 跳过**，结果为 `DeliveryIOS18-v21.xcresult`。
 - 完整回归 v20 在用户展开用例的准备阶段失败：ID 物化只承诺最小可见，而旧 setup 假定顶端对齐；直接设置一次 offset 后，80 行 LazyVStack 的前缀估算又可能把所需两行移出视口。最终该交互专项使用两张真实生产卡片，按实际坐标摆放，末端保有至少 240pt 滚动余量。只在打开详情前确认两行可见，返回后的首帧、±2pt、展开增高和旧校正不增加断言均保留。深列表、物化、旋转和快速导航仍由其他宿主用例覆盖，默认 80 行 fixture 未改。
 - iOS 26.3.1 的 `IOS26ScrollPlayer.xcresult` 中动态回归通过；该轮唯一失败为进度条测试把 UIKit `Float` 值强制与整数精确比较。按实际 slider 值修正测试后，播放器及最新搜索/网页专项在 `DeliveryIOS26-PlayerSearch.xcresult` 中 **19/19** 通过。
-- Release iphoneos 无签名构建通过，独立安装包为 `BilibiliFocus-1.0.2-build4-unsigned.ipa`；包内版本、arm64 架构、ZIP 完整性和无测试 bundle 已核对。播放器交互及真机验证边界见 [播放器与性能记录](PERFORMANCE_FOLLOWUP.md)。
+- Release iphoneos 无签名构建通过，独立安装包为 `BilibiliFocus-1.0.2-build4-unsigned.ipa`；包内版本、arm64 架构、ZIP 完整性和无测试 bundle 已核对。播放器交互及真机验证边界见 [播放器与性能记录](2026-10-17-performance-followup.md)。
 
 ## 2026-10-17 后续验证与 1.0.2（build 3）
 
@@ -73,7 +73,7 @@
 
 ## 工作区与证据基线
 
-项目：`/Users/michaeltan/Desktop/Programming/Bilibili-FOCUS/bilibili-FOCUS-iOS`。
+项目：本仓库根目录。
 
 分支：`codex/ios-kmp-integration`。开始时 HEAD：`b5e72d07c1db82c70be8e90a72f8f2472c73a668`。
 
