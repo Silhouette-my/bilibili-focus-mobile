@@ -7,6 +7,68 @@ private let playbackScopeB = FocusPlaybackAccountScope.accountID(2002)
 
 @Suite("Persistent playback progress and history outbox")
 struct FocusPlaybackProgressStoreTests {
+    @Test("remote deletion waits for in-flight submission and retires only old matching revisions")
+    func remoteDeletionCoordinatesWithOutbox() async throws {
+        let persistence = PlaybackStateMemoryPersistence()
+        let store = FocusPlaybackProgressStore(persistence: persistence)
+        _ = await store.recordProgressAndEnqueueHistory(accountScope: playbackScopeA, aid: 42, bvid: "BV-DELETED", cid: 101, positionMilliseconds: 10_000)
+        _ = await store.recordProgressAndEnqueueHistory(accountScope: playbackScopeA, aid: 42, bvid: "BV-DELETED", cid: 102, positionMilliseconds: 20_000)
+        _ = await store.recordProgressAndEnqueueHistory(accountScope: playbackScopeA, aid: 43, bvid: "BV-KEPT", cid: 103, positionMilliseconds: 30_000)
+        _ = await store.recordProgressAndEnqueueHistory(accountScope: playbackScopeB, aid: 42, bvid: "BV-OTHER-ACCOUNT", cid: 101, positionMilliseconds: 40_000)
+        let reportGate = HistoryMutationTestGate()
+        let deletionGate = HistoryMutationTestGate()
+        let delivered = PlaybackDeliveredReports()
+        let drain = Task {
+            await store.drainPendingHistory(accountScope: playbackScopeA) { report in
+                await delivered.append(report)
+                await reportGate.block()
+                return .delivered
+            }
+        }
+        await reportGate.waitUntilStarted()
+        let deletion = Task {
+            try await store.mutateRemoteHistory(accountScope: playbackScopeA, aid: 42) { await deletionGate.block() }
+        }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while !(await store.hasPendingHistoryMutation(accountScope: playbackScopeA)), ContinuousClock.now < deadline { await Task.yield() }
+        #expect(await store.hasPendingHistoryMutation(accountScope: playbackScopeA))
+        #expect(await deletionGate.hasStarted == false)
+        await reportGate.open()
+        await deletionGate.waitUntilStarted()
+        _ = await store.recordProgressAndEnqueueHistory(accountScope: playbackScopeA, aid: 42, bvid: "BV-DELETED", cid: 102, positionMilliseconds: 50_000)
+        await deletionGate.open()
+        try await deletion.value
+        _ = await drain.value
+        #expect(await delivered.values.count == 1)
+        let pending = await store.pendingHistoryReports(accountScope: playbackScopeA)
+        #expect(pending.count == 2)
+        #expect(pending.contains { $0.aid == 42 && $0.progressSeconds == 50 })
+        #expect(pending.contains { $0.aid == 43 })
+        #expect(await store.pendingHistoryReports(accountScope: playbackScopeB).count == 1)
+        #expect(await store.recentProgress(accountScope: playbackScopeA, aid: 42, bvid: "BV-DELETED", cid: 101)?.positionMilliseconds == 10_000)
+        let restored = FocusPlaybackProgressStore(persistence: persistence)
+        #expect(await restored.pendingHistoryReports(accountScope: playbackScopeA) == pending)
+    }
+
+    @Test("failed remote deletion preserves pending reports and successful clear keeps post-request events")
+    func remoteClearFailureAndNewEvents() async throws {
+        let store = FocusPlaybackProgressStore(persistence: PlaybackStateMemoryPersistence())
+        let old = await store.recordProgressAndEnqueueHistory(accountScope: playbackScopeA, aid: 42, bvid: "BV-CLEAR", cid: 101, positionMilliseconds: 10_000)
+        do {
+            try await store.mutateRemoteHistory(accountScope: playbackScopeA) { throw URLError(.notConnectedToInternet) }
+            Issue.record("Deletion must expose failure")
+        } catch is URLError { }
+        #expect(await store.pendingHistoryReports(accountScope: playbackScopeA) == [old!])
+        let gate = HistoryMutationTestGate()
+        let clearing = Task { try await store.mutateRemoteHistory(accountScope: playbackScopeA) { await gate.block() } }
+        await gate.waitUntilStarted()
+        _ = await store.recordProgressAndEnqueueHistory(accountScope: playbackScopeA, aid: 43, bvid: "BV-NEW", cid: 102, positionMilliseconds: 20_000)
+        await gate.open()
+        try await clearing.value
+        #expect(await store.pendingHistoryReports(accountScope: playbackScopeA).map(\.aid) == [43])
+        #expect(await store.recentProgress(accountScope: playbackScopeA, aid: 42, bvid: "BV-CLEAR") != nil)
+    }
+
     @Test("progress survives recreation, remains bounded, and expires")
     func progressPersistenceBoundsAndRecency() async {
         let persistence = PlaybackStateMemoryPersistence()
@@ -726,6 +788,24 @@ struct FocusPlaybackProgressStoreTests {
         #expect(transient.requiresRetry)
         #expect(await store.pendingHistoryReports(accountScope: playbackScopeA).count == 1)
     }
+}
+
+private actor HistoryMutationTestGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private(set) var hasStarted = false
+    func block() async {
+        hasStarted = true
+        let waiters = startWaiters
+        startWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        await withCheckedContinuation { continuation = $0 }
+    }
+    func waitUntilStarted() async {
+        if hasStarted { return }
+        await withCheckedContinuation { startWaiters.append($0) }
+    }
+    func open() { continuation?.resume(); continuation = nil }
 }
 
 private actor PlaybackStateMemoryPersistence: FocusPlaybackStatePersistence {

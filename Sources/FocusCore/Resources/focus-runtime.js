@@ -17,6 +17,8 @@
       runtimeVersion,
       currentPhase: phase,
       observerInstalled: false,
+      observer: null,
+      documentActive: window.__FOCUS_DOCUMENT_ACTIVE__ !== false,
       historyInstalled: false,
       applyTimer: null,
       applyTimerToken: 0,
@@ -197,6 +199,7 @@
         executor(currentConfig(), {
           canonicalizeBilibiliURL,
           featureState: featureState(rule.id, feature.featureId),
+          isDocumentActive: () => state.documentActive,
           postDebug,
         });
       } catch (error) {
@@ -255,6 +258,7 @@
     }
 
     function applyPhase(requestedPhase) {
+      if (!state.documentActive) return;
       const applicableRules = (window.__FOCUS_RULES__ || []).filter((rule) => rule.runPhase === requestedPhase);
       applicableRules.forEach(applyRule);
       state.lastAppliedComparableURL = comparableFocusURL(location.href);
@@ -312,6 +316,7 @@
 
     function scheduleApply(reason) {
       clearPendingApplyTimer();
+      if (!state.documentActive) return;
       const now = Date.now();
       const stableState = stableFocusVideoState();
       const isVideoPage = stableState.isVideoPage;
@@ -610,7 +615,7 @@
     }
 
     function installObserver() {
-      if (state.observerInstalled) {
+      if (!state.documentActive || state.observerInstalled) {
         postDebug("installObserver-skipped", runtimeLabel({ reason: "already-installed" }));
         return;
       }
@@ -622,10 +627,28 @@
           scheduleApply("mutation");
         }
       });
+      state.observer = observer;
       observer.observe(document.documentElement, {
         childList: true,
         subtree: true
       });
+    }
+
+    function setDocumentActive(active) {
+      active = !!active;
+      window.__FOCUS_DOCUMENT_ACTIVE__ = active;
+      if (state.documentActive === active) return;
+      state.documentActive = active;
+      clearPendingApplyTimer();
+      if (!active) {
+        state.observer?.disconnect();
+        state.observerInstalled = false;
+        Object.values(state.featureScriptState).forEach((feature) => feature.suspendDocumentWork?.());
+      } else {
+        Object.values(state.featureScriptState).forEach((feature) => feature.resumeDocumentWork?.());
+        applyAll();
+        installObserver();
+      }
     }
 
     return {
@@ -640,7 +663,8 @@
       applyAll,
       cancelPendingApply,
       installHistoryHooks,
-      installObserver
+      installObserver,
+      setDocumentActive
     };
   }
 

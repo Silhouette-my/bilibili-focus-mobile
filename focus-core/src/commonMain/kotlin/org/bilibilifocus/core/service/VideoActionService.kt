@@ -74,19 +74,25 @@ class VideoActionService(
         )
     }
 
-    suspend fun toggleLike(aid: Long, liked: Boolean) {
-        val csrf = csrfToken()
+    suspend fun toggleLike(aid: Long, liked: Boolean, expectedMid: Long? = null) {
+        val url = BiliApiContractCatalog.require("video.operate.like").url
+        val cookies = actionCookies(expectedMid, url)
+        val csrf = csrfToken(cookies, url)
         postForm(
-            url = BiliApiContractCatalog.require("video.operate.like").url,
+            url = url,
             body = "aid=$aid&like=${if (liked) 1 else 2}&csrf=$csrf&csrf_token=$csrf",
+            cookies = cookies,
         )
     }
 
-    suspend fun coin(aid: Long, likeAlso: Boolean = false) {
-        val csrf = csrfToken()
+    suspend fun coin(aid: Long, likeAlso: Boolean = false, expectedMid: Long? = null) {
+        val url = BiliApiContractCatalog.require("video.operate.coin").url
+        val cookies = actionCookies(expectedMid, url)
+        val csrf = csrfToken(cookies, url)
         postForm(
-            url = BiliApiContractCatalog.require("video.operate.coin").url,
+            url = url,
             body = "aid=$aid&multiply=1&select_like=${if (likeAlso) 1 else 0}&csrf=$csrf&csrf_token=$csrf",
+            cookies = cookies,
         )
     }
 
@@ -122,14 +128,17 @@ class VideoActionService(
         )
     }
 
-    suspend fun toggleFavorite(aid: Long, favorited: Boolean, folderId: Long? = null): Long {
+    suspend fun toggleFavorite(aid: Long, favorited: Boolean, folderId: Long? = null, expectedMid: Long? = null): Long {
         val targetFolderId = folderId ?: resolveDefaultFavoriteFolderId()
-        val csrf = csrfToken()
+        val url = BiliApiContractCatalog.require("video.operate.favorite").url
+        val cookies = actionCookies(expectedMid, url)
+        val csrf = csrfToken(cookies, url)
         val addMediaIds = if (favorited) targetFolderId.toString() else ""
         val delMediaIds = if (favorited) "" else targetFolderId.toString()
         postForm(
-            url = BiliApiContractCatalog.require("video.operate.favorite").url,
+            url = url,
             body = "rid=$aid&type=2&add_media_ids=$addMediaIds&del_media_ids=$delMediaIds&csrf=$csrf&csrf_token=$csrf",
+            cookies = cookies,
         )
         return targetFolderId
     }
@@ -166,10 +175,10 @@ class VideoActionService(
         if (code != 0) throw ServiceError.Api(code, payload.stringValueAt("message") ?: "未知错误")
     }
 
-    private suspend fun csrfToken(): String {
-        val csrf = cookieProvider.loadCookies().firstOrNull { it.name == "bili_jct" }?.value
-        if (csrf.isNullOrBlank()) throw ServiceError.LoginRequired
-        return csrf
+    private suspend fun actionCookies(expectedMid: Long?, url: String): List<Cookie> {
+        val cookies = cookieProvider.loadCookies()
+        if (expectedMid != null && CookieRequestPolicy.matchingCookies(cookies, url).firstOrNull { it.name == "DedeUserID" }?.value?.toLongOrNull() != expectedMid) throw ServiceError.LoginRequired
+        return cookies
     }
 
     private fun csrfToken(cookies: List<Cookie>, targetUrl: String): String {

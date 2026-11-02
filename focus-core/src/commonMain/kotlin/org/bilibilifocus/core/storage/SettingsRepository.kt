@@ -9,7 +9,7 @@ class SettingsRepository(private val storage: SettingsStorage) {
     fun load(): FocusSettings {
         val raw = storage.getString(FocusSettings.STORAGE_KEY) ?: return FocusSettings.DEFAULTS
         return try {
-            json.decodeFromString<FocusSettings>(raw)
+            json.decodeFromString<FocusSettings>(raw).let { it.copy(playbackPreferences = it.playbackPreferences.normalized()) }
         } catch (_: Exception) {
             FocusSettings.DEFAULTS
         }

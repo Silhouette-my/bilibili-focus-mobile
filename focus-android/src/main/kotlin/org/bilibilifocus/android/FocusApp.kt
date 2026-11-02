@@ -91,7 +91,6 @@ import org.bilibilifocus.android.ui.FocusSettingsScreen
 import org.bilibilifocus.android.ui.FocusUserScreen
 import org.bilibilifocus.android.ui.FocusUserCollectionScreen
 import org.bilibilifocus.android.ui.FocusVideoScreen
-import org.bilibilifocus.android.ui.FocusWatchLaterScreen
 import org.bilibilifocus.android.ui.FocusWebView
 import org.bilibilifocus.android.playback.FocusPlaybackConnection
 import org.bilibilifocus.core.model.FavFolder
@@ -160,9 +159,6 @@ fun FocusApp(
             favoriteService = appGraph.favoriteService,
         )
     }
-    val watchLaterViewModel = remember(accountRevision) {
-        FocusWatchLaterViewModel(appGraph.watchLaterService)
-    }
     val feedListState = rememberSaveable(accountRevision, saver = LazyListState.Saver) { LazyListState() }
     val isDynamicFeedVisible = selectedTab == 0 && !showSettings && !showLogin &&
         overlayStack.isEmpty() && (isWideLayout || dynamicDetailStack.isEmpty())
@@ -185,7 +181,6 @@ fun FocusApp(
     val favFolderGridStates = remember(accountRevision) { mutableStateMapOf<Long, LazyGridState>() }
     val historyViewModels = remember(accountRevision) { mutableStateMapOf<String, FocusHistoryViewModel>() }
     val historyGridStates = remember(accountRevision) { mutableStateMapOf<String, LazyGridState>() }
-    val watchLaterGridState = remember(accountRevision) { LazyGridState() }
 
     fun releaseRouteIfUnused(route: OverlayRoute) {
         val isStillRetained = overlayStack.any { it.key == route.key } ||
@@ -218,7 +213,6 @@ fun FocusApp(
                 historyViewModels.remove(route.key)?.onCleared()
                 historyGridStates.remove(route.key)
             }
-            OverlayRoute.WatchLater -> Unit
             is OverlayRoute.Web -> Unit
         }
     }
@@ -228,7 +222,6 @@ fun FocusApp(
             feedViewModel.onCleared()
             searchViewModel.onCleared()
             myViewModel.onCleared()
-            watchLaterViewModel.onCleared()
             videoViewModels.values.forEach(FocusVideoViewModel::onCleared)
             opusViewModels.values.forEach(FocusOpusViewModel::onCleared)
             articleViewModels.values.forEach(FocusArticleViewModel::onCleared)
@@ -277,6 +270,7 @@ fun FocusApp(
             }
             overlayStack.removeAt(overlayStack.lastIndex)
             releaseRouteIfUnused(route)
+            if (overlayStack.isEmpty() && selectedTab == 2) myViewModel.reload()
         }
     }
 
@@ -363,6 +357,12 @@ fun FocusApp(
                     onNativeDanmakuEnabledChange = { enabled ->
                         settingsViewModel.update { it.copy(nativeDanmakuEnabled = enabled) }
                     },
+                    nativeSubtitleEnabled = settings.nativeSubtitleEnabled,
+                    nativeSubtitleLanguageCode = settings.nativeSubtitleLanguageCode,
+                    onNativeSubtitleEnabledChange = { enabled -> settingsViewModel.update { it.copy(nativeSubtitleEnabled = enabled) } },
+                    onNativeSubtitleLanguageCodeChange = { language -> settingsViewModel.update { it.copy(nativeSubtitleLanguageCode = language) } },
+                    playbackPreferences = settings.playbackPreferences,
+                    onPlaybackPreferencesChange = { preferences -> settingsViewModel.update { it.copy(playbackPreferences = preferences) } },
                     viewModel = viewModel,
                     scrollState = scrollState,
                     playbackConnection = playbackConnection,
@@ -487,7 +487,7 @@ fun FocusApp(
 
             is OverlayRoute.History -> {
                 val viewModel = historyViewModels.getOrPut(route.key) {
-                    FocusHistoryViewModel(service = appGraph.historyService)
+                    FocusHistoryViewModel(service = appGraph.historyService, remoteHistoryMutation = appGraph.playbackHistoryOutbox::mutateRemoteHistory)
                 }
                 val gridState = historyGridStates.getOrPut(route.key) { LazyGridState() }
                 FocusHistoryScreen(
@@ -498,15 +498,6 @@ fun FocusApp(
                 )
             }
 
-            OverlayRoute.WatchLater -> {
-                FocusWatchLaterScreen(
-                    onBack = onBack,
-                    onOpenVideo = onOpenVideoRoute,
-                    onOpenLogin = { showLogin = true },
-                    viewModel = watchLaterViewModel,
-                    gridState = watchLaterGridState,
-                )
-            }
         }
     }
 
@@ -524,6 +515,9 @@ fun FocusApp(
             )
         }
     }
+
+    val currentDynamicVideo = (dynamicDetailStack.lastOrNull() as? OverlayRoute.Video)?.let { videoViewModels[it.key] }
+    val dynamicVideoIsFullscreen = currentDynamicVideo?.isFullscreen?.collectAsState()?.value ?: false
 
     key(accountRevision) {
         Box(modifier = Modifier.fillMaxSize()) {
@@ -549,6 +543,7 @@ fun FocusApp(
                             },
                             contentPadding = contentPadding,
                             settings = settings,
+                            isActive = !showLogin && !showSettings && overlayStack.isEmpty() && !isInPictureInPictureMode && !dynamicVideoIsFullscreen,
                         )
                     },
                     detailContent = {
@@ -570,7 +565,8 @@ fun FocusApp(
                         feedListState = feedListState,
                         searchViewModel = searchViewModel,
                         myViewModel = myViewModel,
-                        watchLaterViewModel = watchLaterViewModel,
+                        followingService = appGraph.followingAuthorsService,
+                        onOpenSettings = { showSettings = true },
                         myListState = myListState,
                         onOpenLogin = { showLogin = true },
                         onOpenRouteFromUrl = openInBrowser,
@@ -586,12 +582,12 @@ fun FocusApp(
                         initialQuery = pendingSearchQuery,
                         onInitialQueryConsumed = { pendingSearchQuery = null },
                         onOpenMyVideo = { pushOverlay(OverlayRoute.Video(it)) },
-                        onOpenWatchLater = { pushOverlay(OverlayRoute.WatchLater) },
                         onOpenHistory = { pushOverlay(OverlayRoute.History) },
                         onOpenFolder = { pushOverlay(OverlayRoute.Folder(it.id, it.title)) },
                         contentPadding = contentPadding,
                         searchGridColumns = searchColumnsFor(widthClass),
                         settings = settings,
+                        isFeedActive = !showLogin && !showSettings && overlayStack.isEmpty() && !isInPictureInPictureMode,
                     )
                 }
             } else {
@@ -606,7 +602,8 @@ fun FocusApp(
                         feedListState = feedListState,
                         searchViewModel = searchViewModel,
                         myViewModel = myViewModel,
-                        watchLaterViewModel = watchLaterViewModel,
+                        followingService = appGraph.followingAuthorsService,
+                        onOpenSettings = { showSettings = true },
                         myListState = myListState,
                         onOpenLogin = { showLogin = true },
                         onOpenRouteFromUrl = openInBrowser,
@@ -622,12 +619,12 @@ fun FocusApp(
                         initialQuery = pendingSearchQuery,
                         onInitialQueryConsumed = { pendingSearchQuery = null },
                         onOpenMyVideo = { pushOverlay(OverlayRoute.Video(it)) },
-                        onOpenWatchLater = { pushOverlay(OverlayRoute.WatchLater) },
                         onOpenHistory = { pushOverlay(OverlayRoute.History) },
                         onOpenFolder = { pushOverlay(OverlayRoute.Folder(it.id, it.title)) },
                         contentPadding = contentPadding,
                         searchGridColumns = searchColumnsFor(widthClass),
                         settings = settings,
+                        isFeedActive = !showLogin && !showSettings && overlayStack.isEmpty() && dynamicDetailStack.isEmpty() && !isInPictureInPictureMode,
                     )
                 }
             }
@@ -695,7 +692,8 @@ private fun FocusPrimaryTabContent(
     feedListState: LazyListState,
     searchViewModel: FocusSearchViewModel,
     myViewModel: FocusMyViewModel,
-    watchLaterViewModel: FocusWatchLaterViewModel,
+    followingService: org.bilibilifocus.core.service.FollowingAuthorsService,
+    onOpenSettings: () -> Unit,
     myListState: LazyListState,
     onOpenLogin: () -> Unit,
     onOpenRouteFromUrl: (String) -> Unit,
@@ -706,12 +704,12 @@ private fun FocusPrimaryTabContent(
     initialQuery: String?,
     onInitialQueryConsumed: () -> Unit,
     onOpenMyVideo: (String) -> Unit,
-    onOpenWatchLater: () -> Unit,
     onOpenHistory: () -> Unit,
     onOpenFolder: (FavFolder) -> Unit,
     contentPadding: PaddingValues,
     searchGridColumns: Int,
     settings: FocusSettings,
+    isFeedActive: Boolean,
 ) {
     when (selectedTab) {
         0 -> FocusDynamicFeedScreen(
@@ -724,6 +722,7 @@ private fun FocusPrimaryTabContent(
             onSelectedFilterChange = onFeedFilterChange,
             contentPadding = contentPadding,
             settings = settings,
+            isActive = isFeedActive,
         )
 
         1 -> FocusSearchScreen(
@@ -738,13 +737,14 @@ private fun FocusPrimaryTabContent(
 
         2 -> FocusMyScreen(
             viewModel = myViewModel,
-            watchLaterViewModel = watchLaterViewModel,
+            followingService = followingService,
             listState = myListState,
             onOpenLogin = onOpenLogin,
             onOpenVideo = onOpenMyVideo,
-            onOpenWatchLater = onOpenWatchLater,
             onOpenHistory = onOpenHistory,
             onOpenFolder = onOpenFolder,
+            onOpenUser = onOpenUser,
+            onOpenSettings = onOpenSettings,
             contentPadding = contentPadding,
         )
     }
@@ -1147,7 +1147,4 @@ private sealed interface OverlayRoute {
         override val key: String = "history"
     }
 
-    data object WatchLater : OverlayRoute {
-        override val key: String = "watch-later"
-    }
 }

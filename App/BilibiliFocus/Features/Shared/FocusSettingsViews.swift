@@ -70,6 +70,12 @@ struct FocusSettingsView: View {
                 Section {
                     Toggle("原生播放器默认显示弹幕", isOn: binding(\.nativeDanmakuEnabled))
                     Toggle("有字幕时默认显示字幕", isOn: binding(\.nativeSubtitleEnabled))
+                    Toggle("自动播放下一 P", isOn: playbackBinding(\.autoPlayNextPart))
+                    Picker("常用倍速", selection: playbackBinding(\.preferredRate)) {
+                        ForEach([0.5, 0.75, 1, 1.25, 1.5, 2, 3], id: \.self) { rate in
+                            Text("\(rate.formatted())×").tag(rate)
+                        }
+                    }
                 } header: {
                     Text("播放")
                 }
@@ -109,6 +115,12 @@ struct FocusSettingsView: View {
                 }
             }
         }
+    }
+
+    private func playbackBinding<Value>(_ keyPath: WritableKeyPath<FocusPlaybackPreferences, Value>) -> Binding<Value> {
+        Binding(get: { settingsStore.settings.playbackPreferences[keyPath: keyPath] }, set: { value in
+            settingsStore.settings.playbackPreferences[keyPath: keyPath] = value
+        })
     }
 
     private func binding<Value>(_ keyPath: WritableKeyPath<FocusSettings, Value>) -> Binding<Value> {

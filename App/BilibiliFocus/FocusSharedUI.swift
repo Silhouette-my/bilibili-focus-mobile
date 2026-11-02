@@ -3,6 +3,7 @@ import SwiftUI
 import UIKit
 import ImageIO
 import FocusCore
+import Network
 
 enum FocusSharedDesign {
     static var primary: Color { .accentColor }
@@ -788,6 +789,122 @@ enum FocusImageLoadQuality: String, Hashable, Sendable {
     case emote
 }
 
+/// Only public BFS still images support this transform. Query-bearing URLs may
+/// be signed; animated emotes and gallery originals keep their source bytes.
+enum FocusImageCDNRequest {
+    static func thumbnailURL(for url: URL, pixelSize: Int) -> URL? {
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              components.scheme == "https", components.user == nil, components.password == nil,
+              components.port == nil, components.query == nil, components.fragment == nil,
+              let host = components.host?.lowercased(),
+              host.range(of: #"^i[0-9]+\.hdslb\.com$"#, options: .regularExpression) != nil
+        else { return nil }
+        let path = components.percentEncodedPath.components(separatedBy: "@").first ?? ""
+        let folders = ["/bfs/archive/", "/bfs/face/", "/bfs/new_dyn/", "/bfs/article/", "/bfs/album/"]
+        guard folders.contains(where: path.hasPrefix),
+              ["jpg", "jpeg", "png", "webp"].contains((path as NSString).pathExtension.lowercased())
+        else { return nil }
+        let pixels = FocusImagePixelSize.normalized(pixelSize)
+        // 0e fits both dimensions without cropping, including long thumbnails.
+        components.percentEncodedPath = "\(path)@\(pixels)w_\(pixels)h_0e.webp"
+        return components.url
+    }
+}
+
+struct FocusImageResourceState: Equatable, Sendable {
+    var networkAvailable = true
+    var constrainedNetwork = false
+    var lowPower = false
+    var thermalPressure = false
+
+    var allowsPrefetch: Bool {
+        networkAvailable && !constrainedNetwork && !lowPower && !thermalPressure
+    }
+}
+
+/// Cancels optional consumers, not shared network tasks used by visible images.
+/// A recovered connection never replays an old window; the next visible window
+/// supplies fresh work through the existing prefetch entry point.
+final class FocusImageResourceMonitor: @unchecked Sendable {
+    static let shared = FocusImageResourceMonitor(observeSystem: true)
+    private let lock = NSLock()
+    private var state: FocusImageResourceState
+    private var consumers: [UUID: @Sendable () -> Void] = [:]
+    private var observers: [NSObjectProtocol] = []
+    private var pathMonitor: NWPathMonitor?
+
+    init(state: FocusImageResourceState = .init(), observeSystem: Bool = false) {
+        self.state = state
+        guard observeSystem else { return }
+        self.state.networkAvailable = false
+        refreshPowerState()
+        let center = NotificationCenter.default
+        for name in [Notification.Name.NSProcessInfoPowerStateDidChange, ProcessInfo.thermalStateDidChangeNotification] {
+            observers.append(center.addObserver(forName: name, object: nil, queue: nil) { [weak self] _ in
+                self?.refreshPowerState()
+            })
+        }
+        observers.append(center.addObserver(forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: nil) { [weak self] _ in
+            self?.cancelPrefetches()
+            Task { await FocusImageRepository.shared.releaseDecodedImages() }
+        })
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            self?.update { state in
+                state.networkAvailable = path.status == .satisfied
+                state.constrainedNetwork = path.isConstrained
+            }
+        }
+        pathMonitor = monitor
+        monitor.start(queue: DispatchQueue(label: "org.bilibilifocus.images.network", qos: .utility))
+    }
+
+    deinit {
+        pathMonitor?.cancel()
+        observers.forEach(NotificationCenter.default.removeObserver)
+    }
+
+    var allowsPrefetch: Bool { lock.withLock { state.allowsPrefetch } }
+
+    func update(_ change: (inout FocusImageResourceState) -> Void) {
+        let callbacks: [@Sendable () -> Void] = lock.withLock {
+            change(&state)
+            guard !state.allowsPrefetch else { return [] }
+            let callbacks = Array(consumers.values)
+            consumers.removeAll()
+            return callbacks
+        }
+        callbacks.forEach { $0() }
+    }
+
+    func registerPrefetchCancellation(_ cancel: @escaping @Sendable () -> Void) -> UUID? {
+        lock.withLock {
+            guard state.allowsPrefetch else { return nil }
+            let id = UUID()
+            consumers[id] = cancel
+            return id
+        }
+    }
+
+    func unregisterPrefetch(_ id: UUID) { lock.withLock { _ = consumers.removeValue(forKey: id) } }
+
+    func cancelPrefetches() {
+        let callbacks: [@Sendable () -> Void] = lock.withLock {
+            let callbacks = Array(consumers.values)
+            consumers.removeAll()
+            return callbacks
+        }
+        callbacks.forEach { $0() }
+    }
+
+    private func refreshPowerState() {
+        update { state in
+            state.lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
+            state.thermalPressure = [.serious, .critical].contains(ProcessInfo.processInfo.thermalState)
+        }
+    }
+}
+
 actor FocusImageRepository {
     static let shared = FocusImageRepository()
 
@@ -832,20 +949,34 @@ actor FocusImageRepository {
             configuration.protocolClasses = [FocusFixtureOfflineImageProtocol.self]
         }
         self.session = session ?? URLSession(configuration: configuration)
+        if session == nil { _ = FocusImageResourceMonitor.shared }
     }
 
     var activeConsumerCount: Int { inFlight.values.reduce(0) { $0 + $1.consumers.count } }
     var inFlightRequestCount: Int { inFlight.count }
 
+    func releaseDecodedImages() { cache.removeAllObjects() }
+
     func cachedImage(for url: URL, quality: FocusImageLoadQuality, pixelSize: Int = 1_600) -> UIImage? {
         let canonicalURL = Self.canonicalImageURL(url)
         let pixels = quality == .gallery ? 0 : FocusImagePixelSize.normalized(pixelSize)
-        return cache.object(forKey: RequestKey(
+        return cachedImage(for: RequestKey(
             url: canonicalURL,
             quality: quality,
             pixelSize: pixels,
             animated: quality == .emote
-        ).cacheKey)
+        ))
+    }
+
+    private func cachedImage(for key: RequestKey) -> UIImage? {
+        guard key.quality == .thumbnail else { return cache.object(forKey: key.cacheKey) }
+        // A warmed 768px card already satisfies a 512px card. Reuse its decoded
+        // image instead of fetching a second CDN derivative for the same source.
+        for pixels in FocusImagePixelSize.buckets where pixels >= key.pixelSize {
+            let candidate = RequestKey(url: key.url, quality: key.quality, pixelSize: pixels, animated: false)
+            if let image = cache.object(forKey: candidate.cacheKey) { return image }
+        }
+        return nil
     }
 
     func image(
@@ -860,8 +991,16 @@ actor FocusImageRepository {
         let canonicalURL = Self.canonicalImageURL(url)
         let pixels = quality == .gallery ? 0 : FocusImagePixelSize.normalized(pixelSize)
         let shouldAnimate = quality == .emote && animated
-        let key = RequestKey(url: canonicalURL, quality: quality, pixelSize: pixels, animated: shouldAnimate)
-        if let cached = cache.object(forKey: key.cacheKey) { return cached }
+        let requestedKey = RequestKey(url: canonicalURL, quality: quality, pixelSize: pixels, animated: shouldAnimate)
+        if let cached = cachedImage(for: requestedKey) { return cached }
+        let key: RequestKey
+        if quality == .thumbnail, let larger = inFlight.keys
+            .filter({ $0.url == canonicalURL && $0.quality == .thumbnail && $0.pixelSize >= pixels })
+            .min(by: { $0.pixelSize < $1.pixelSize }) {
+            key = larger
+        } else {
+            key = requestedKey
+        }
 
         let consumerID = UUID()
         let fetchTask: Task<UIImage, Error>
@@ -933,7 +1072,7 @@ actor FocusImageRepository {
             }
 
         for referer in referers {
-            for candidate in imageURLCandidates(for: url, quality: quality) {
+            for candidate in imageURLCandidates(for: url, quality: quality, pixelSize: pixelSize) {
                 try Task.checkCancellation()
                 do {
                     var request = URLRequest(url: candidate)
@@ -1073,13 +1212,24 @@ actor FocusImageRepository {
         URL(string: url.absoluteString.replacingOccurrences(of: "http://", with: "https://")) ?? url
     }
 
-    private static func imageURLCandidates(
+    nonisolated static func imageURLCandidates(
         for url: URL,
-        quality: FocusImageLoadQuality
+        quality: FocusImageLoadQuality,
+        pixelSize: Int = 1_600
     ) -> [URL] {
         let cleaned = url.absoluteString.replacingOccurrences(of: "http://", with: "https://")
+        // Preserve signature and fragment semantics instead of stripping a URL
+        // path suffix out of a credential-bearing request.
+        if url.query != nil || url.fragment != nil || url.user != nil || url.password != nil {
+            return [URL(string: cleaned) ?? url]
+        }
         let stripped = cleaned.replacingOccurrences(of: #"@[^/?#]+"#, with: "", options: .regularExpression)
-        let orderedCandidates = quality == .gallery ? [stripped, cleaned] : [cleaned, stripped]
+        var orderedCandidates = quality == .gallery ? [stripped, cleaned] : [cleaned, stripped]
+        if quality == .thumbnail,
+           let original = URL(string: cleaned),
+           let thumbnail = FocusImageCDNRequest.thumbnailURL(for: original, pixelSize: pixelSize) {
+            orderedCandidates.insert(thumbnail.absoluteString, at: 0)
+        }
         return orderedCandidates
             .compactMap(URL.init(string:))
             .reduce(into: [URL]()) { values, candidate in
@@ -1154,7 +1304,31 @@ final class FocusRemoteImageLoader: ObservableObject {
     nonisolated static func prefetch(
         urls: [URL], referer: String, pixelSize: Int = 768,
         repository: FocusImageRepository = .shared,
-        limiter: FocusImagePrefetchLimiter = .shared
+        limiter: FocusImagePrefetchLimiter = .shared,
+        resourceMonitor: FocusImageResourceMonitor = .shared
+    ) async {
+        guard resourceMonitor.allowsPrefetch else { return }
+        let batch = Task {
+            await prefetchBatch(urls: urls, referer: referer, pixelSize: pixelSize,
+                                repository: repository, limiter: limiter, resourceMonitor: resourceMonitor)
+        }
+        guard let registration = resourceMonitor.registerPrefetchCancellation({ batch.cancel() }) else {
+            batch.cancel()
+            await batch.value
+            return
+        }
+        defer { resourceMonitor.unregisterPrefetch(registration) }
+        await withTaskCancellationHandler {
+            await batch.value
+        } onCancel: {
+            batch.cancel()
+        }
+    }
+
+    private nonisolated static func prefetchBatch(
+        urls: [URL], referer: String, pixelSize: Int,
+        repository: FocusImageRepository, limiter: FocusImagePrefetchLimiter,
+        resourceMonitor: FocusImageResourceMonitor
     ) async {
         var seen: Set<URL> = []
         var candidates: [URL] = []
@@ -1173,6 +1347,7 @@ final class FocusRemoteImageLoader: ObservableObject {
                     do {
                         try await limiter.acquire(lease)
                         try Task.checkCancellation()
+                        guard resourceMonitor.allowsPrefetch else { throw CancellationError() }
                         _ = try await repository.image(for: url, preferredReferer: referer,
                                                        pixelSize: pixelSize, priority: .prefetch)
                     } catch is CancellationError {

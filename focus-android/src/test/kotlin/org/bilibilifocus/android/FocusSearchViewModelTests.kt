@@ -13,6 +13,8 @@ import org.bilibilifocus.core.model.SearchVideoSortOption
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class FocusSearchViewModelTests {
@@ -106,13 +108,46 @@ class FocusSearchViewModelTests {
         viewModel.loadMoreIfNeeded("v4")
         advanceUntilIdle()
         assertEquals(listOf("v1", "v2", "v3", "v4"), viewModel.loadedVideoIDs())
-
-        viewModel.loadMoreIfNeeded("v4")
+        assertNotNull(viewModel.loadMoreError.value)
+        viewModel.retryLoadMore()
         advanceUntilIdle()
 
         assertEquals(3, requestCount)
         assertEquals(listOf("v1", "v2", "v3", "v4", "v5"), viewModel.loadedVideoIDs())
+        assertNull(viewModel.loadMoreError.value)
         viewModel.onCleared()
+    }
+
+    @Test
+    fun `all typed categories append results and stop repeated pages`() = runTest {
+        for (filter in listOf(SearchResultFilter.USERS, SearchResultFilter.LIVE, SearchResultFilter.BANGUMI, SearchResultFilter.FILM)) {
+            val requests = mutableListOf<Int>()
+            val model = FocusSearchViewModel(SearchPageFetcher { _, requestedFilter, page, _ ->
+                if (requestedFilter == SearchResultFilter.ALL) resultPage(listOf("overview"), 2)
+                else {
+                    requests += page
+                    val kind = when (filter) {
+                        SearchResultFilter.USERS -> SearchResultItem.Kind.USER
+                        SearchResultFilter.LIVE -> SearchResultItem.Kind.LIVE
+                        else -> SearchResultItem.Kind.MEDIA
+                    }
+                    SearchResultPage(listOf(SearchResultSection(filter, listOf(videoItem("item-$page").copy(kind = kind)))), 2)
+                }
+            }, StandardTestDispatcher(testScheduler))
+            model.search("typed")
+            advanceUntilIdle()
+            model.selectFilter(filter)
+            advanceUntilIdle()
+            model.loadMoreIfNeeded("item-1")
+            advanceUntilIdle()
+            val section = (model.state.value as SearchUiState.Loaded).sections.single()
+            assertEquals(filter, section.filter)
+            assertEquals(listOf("item-1", "item-2"), section.items.map { it.id })
+            model.loadMoreIfNeeded("item-2")
+            advanceUntilIdle()
+            assertEquals(listOf(1, 2), requests)
+            model.onCleared()
+        }
     }
 }
 

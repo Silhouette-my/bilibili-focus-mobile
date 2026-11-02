@@ -5,12 +5,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.outlined.Chat
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -21,6 +16,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextLayoutResult
@@ -32,8 +28,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import org.bilibilifocus.android.VideoDanmakuLoadStatus
 import org.bilibilifocus.android.VideoDanmakuUiState
+import org.bilibilifocus.android.VideoDanmakuRenderSegment
 import org.bilibilifocus.core.model.VideoDanmaku
 import org.bilibilifocus.core.model.VideoDanmakuMode
+import org.bilibilifocus.core.model.FocusPlaybackPreferences
 
 private const val DANMAKU_DISPLAY_MILLIS = 5_000L
 
@@ -43,33 +41,34 @@ internal fun VideoDanmakuOverlay(
     enabled: Boolean,
     playbackPositionMillis: () -> Long,
     modifier: Modifier = Modifier,
+    preferences: FocusPlaybackPreferences = FocusPlaybackPreferences(),
 ) {
-    if (!enabled || state.danmakus.isEmpty()) return
+    if (!enabled || state.segments.isEmpty()) return
     val textMeasurer = rememberTextMeasurer()
     val density = LocalDensity.current
 
-    BoxWithConstraints(modifier = modifier) {
-        val lineHeightPx = with(density) { 32.dp.toPx() }
-        val usableHeightPx = with(density) { maxHeight.toPx() } * 0.75f
+    BoxWithConstraints(modifier = modifier.clipToBounds()) {
+        val lineHeightPx = with(density) { 32.dp.toPx() } * preferences.danmakuFontScale * density.fontScale
+        val usableHeightPx = with(density) { maxHeight.toPx() } * 0.75f * preferences.danmakuArea
         val laneCount = (usableHeightPx / lineHeightPx).toInt().coerceAtLeast(1)
-        val prepared = remember(state.danmakus, laneCount, textMeasurer) {
-            val availableAt = VideoDanmakuMode.entries.associateWith { LongArray(laneCount) }.toMutableMap()
-            state.danmakus.mapNotNull { danmaku ->
-                val lanes = availableAt.getValue(danmaku.mode)
-                val lane = lanes.indexOfFirst { it <= danmaku.progressMillis }
-                if (lane < 0) return@mapNotNull null
-                lanes[lane] = danmaku.progressMillis + DANMAKU_DISPLAY_MILLIS
+        val layoutCache = remember(laneCount, textMeasurer, density, preferences.danmakuOpacity, preferences.danmakuFontScale, preferences.danmakuDensity) {
+            DanmakuSegmentLayoutCache<PreparedDanmaku>(laneCount) { danmaku ->
+                (danmaku.id and Long.MAX_VALUE) % 100 < preferences.danmakuDensity * 100
+            }
+        }
+        val prepared = remember(state.segments, layoutCache) {
+            layoutCache.update(state.segments) { danmaku, lane ->
                 val color = danmakuColor(danmaku.colorRgb)
                 val shadowColor = if (color.luminance() < 0.28f) Color.White else Color.Black
                 val scale = (danmaku.fontSize / 25f).coerceIn(0.72f, 1.44f)
                 val layout = textMeasurer.measure(
                     text = AnnotatedString(danmaku.content),
                     style = TextStyle(
-                        color = color.copy(alpha = 0.94f),
-                        fontSize = (18f * scale).sp,
+                        color = color.copy(alpha = preferences.danmakuOpacity),
+                        fontSize = (18f * scale * preferences.danmakuFontScale).sp,
                         fontWeight = FontWeight.SemiBold,
                         shadow = Shadow(
-                            color = shadowColor.copy(alpha = 0.95f),
+                            color = shadowColor.copy(alpha = preferences.danmakuOpacity),
                             offset = Offset(1.5f, 1.5f),
                             blurRadius = 2.5f,
                         ),
@@ -79,38 +78,81 @@ internal fun VideoDanmakuOverlay(
                 PreparedDanmaku(danmaku, lane, layout)
             }
         }
-        val progressTimes = remember(prepared) {
-            LongArray(prepared.size) { prepared[it].danmaku.progressMillis }
-        }
-
         Canvas(modifier = Modifier.fillMaxSize()) {
             val time = playbackPositionMillis()
-            for (index in activeDanmakuRange(progressTimes, time)) {
-                val preparedDanmaku = prepared[index]
-                val elapsed = time - preparedDanmaku.danmaku.progressMillis
-                val textWidth = preparedDanmaku.layout.size.width.toFloat()
-                val x = when (preparedDanmaku.danmaku.mode) {
-                    VideoDanmakuMode.SCROLLING -> {
-                        val progress = elapsed.toFloat() / DANMAKU_DISPLAY_MILLIS
-                        size.width - progress * (size.width + textWidth)
+            for (segment in prepared) {
+                for (index in activeDanmakuRange(segment.progressTimes, time)) {
+                    val preparedDanmaku = segment.items[index]
+                    val elapsed = time - preparedDanmaku.danmaku.progressMillis
+                    val textWidth = preparedDanmaku.layout.size.width.toFloat()
+                    val x = when (preparedDanmaku.danmaku.mode) {
+                        VideoDanmakuMode.SCROLLING -> {
+                            val progress = elapsed.toFloat() / DANMAKU_DISPLAY_MILLIS
+                            size.width - progress * (size.width + textWidth)
+                        }
+                        VideoDanmakuMode.TOP, VideoDanmakuMode.BOTTOM -> (size.width - textWidth) / 2f
                     }
-                    VideoDanmakuMode.TOP, VideoDanmakuMode.BOTTOM -> (size.width - textWidth) / 2f
+                    val y = when (preparedDanmaku.danmaku.mode) {
+                        VideoDanmakuMode.BOTTOM -> usableHeightPx - (preparedDanmaku.lane + 1) * lineHeightPx
+                        VideoDanmakuMode.SCROLLING, VideoDanmakuMode.TOP -> preparedDanmaku.lane * lineHeightPx
+                    }
+                    drawText(
+                        textLayoutResult = preparedDanmaku.layout,
+                        topLeft = Offset(x, y.coerceAtLeast(0f)),
+                    )
                 }
-                val y = when (preparedDanmaku.danmaku.mode) {
-                    VideoDanmakuMode.BOTTOM -> usableHeightPx - (preparedDanmaku.lane + 1) * lineHeightPx
-                    VideoDanmakuMode.SCROLLING, VideoDanmakuMode.TOP -> preparedDanmaku.lane * lineHeightPx
-                }
-                drawText(
-                    textLayoutResult = preparedDanmaku.layout,
-                    topLeft = Offset(x, y.coerceAtLeast(0f)),
-                )
             }
         }
     }
 }
 
+/** Immutable segments share both lane assignments and measured text across arrivals. */
+internal class DanmakuSegmentLayoutCache<T>(private val laneCount: Int, private val shouldInclude: (VideoDanmaku) -> Boolean = { true }) {
+    internal data class PreparedSegment<T>(
+        val source: VideoDanmakuRenderSegment,
+        val incoming: Map<VideoDanmakuMode, List<Long>>,
+        val outgoing: Map<VideoDanmakuMode, List<Long>>,
+        val items: List<T>,
+        val progressTimes: LongArray,
+    )
+    private var segments = emptyList<PreparedSegment<T>>()
+    var processedCommentCount = 0
+        private set
+
+    fun update(source: List<VideoDanmakuRenderSegment>, prepare: (VideoDanmaku, Int) -> T): List<PreparedSegment<T>> {
+        val previous = segments.associateBy { it.source.index }
+        var lanes = VideoDanmakuMode.entries.associateWith { List(laneCount) { 0L } }
+        segments = source.map { segment ->
+            val cached = previous[segment.index]
+            if (cached != null && cached.source === segment && cached.incoming == lanes) {
+                lanes = cached.outgoing
+                cached
+            } else {
+                val incoming = lanes
+                val availableAt = lanes.mapValues { it.value.toMutableList() }
+                val times = mutableListOf<Long>()
+                val items = segment.danmakus.mapNotNull { danmaku ->
+                    if (!shouldInclude(danmaku)) return@mapNotNull null
+                    val available = availableAt.getValue(danmaku.mode)
+                    val lane = available.indexOfFirst { it <= danmaku.progressMillis }
+                    processedCommentCount++
+                    if (lane < 0) return@mapNotNull null
+                    available[lane] = danmaku.progressMillis + DANMAKU_DISPLAY_MILLIS
+                    times += danmaku.progressMillis
+                    prepare(danmaku, lane)
+                }
+                lanes = availableAt.mapValues { it.value.toList() }
+                PreparedSegment(segment, incoming, lanes, items, times.toLongArray())
+            }
+        }
+        return segments
+    }
+}
+
 /** Input follows the view model's ascending progress order; seeks need no retained cursor. */
 internal fun activeDanmakuRange(progressTimes: LongArray, positionMillis: Long): IntRange {
+    if (progressTimes.isEmpty() || positionMillis < progressTimes.first() ||
+        progressTimes.last() <= positionMillis - DANMAKU_DISPLAY_MILLIS) return IntRange.EMPTY
     fun insertionIndex(target: Long, afterEqual: Boolean): Int {
         var low = 0
         var high = progressTimes.size
@@ -154,25 +196,6 @@ internal fun VideoDanmakuStatusBanner(
                 .padding(horizontal = 12.dp, vertical = 7.dp),
         )
         else -> Unit
-    }
-}
-
-@Composable
-internal fun DanmakuFullscreenButton(
-    enabled: Boolean,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    IconButton(
-        onClick = onClick,
-        modifier = modifier
-            .background(Color.Black.copy(alpha = 0.52f), CircleShape),
-    ) {
-        Icon(
-            imageVector = Icons.AutoMirrored.Outlined.Chat,
-            contentDescription = if (enabled) "关闭弹幕" else "开启弹幕",
-            tint = if (enabled) MaterialTheme.colorScheme.primary else Color.White,
-        )
     }
 }
 

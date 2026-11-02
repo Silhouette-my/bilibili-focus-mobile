@@ -22,7 +22,6 @@ import org.bilibilifocus.core.service.SearchResultService
 import org.bilibilifocus.core.service.UserService
 import org.bilibilifocus.core.service.VideoActionService
 import org.bilibilifocus.core.service.VideoInfoService
-import org.bilibilifocus.core.service.WatchLaterService
 import org.bilibilifocus.core.service.WbiSigner
 
 /**
@@ -64,7 +63,6 @@ class FocusAppGraph(
     val videoActionService: VideoActionService = VideoActionService(cookieProvider, httpClient)
     val videoInfoService: VideoInfoService =
         VideoInfoService(cookieProvider, httpClient, wbiSigner = wbiSigner)
-    val watchLaterService: WatchLaterService = WatchLaterService(cookieProvider, httpClient)
     internal val playbackHistoryOutbox: FocusPlaybackHistoryOutbox =
         FocusPlaybackHistoryOutbox(
             accountScopeProvider = playbackAccountScopeProvider,

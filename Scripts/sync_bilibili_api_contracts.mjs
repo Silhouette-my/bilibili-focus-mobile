@@ -46,6 +46,11 @@ function validateLocalSnapshot(snapshot) {
       throw new Error(`Endpoint ${key} has unsupported method ${endpoint.method}`);
     }
   }
+  for (const [key, reference] of Object.entries(snapshot.source.supplementalEndpoints ?? {})) {
+    if (!snapshot.endpoints[key] || typeof reference !== "string" || !reference.startsWith("https://")) {
+      throw new Error(`Invalid supplemental endpoint reference: ${key}`);
+    }
+  }
 }
 
 function flattenSource(category, value, path = [], output = {}) {
@@ -92,8 +97,11 @@ function validateSource(sourceRootArgument) {
   const local = readJSON(canonicalPath);
   validateLocalSnapshot(local);
 
+  const supplemental = new Set(Object.keys(local.source.supplementalEndpoints ?? {}));
+  const siblingEndpoints = Object.entries(local.endpoints).filter(([key]) => !supplemental.has(key));
+
   const categories = new Set(
-    Object.keys(local.endpoints).map((key) => key.split(".", 1)[0]),
+    siblingEndpoints.map(([key]) => key.split(".", 1)[0]),
   );
   const sourceEndpoints = {};
   for (const category of categories) {
@@ -106,7 +114,7 @@ function validateSource(sourceRootArgument) {
   }
 
   const mismatches = [];
-  for (const [key, endpoint] of Object.entries(local.endpoints)) {
+  for (const [key, endpoint] of siblingEndpoints) {
     const source = sourceEndpoints[key];
     if (!source) {
       mismatches.push(`${key}: missing from sibling source`);
@@ -126,8 +134,11 @@ function validateSource(sourceRootArgument) {
     encoding: "utf8",
   }).trim();
   process.stdout.write(
-    `Validated ${Object.keys(local.endpoints).length} endpoint URLs/methods against sibling bilibili-api ${commit}\n`,
+    `Validated ${siblingEndpoints.length} endpoint URLs/methods against sibling bilibili-api ${commit}\n`,
   );
+  if (supplemental.size) {
+    process.stdout.write(`${supplemental.size} supplemental endpoints have separate documentation; not validated by this sibling check: ${[...supplemental].join(", ")}\n`);
+  }
 }
 
 const [mode, sourceRoot] = process.argv.slice(2);

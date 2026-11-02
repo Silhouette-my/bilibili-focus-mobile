@@ -8,4 +8,10 @@ data class PlayUrlResult(
     @Deprecated("Media requests intentionally do not receive login cookies")
     val cookie: String = "",
     val userAgent: String = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    val quality: Int = 80,
+    val availableQualities: List<VideoQuality> = emptyList(),
+    val backupVideoUrls: List<String> = emptyList(),
+    val backupAudioUrls: List<String> = emptyList(),
 )
+
+data class VideoQuality(val id: Int, val title: String)

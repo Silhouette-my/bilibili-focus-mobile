@@ -67,7 +67,6 @@
 		000000000000000000000802 /* BiliAPIContract.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000812 /* BiliAPIContract.swift */; };
 		000000000000000000000803 /* BiliAPITransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000813 /* BiliAPITransport.swift */; };
 		000000000000000000000804 /* CursorPager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000814 /* CursorPager.swift */; };
-		000000000000000000000805 /* FocusWatchLaterService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000815 /* FocusWatchLaterService.swift */; };
 		000000000000000000000806 /* WBISigner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000816 /* WBISigner.swift */; };
 		000000000000000000000807 /* bilibili-api-contracts.json in Resources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000817 /* bilibili-api-contracts.json */; };
 		000000000000000000000808 /* FocusPlaybackProgressStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000818 /* FocusPlaybackProgressStore.swift */; };
@@ -184,7 +183,6 @@
 		000000000000000000000812 /* BiliAPIContract.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BiliAPIContract.swift; sourceTree = "<group>"; };
 		000000000000000000000813 /* BiliAPITransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BiliAPITransport.swift; sourceTree = "<group>"; };
 		000000000000000000000814 /* CursorPager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CursorPager.swift; sourceTree = "<group>"; };
-		000000000000000000000815 /* FocusWatchLaterService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusWatchLaterService.swift; sourceTree = "<group>"; };
 		000000000000000000000816 /* WBISigner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WBISigner.swift; sourceTree = "<group>"; };
 		000000000000000000000817 /* bilibili-api-contracts.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "bilibili-api-contracts.json"; sourceTree = "<group>"; };
 		000000000000000000000818 /* FocusPlaybackProgressStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusPlaybackProgressStore.swift; sourceTree = "<group>"; };
@@ -299,7 +297,6 @@
 				000000000000000000000351 /* FocusVideoDetailService.swift */,
 				D10000000000000000000001 /* FocusVideoSubtitleService.swift */,
 				000000000000000000000818 /* FocusPlaybackProgressStore.swift */,
-				000000000000000000000815 /* FocusWatchLaterService.swift */,
 				A10000000000000000000011 /* LoginHealth.swift */,
 				000000000000000000000306 /* FocusBundle.swift */,
 				000000000000000000000307 /* FocusEntry.swift */,
@@ -651,7 +648,6 @@
 				000000000000000000000355 /* FocusVideoDetailService.swift in Sources */,
 				D20000000000000000000001 /* FocusVideoSubtitleService.swift in Sources */,
 				000000000000000000000808 /* FocusPlaybackProgressStore.swift in Sources */,
-				000000000000000000000805 /* FocusWatchLaterService.swift in Sources */,
 				A20000000000000000000011 /* LoginHealth.swift in Sources */,
 				000000000000000000000208 /* FocusBundle.swift in Sources */,
 				000000000000000000000209 /* FocusEntry.swift in Sources */,
@@ -751,7 +747,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = NO;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 5;
+				CURRENT_PROJECT_VERSION = 6;
 				DEVELOPMENT_TEAM = K4S7KL8D85;
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				FRAMEWORK_SEARCH_PATHS = (
@@ -780,7 +776,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = NO;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 5;
+				CURRENT_PROJECT_VERSION = 6;
 				DEVELOPMENT_TEAM = K4S7KL8D85;
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				FRAMEWORK_SEARCH_PATHS = (

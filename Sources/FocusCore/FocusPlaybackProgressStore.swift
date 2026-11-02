@@ -278,6 +278,9 @@ public actor FocusPlaybackProgressStore {
     private var hasLoadedState = false
     private var stateLoadTask: Task<PersistedState?, Never>?
     private var drainingHistoryScopes: Set<FocusPlaybackAccountScope> = []
+    private var historyOperationScopes: Set<FocusPlaybackAccountScope> = []
+    private var historyOperationWaiters: [FocusPlaybackAccountScope: [CheckedContinuation<Void, Never>]] = [:]
+    private var requestedHistoryMutations: [FocusPlaybackAccountScope: Int] = [:]
 
     public init(
         persistence: any FocusPlaybackStatePersistence,
@@ -437,14 +440,16 @@ public actor FocusPlaybackProgressStore {
                 remainingCount: sortedPendingReports(accountScope: accountScope).count
             )
         }
+        await acquireHistoryOperation(accountScope)
         defer {
             drainingHistoryScopes.remove(accountScope)
+            releaseHistoryOperation(accountScope)
         }
 
         var deliveredCount = 0
         var discardedCount = 0
         while let report = sortedPendingReports(accountScope: accountScope).first {
-            guard !Task.isCancelled else {
+            guard !Task.isCancelled, requestedHistoryMutations[accountScope, default: 0] == 0 else {
                 break
             }
 
@@ -484,6 +489,48 @@ public actor FocusPlaybackProgressStore {
             discardedCount: discardedCount,
             remainingCount: sortedPendingReports(accountScope: accountScope).count
         )
+    }
+
+    /// Serializes a remote deletion with physical history submissions. Only
+    /// reports present when the user requested deletion are retired; local
+    /// resume positions and subsequent viewing events remain intact.
+    public func mutateRemoteHistory(
+        accountScope: FocusPlaybackAccountScope,
+        aid: Int64? = nil,
+        operation: @Sendable () async throws -> Void
+    ) async throws {
+        await loadStateIfNeeded()
+        let retired = state.pendingReports.filter {
+            $0.accountScope == accountScope && (aid == nil || $0.aid == aid)
+        }
+        requestedHistoryMutations[accountScope, default: 0] += 1
+        await acquireHistoryOperation(accountScope)
+        defer {
+            requestedHistoryMutations[accountScope, default: 1] -= 1
+            if requestedHistoryMutations[accountScope] == 0 { requestedHistoryMutations.removeValue(forKey: accountScope) }
+            releaseHistoryOperation(accountScope)
+        }
+        try Task.checkCancellation()
+        try await operation()
+        state.pendingReports.removeAll { report in retired.contains(report) }
+        await persistState()
+    }
+
+    private func acquireHistoryOperation(_ scope: FocusPlaybackAccountScope) async {
+        if historyOperationScopes.insert(scope).inserted { return }
+        await withCheckedContinuation { historyOperationWaiters[scope, default: []].append($0) }
+    }
+
+    func hasPendingHistoryMutation(accountScope: FocusPlaybackAccountScope) -> Bool {
+        requestedHistoryMutations[accountScope, default: 0] > 0
+    }
+
+    private func releaseHistoryOperation(_ scope: FocusPlaybackAccountScope) {
+        if var waiters = historyOperationWaiters[scope], !waiters.isEmpty {
+            let first = waiters.removeFirst()
+            historyOperationWaiters[scope] = waiters.isEmpty ? nil : waiters
+            first.resume()
+        } else { historyOperationScopes.remove(scope) }
     }
 
     private func loadStateIfNeeded() async {

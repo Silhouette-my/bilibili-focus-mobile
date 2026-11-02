@@ -206,6 +206,10 @@ final class FocusAppViewModel: ObservableObject {
                 settings.nativeSubtitleEnabled = enabled
                 settings.nativeSubtitleLanguageCode = languageCode
                 settingsStore.settings = settings
+            },
+            playbackPreferences: settingsStore.settings.playbackPreferences,
+            playbackPreferenceChange: { [weak settingsStore] preferences in
+                settingsStore?.settings.playbackPreferences = preferences
             }
         )
         videoViewModels[routeID] = viewModel
@@ -371,6 +375,10 @@ final class FocusAppViewModel: ObservableObject {
 
     func applyNativeDanmakuPreference(_ enabled: Bool) {
         videoViewModels.values.forEach { $0.applyDanmakuPreference(enabled) }
+    }
+
+    func applyPlaybackPreferences(_ preferences: FocusPlaybackPreferences) {
+        videoViewModels.values.forEach { $0.applyPlaybackPreferences(preferences) }
     }
 
     func applyNativeSubtitlePreference(
@@ -575,7 +583,8 @@ final class FocusAppViewModel: ObservableObject {
         }
 
         didHandleLaunchEntry = true
-        hasInstantiatedBrowser = true
+        // Native entries restore cookies directly from the shared data store.
+        // Create WebKit only when a browser route (including login) is opened.
         // The feed view owns its initial load, which already awaits cookies.
         // Late startup warmup must not refresh an already visible/returned feed.
         refreshLoginSensitiveContent(reloadDynamicFeed: false)

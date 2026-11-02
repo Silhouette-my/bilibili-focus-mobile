@@ -205,19 +205,30 @@ final class BilibiliFocusStabilityTests: XCTestCase {
         let model = FocusAppViewModel(settingsStore: store)
         defer { model.dynamicFeedViewModel.suspend() }
         model.handleLaunchEntryIfNeeded()
+        XCTAssertFalse(model.hasInstantiatedBrowser, "Native startup must not mount an invisible WebKit process")
         // The retained feed can already be visible while startup cookie work awaits.
         model.dynamicFeedViewModel.updateScrollOffset(420)
         let revision = model.dynamicFeedViewModel.scrollRestorationRevision
         try await Task.sleep(for: .seconds(3))
         XCTAssertEqual(model.dynamicFeedViewModel.scrollOffsetY, 420)
         XCTAssertEqual(model.dynamicFeedViewModel.scrollRestorationRevision, revision)
+        XCTAssertFalse(model.hasInstantiatedBrowser, "Cookie warmup must not require a browser surface")
+        model.openVideoInBrowser(URL(string: "https://www.bilibili.com/video/BV1xx411c7mD/")!)
+        XCTAssertTrue(model.hasInstantiatedBrowser)
+        XCTAssertTrue(model.isBrowserActive, "An explicit web fallback must instantiate its browser route")
+        let loginModel = FocusAppViewModel(settingsStore: store)
+        defer { loginModel.dynamicFeedViewModel.suspend() }
+        loginModel.handleLaunchEntryIfNeeded()
+        XCTAssertFalse(loginModel.hasInstantiatedBrowser)
+        loginModel.openLogin()
+        XCTAssertTrue(loginModel.hasInstantiatedBrowser)
+        XCTAssertTrue(loginModel.isBrowserActive, "Login must still instantiate the real browser route")
     }
 
     func testMyPageDoesNotTurnSectionFailuresIntoEmptyLists() async {
         let sections: [(String, FocusMyViewModel.Section)] = [
             ("/x/relation/stat", .relation), ("/x/web-interface/history/cursor", .history),
-            ("/x/v3/fav/folder/created/list-all", .folders), ("/x/v3/fav/resource/list", .previews),
-            ("/x/v2/history/toview", .watchLater),
+            ("/x/v3/fav/folder/created/list-all", .folders),
         ]
         for (path, section) in sections {
             let model = makeMyPageTestModel(failedPath: path)
@@ -233,7 +244,7 @@ final class BilibiliFocusStabilityTests: XCTestCase {
                 continue
             }
             XCTAssertFalse(message.isEmpty)
-            let independent: FocusMyViewModel.Section = section == .history ? .watchLater : .history
+            let independent: FocusMyViewModel.Section = section == .history ? .folders : .history
             XCTAssertEqual(model.sectionStates[independent], .loaded)
             model.suspend()
         }
@@ -246,12 +257,10 @@ final class BilibiliFocusStabilityTests: XCTestCase {
         guard case let .loaded(page) = model.state else { return XCTFail("Expected loaded page") }
         XCTAssertTrue(FocusMyViewModel.Section.allCases.allSatisfy { model.sectionStates[$0] == .loaded })
         XCTAssertTrue(page.history.isEmpty)
-        XCTAssertTrue(page.watchLater.isEmpty)
         XCTAssertEqual(page.folders.count, 1)
-        XCTAssertTrue(page.folders[0].previews.isEmpty)
     }
 
-    func testMyPageSurfacesRelationAPIErrorAndWatchLaterExpiredSession() async {
+    func testMyPageSurfacesRelationAPIErrorAndHistoryExpiredSession() async {
         let relation = makeMyPageTestModel(failedPath: "/x/relation/stat", failureCode: -352)
         await relation.refresh()
         if case let .failed(message) = relation.sectionStates[.relation] { XCTAssertEqual(message, "fixture failure") }
@@ -260,15 +269,15 @@ final class BilibiliFocusStabilityTests: XCTestCase {
         XCTAssertEqual(relation.sectionStates[.history], .loaded)
         relation.suspend()
 
-        let watchLater = makeMyPageTestModel(failedPath: "/x/v2/history/toview", failureCode: -101)
-        watchLater.loadIfNeeded()
-        await waitUntil { if case .loginRequired = watchLater.state { return true }; return false }
-        if case .loginRequired = watchLater.state {} else { XCTFail("Expected loginRequired") }
-        watchLater.suspend()
+        let history = makeMyPageTestModel(failedPath: "/x/web-interface/history/cursor", failureCode: -101)
+        history.loadIfNeeded()
+        await waitUntil { if case .loginRequired = history.state { return true }; return false }
+        if case .loginRequired = history.state {} else { XCTFail("Expected loginRequired") }
+        history.suspend()
     }
 
     private func makeMyPageTestModel(failedPath: String? = nil, failureCode: Int? = nil) -> FocusMyViewModel {
-        let loader: FocusWatchLaterService.RequestLoader = { request in
+        let loader: FocusMyDataService.RequestLoader = { request in
             let url = request.url!
             let body: String
             if url.path == failedPath {
@@ -288,8 +297,7 @@ final class BilibiliFocusStabilityTests: XCTestCase {
             service: FocusMyDataService(
                 cookieProvider: WebViewCookieSnapshotProvider(websiteDataStore: .nonPersistent(), performsLoginWarmup: false),
                 requestLoader: loader
-            ),
-            watchLaterService: FocusWatchLaterService(cookieProvider: NativeVideoTestCookieProvider(), requestLoader: loader)
+            )
         )
     }
 

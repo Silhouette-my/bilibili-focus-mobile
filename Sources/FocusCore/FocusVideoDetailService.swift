@@ -442,6 +442,10 @@ public enum FocusVideoPlaybackResumePolicy {
 }
 
 public actor FocusVideoDetailService {
+    /// Default representation requested when no manual quality is selected.
+    /// The playback API may return another quality according to access and source availability.
+    public static let defaultPlaybackQuality = 80
+
     public enum ServiceError: Error, Equatable, Sendable, LocalizedError {
         case unsupportedURL
         case invalidResponse
@@ -666,7 +670,7 @@ public actor FocusVideoDetailService {
         }
     }
 
-    public func fetchPlayback(bvid: String, cid: Int64, quality: Int = 80) async throws -> FocusVideoPlaybackSource {
+    public func fetchPlayback(bvid: String, cid: Int64, quality: Int = FocusVideoDetailService.defaultPlaybackQuality) async throws -> FocusVideoPlaybackSource {
         guard quality > 0 else { throw ServiceError.invalidResponse }
         let snapshot = await cookieProvider.loadSnapshot()
         guard snapshot.version == cookieProvider.sessionVersion else { throw CancellationError() }

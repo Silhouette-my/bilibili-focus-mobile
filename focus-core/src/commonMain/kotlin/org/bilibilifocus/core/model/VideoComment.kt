@@ -12,4 +12,7 @@ data class VideoComment(
     val publishTime: Long,
     val replies: List<VideoComment> = emptyList(),
     val imageURLs: List<String> = emptyList(),
+    val isLiked: Boolean = false,
 )
+
+data class VideoCommentRepliesPage(val replies: List<VideoComment>, val nextPage: Int?)

@@ -78,8 +78,12 @@ final class FocusAppGraph {
         let nativePageAugmentService = FocusNativePageAugmentService(
             cookieProvider: cookieProvider
         )
-        let myDataService = FocusMyDataService(cookieProvider: cookieProvider)
-        let watchLaterService = FocusWatchLaterService(cookieProvider: cookieProvider)
+        let resolvedProgressStore = playbackProgressStore ?? (FocusTestRuntime.isRunningFixtures
+            ? FocusPlaybackProgressStore(persistence: FocusFixturePlaybackPersistence())
+            : .shared)
+        let historyWriteCoordinator = FocusPlaybackProgressWriteCoordinator()
+        let myDataService = FocusMyDataService(cookieProvider: cookieProvider, playbackProgressStore: resolvedProgressStore,
+            historyWriteBarrier: { await historyWriteCoordinator.waitForPendingWrites() })
 
         self.settingsStore = settingsStore
         self.browserViewModel = browserViewModel
@@ -92,10 +96,7 @@ final class FocusAppGraph {
         self.searchResultsViewModel = FocusSearchResultsViewModel(
             service: SearchResultService(cookieProvider: cookieProvider)
         )
-        self.myViewModel = FocusMyViewModel(
-            service: myDataService,
-            watchLaterService: watchLaterService
-        )
+        self.myViewModel = FocusMyViewModel(service: myDataService)
         self.historyViewModel = FocusHistoryViewModel(service: myDataService)
         self.favoriteFolderViewModel = FocusFavoriteFolderViewModel(service: myDataService)
         self.userSpaceService = FocusUserSpaceService(cookieProvider: cookieProvider)
@@ -112,10 +113,8 @@ final class FocusAppGraph {
         )
         self.videoCommentService = FocusVideoCommentService(cookieProvider: videoCookieProvider)
         self.loginHealthService = LoginHealthService(cookieProvider: cookieProvider)
-        self.playbackProgressStore = playbackProgressStore ?? (FocusTestRuntime.isRunningFixtures
-            ? FocusPlaybackProgressStore(persistence: FocusFixturePlaybackPersistence())
-            : .shared)
-        self.playbackProgressWriteCoordinator = FocusPlaybackProgressWriteCoordinator()
+        self.playbackProgressStore = resolvedProgressStore
+        self.playbackProgressWriteCoordinator = historyWriteCoordinator
 
         browserViewModel.websiteDataStore = cookieProvider.websiteDataStore
         browserViewModel.nativePageAugmentService = nativePageAugmentService

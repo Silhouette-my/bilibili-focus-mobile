@@ -2,6 +2,10 @@ package org.bilibilifocus.android.playback
 
 import androidx.work.ExistingWorkPolicy
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.async
+import kotlin.test.assertFailsWith
 import org.bilibilifocus.core.cookie.Cookie
 import org.bilibilifocus.core.cookie.CookieProvider
 import org.bilibilifocus.core.service.VideoActionService
@@ -12,6 +16,61 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class FocusPlaybackHistoryOutboxTests {
+    @Test
+    fun `deletion waits for in flight post retires old matching revisions and preserves new events`() = runTest {
+        val cookies = accountCookies("10001", "session-a")
+        val provider = FocusPlaybackAccountScopeProvider(SequencedCookieProvider(listOf(cookies)))
+        val account = provider.scopeFor(cookies)!!
+        val otherAccount = provider.scopeFor(accountCookies("20002", "session-b"))!!
+        val store = FocusPlaybackProgressStore()
+        store.record(account, "BV-DELETED", 101, 10_000)
+        val first = store.enqueueHistoryReport(account, 42, 101, 10)!!
+        val oldOtherPart = store.enqueueHistoryReport(account, 42, 102, 20)!!
+        val unrelated = store.enqueueHistoryReport(account, 43, 103, 30)!!
+        val otherUser = store.enqueueHistoryReport(otherAccount, 42, 101, 40)!!
+        val reportStarted = CompletableDeferred<Unit>()
+        val releaseReport = CompletableDeferred<Unit>()
+        val deletionStarted = CompletableDeferred<Unit>()
+        val releaseDeletion = CompletableDeferred<Unit>()
+        val submissions = mutableListOf<FocusPendingHistoryReport>()
+        val outbox = FocusPlaybackHistoryOutbox(provider, store, submitReport = { report, _ ->
+            submissions += report
+            if (report.revision == first.revision) { reportStarted.complete(Unit); releaseReport.await() }
+            else throw IOException("offline after deletion")
+        })
+        val draining = async(start = CoroutineStart.UNDISPATCHED) { outbox.drainCurrentAccount() }
+        reportStarted.await()
+        val deleting = async(start = CoroutineStart.UNDISPATCHED) {
+            outbox.mutateRemoteHistory(10001, 42) { deletionStarted.complete(Unit); releaseDeletion.await() }
+        }
+        assertFalse(deletionStarted.isCompleted)
+        releaseReport.complete(Unit)
+        deletionStarted.await()
+        val replacement = store.enqueueHistoryReport(account, 42, 102, 50)!!
+        releaseDeletion.complete(Unit)
+        deleting.await()
+        draining.await()
+        assertFalse(submissions.any { it.revision == oldOtherPart.revision })
+        assertEquals(listOf(unrelated, replacement), store.pendingHistoryReports(account))
+        assertEquals(listOf(otherUser), store.pendingHistoryReports(otherAccount))
+        assertEquals(10_000L, store.progress(account, "BV-DELETED", 101)?.positionMillis)
+    }
+
+    @Test
+    fun `failed deletion keeps queue and clear retires only events captured before request`() = runTest {
+        val cookies = accountCookies("10001", "session-a")
+        val provider = FocusPlaybackAccountScopeProvider(SequencedCookieProvider(listOf(cookies)))
+        val account = provider.scopeFor(cookies)!!
+        val store = FocusPlaybackProgressStore()
+        val old = store.enqueueHistoryReport(account, 42, 101, 10)!!
+        val outbox = FocusPlaybackHistoryOutbox(provider, store, submitReport = { _, _ -> })
+        assertFailsWith<IOException> { outbox.mutateRemoteHistory(10001, null) { throw IOException("offline") } }
+        assertEquals(listOf(old), store.pendingHistoryReports(account))
+        var replacement: FocusPendingHistoryReport? = null
+        outbox.mutateRemoteHistory(10001, null) { replacement = store.enqueueHistoryReport(account, 42, 101, 30) }
+        assertEquals(listOf(replacement!!), store.pendingHistoryReports(account))
+    }
+
     @Test
     fun `drain submits and acknowledges with the exact account cookie snapshot`() = runTest {
         val cookies = accountCookies("10001", "session-a")

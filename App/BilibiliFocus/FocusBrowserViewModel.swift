@@ -64,6 +64,7 @@ final class FocusBrowserViewModel: ObservableObject {
     private var pendingURL: URL?
     private var nativeVideoWebBypassIdentifier: FocusVideoIdentifier?
     private(set) var isSessionActive = false
+    private(set) var documentSuspensionRevision: UInt64 = 0
     private var playerStateObservationTask: Task<Void, Never>?
     private var embeddedPlayerDetectionTask: Task<Void, Never>?
     private var playerCommandTask: Task<Void, Never>?
@@ -1434,11 +1435,13 @@ final class FocusBrowserViewModel: ObservableObject {
 
     func prepareForDismiss() {
         isSessionActive = false
+        documentSuspensionRevision &+= 1
         invalidateBrowserCallbacks()
         webContentRecoveryTask?.cancel()
         webContentRecoveryTask = nil
         webContentFailureMessage = nil
         if let webView {
+            webView.evaluateJavaScript(FocusWebView.Coordinator.documentActivityScript(isActive: false))
             suspendActivePlayback(in: webView)
             webView.stopLoading()
         }

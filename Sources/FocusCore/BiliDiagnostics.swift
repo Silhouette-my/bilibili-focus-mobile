@@ -4,7 +4,7 @@ import Foundation
 public enum BiliPerformanceStage: String, Codable, Sendable {
     case sessionInitialization, cookieSnapshot
     case dynamicLoad, dynamicFirstPage, dynamicDisplayed
-    case myProfile, myFollowing, myHistory, myFavorites, myWatchLater, favoritePreviews
+    case myProfile, myFollowing, myHistory, myFavorites
     case videoStartup, videoDetail, playbackURL, resumeLookup, mediaPreparation, playerReady, firstFrame
     case scrollRestore, layoutCompensation
     case scrollReturn, normalReturnPreserved, layoutChanged

@@ -1,10 +1,89 @@
 import FocusCore
 import Foundation
 import XCTest
+import SwiftUI
+import UIKit
 @testable import BilibiliFocus
 
 @MainActor
 final class FocusSearchOwnershipTests: XCTestCase {
+    func testImagePrefetchWindowFollowsVisibleItemsAndExtendsIntoAppendedPages() {
+        let firstPage = (0..<20).map { "result-\($0)" }
+        XCTAssertEqual(
+            FocusSearchPrefetchWindow.itemIDs(in: firstPage, after: "result-4"),
+            (5..<15).map { "result-\($0)" }
+        )
+
+        let appendedResults = firstPage + (20..<28).map { "result-\($0)" }
+        XCTAssertEqual(
+            FocusSearchPrefetchWindow.itemIDs(in: appendedResults, after: "result-19"),
+            (20..<28).map { "result-\($0)" }
+        )
+        XCTAssertEqual(
+            FocusSearchPrefetchWindow.itemIDs(in: appendedResults, after: nil),
+            (0..<10).map { "result-\($0)" }
+        )
+        XCTAssertEqual(
+            FocusSearchPrefetchWindow.itemIDs(in: appendedResults, after: "missing"),
+            (0..<10).map { "result-\($0)" },
+            "A scope change can retain rows without firing onAppear again, so it must still warm the first window."
+        )
+    }
+
+    func testImagePrefetchAnchorMovesInBothDirectionsByWindowBucket() {
+        XCTAssertFalse(FocusSearchPrefetchWindow.shouldAdvance(from: 1, to: 1))
+        XCTAssertTrue(FocusSearchPrefetchWindow.shouldAdvance(
+            from: FocusSearchPrefetchWindow.bucket(for: 9),
+            to: FocusSearchPrefetchWindow.bucket(for: 10)
+        ))
+        XCTAssertTrue(FocusSearchPrefetchWindow.shouldAdvance(
+            from: FocusSearchPrefetchWindow.bucket(for: 10),
+            to: FocusSearchPrefetchWindow.bucket(for: 9)
+        ))
+    }
+
+    func testImagePrefetchTaskIdentityIncludesSearchScopeEvenWhenIDsMatch() {
+        let ids = ["same-result-1", "same-result-2"]
+        let first = FocusSearchPrefetchTaskID(
+            scope: FocusSearchPrefetchScope(keyword: "first", filter: .video, sort: .default),
+            windowItemIDs: ids
+        )
+        let second = FocusSearchPrefetchTaskID(
+            scope: FocusSearchPrefetchScope(keyword: "second", filter: .video, sort: .default),
+            windowItemIDs: ids
+        )
+        XCTAssertNotEqual(first, second)
+        XCTAssertNotEqual(
+            first,
+            FocusSearchPrefetchTaskID(
+                scope: FocusSearchPrefetchScope(keyword: "first", filter: .users, sort: .default),
+                windowItemIDs: ids
+            )
+        )
+        XCTAssertNotEqual(
+            first,
+            FocusSearchPrefetchTaskID(
+                scope: FocusSearchPrefetchScope(keyword: "first", filter: .video, sort: .mostPlayed),
+                windowItemIDs: ids
+            )
+        )
+    }
+
+    func testCancelledSearchPrefetchDoesNotQueueLaterItems() async {
+        let recorder = SearchPrefetchRecorder()
+        let task = Task {
+            await FocusSearchPrefetchWindow.prefetch([0, 1, 2]) { item in
+                await recorder.record(item)
+            }
+        }
+        await eventuallyAsync { await recorder.recordedItems() == [0] }
+        task.cancel()
+        await recorder.releaseFirstItem()
+        await task.value
+        let recordedItems = await recorder.recordedItems()
+        XCTAssertEqual(recordedItems, [0])
+    }
+
     func testRepeatedSearchVideoRoundTripsKeepAppHierarchy() {
         withApp { app in
             app.searchKeyword = "fixture"
@@ -136,6 +215,93 @@ final class FocusSearchOwnershipTests: XCTestCase {
         XCTAssertTrue(completed)
     }
 
+    func testEveryTypedCategoryPaginatesAndKeepsItsOwnItems() async {
+        for filter in [SearchResultFilter.users, .live, .bangumi, .film] {
+            let api = SearchOwnershipAPI()
+            await api.enableTypedPagination()
+            let model = makeModel(api)
+            model.search(SearchQuery(keyword: "typed"))
+            await eventually { if case .loaded = model.state { return true }; return false }
+            model.selectFilter(filter)
+            await eventually { self.sections(model).first?.filter == filter }
+            let section = sections(model)[0]
+            model.loadMoreIfNeeded(currentItemID: section.items[0].id, in: section)
+            await eventually { self.sections(model).first?.items.count == 2 }
+            XCTAssertEqual(sections(model).map(\.filter), [filter])
+            XCTAssertNil(model.loadMoreErrorMessage)
+            model.suspend()
+        }
+    }
+
+    func testAppendFailurePreservesRowsAndExplicitRetryKeepsCursor() async {
+        let api = SearchOwnershipAPI()
+        let model = makeModel(api)
+        defer { model.suspend() }
+        model.search(SearchQuery(keyword: "retry"))
+        await eventually { if case .loaded = model.state { return true }; return false }
+        await api.failNext("retry/video/2")
+        let section = sections(model)[0]
+        model.loadMoreIfNeeded(currentItemID: section.items[0].id, in: section)
+        await eventually { model.loadMoreErrorMessage != nil }
+        XCTAssertEqual(sections(model)[0].items.count, 1)
+        XCTAssertFalse(model.isLoadingMore)
+        model.retryLoadMore()
+        await eventually { self.sections(model)[0].items.count == 2 }
+        XCTAssertNil(model.loadMoreErrorMessage)
+    }
+
+    func testOverviewDoesNotOverwriteSortedVideoCacheOrUseItsCursor() async {
+        let api = SearchOwnershipAPI()
+        let model = makeModel(api)
+        defer { model.suspend() }
+        model.search(SearchQuery(keyword: "sort"))
+        await eventually { if case .loaded = model.state { return true }; return false }
+        model.selectFilter(.video)
+        model.selectVideoSort(.mostPlayed)
+        await eventually { self.sections(model).first?.items.first?.id == "sort/video/1" }
+        model.selectFilter(.all)
+        let section = sections(model)[0]
+        model.loadMoreIfNeeded(currentItemID: section.items[0].id, in: section)
+        await eventually { self.sections(model).first?.items.count == 2 }
+        model.selectFilter(.video)
+        XCTAssertEqual(model.selectedVideoSort, .mostPlayed)
+        XCTAssertEqual(sections(model)[0].items.map(\.id), ["sort/video/1"])
+    }
+
+    func testTypedSearchPaginationFailureRender() async throws {
+        let api = SearchOwnershipAPI()
+        await api.enableTypedPagination()
+        let model = makeModel(api)
+        defer { model.suspend() }
+        model.search(SearchQuery(keyword: "搜索体验"))
+        await eventually { if case .loaded = model.state { return true }; return false }
+        model.selectFilter(.users)
+        await eventually { self.sections(model).first?.filter == .users }
+        await api.failNext("搜索体验/bili_user/2")
+        let section = sections(model)[0]
+        model.loadMoreIfNeeded(currentItemID: section.items[0].id, in: section)
+        await eventually { model.loadMoreErrorMessage != nil }
+        let host = UIHostingController(rootView: FocusSearchResultsView(
+            viewModel: model, onOpenItem: { _ in }, onOpenPreview: { _ in }, onEditQuery: {}
+        ))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 393, height: 852))
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.frame = window.bounds
+        window.layoutIfNeeded()
+        try await Task.sleep(nanoseconds: 120_000_000)
+        host.view.layoutIfNeeded()
+        let attachment = XCTAttachment(image: UIGraphicsImageRenderer(size: window.bounds.size).image { _ in
+            host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true)
+        })
+        attachment.name = "search-users-append-retry"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        XCTAssertNotNil(model.loadMoreErrorMessage)
+        XCTAssertEqual(sections(model)[0].items.count, 1)
+    }
+
     private func makeModel(_ api: SearchOwnershipAPI) -> FocusSearchResultsViewModel {
         FocusSearchResultsViewModel(service: SearchResultService(cookieProvider: SearchOwnershipCookies(), requestLoader: {
             try await api.respond($0)
@@ -165,7 +331,30 @@ private struct SearchOwnershipCookies: CookieSnapshotProvider {
     func loadCookies() async -> [HTTPCookie] { [] }
 }
 
+private actor SearchPrefetchRecorder {
+    private var items: [Int] = []
+    private var firstItemContinuation: CheckedContinuation<Void, Never>?
+
+    func record(_ item: Int) async {
+        items.append(item)
+        if item == 0 {
+            await withCheckedContinuation { firstItemContinuation = $0 }
+        }
+    }
+
+    func recordedItems() -> [Int] { items }
+
+    func releaseFirstItem() {
+        firstItemContinuation?.resume()
+        firstItemContinuation = nil
+    }
+}
+
 private actor SearchOwnershipAPI {
+    private var typedPagination = false
+    private var failingKey: String?
+    func enableTypedPagination() { typedPagination = true }
+    func failNext(_ key: String) { failingKey = key }
     private var heldKey: String?
     private var continuation: CheckedContinuation<Void, Never>?
     private(set) var completedHeldRequest = false
@@ -186,11 +375,21 @@ private actor SearchOwnershipAPI {
             func value(_ name: String, _ fallback: String) -> String { query.first { $0.name == name }?.value ?? fallback }
             let type = value("search_type", "all")
             let key = "\(value("keyword", ""))/\(type)/\(value("page", "1"))"
+            if key == failingKey { failingKey = nil; throw URLError(.notConnectedToInternet) }
             let wasHeld = key == heldKey
             if wasHeld { await withCheckedContinuation { continuation = $0 } }
             // Ignore cancellation deliberately to exercise UI request ownership.
             if wasHeld { completedHeldRequest = true }
-            if type == "bili_user" {
+            if typedPagination && type != "all" {
+                let page = Int(value("page", "1"))!
+                let item: [String: Any]
+                switch type {
+                case "bili_user": item = ["mid": "\(page)", "uname": key]
+                case "live_room": item = ["roomid": "\(page)", "title": key]
+                default: item = ["season_id": "\(page)", "title": key, "url": "https://www.bilibili.com/bangumi/play/ss\(page)"]
+                }
+                payload = ["result": [item], "page": page, "numPages": 2]
+            } else if type == "bili_user" {
                 payload = ["result": [["mid": "42", "uname": key]], "page": 1, "numPages": 1]
             } else {
                 let video: [String: Any] = ["bvid": key, "title": key, "arcurl": "https://www.bilibili.com/video/BV1xx411c7mD/"]

@@ -312,6 +312,19 @@ struct FocusVideoDetailServiceTests {
     }
 
     @Test
+    func automaticPlaybackKeepsTheExistingDefaultQualityRequest() async throws {
+        let recorder = PlaybackMediaRequestRecorder(payload: progressivePayload)
+        let service = FocusVideoDetailService(cookieProvider: VideoActionCookieProvider(), requestLoader: { request in
+            try await recorder.response(for: request)
+        })
+        _ = try await service.fetchPlayback(bvid: "BV1xx411c7mD", cid: 4201)
+        let request = try #require(await recorder.requests.first)
+        let query = URLComponents(url: try #require(request.url), resolvingAgainstBaseURL: false)?.queryItems ?? []
+        #expect(FocusVideoDetailService.defaultPlaybackQuality == 80)
+        #expect(query.first(where: { $0.name == "qn" })?.value == "80")
+    }
+
+    @Test
     func playbackResumeDecoderKeepsServerMilliseconds() throws {
         let progress = try FocusVideoDetailService.decodePlaybackResumeResponse(
             Data(#"{"code":0,"data":{"last_play_cid":4203,"last_play_time":87000}}"#.utf8)

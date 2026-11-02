@@ -14,6 +14,9 @@ data class FocusPlaybackRequest(
     val accountScope: String?,
     val startPositionMillis: Long = 0,
     val autoPlay: Boolean = true,
+    val preferredQuality: Int? = null,
+    val playbackSpeed: Float = 1f,
+    val forceReload: Boolean = false,
 ) {
     val mediaId: String = "$bvid:$cid:${accountScope.orEmpty()}"
 
@@ -28,6 +31,9 @@ data class FocusPlaybackRequest(
         putString(FocusPlaybackContract.KEY_ACCOUNT_SCOPE, accountScope)
         putLong(FocusPlaybackContract.KEY_START_POSITION_MILLIS, startPositionMillis)
         putBoolean(FocusPlaybackContract.KEY_AUTO_PLAY, autoPlay)
+        preferredQuality?.let { putInt("quality", it) }
+        putFloat("speed", playbackSpeed)
+        putBoolean("force_reload", forceReload)
     }
 
     companion object {
@@ -48,6 +54,9 @@ data class FocusPlaybackRequest(
                     ?.takeIf(String::isNotBlank),
                 startPositionMillis = bundle.getLong(FocusPlaybackContract.KEY_START_POSITION_MILLIS),
                 autoPlay = bundle.getBoolean(FocusPlaybackContract.KEY_AUTO_PLAY, true),
+                preferredQuality = bundle.getInt("quality").takeIf { bundle.containsKey("quality") && it > 0 },
+                playbackSpeed = bundle.getFloat("speed", 1f).takeIf { it.isFinite() && it in 0.5f..3f } ?: 1f,
+                forceReload = bundle.getBoolean("force_reload", false),
             )
         }
     }
@@ -56,11 +65,14 @@ data class FocusPlaybackRequest(
 object FocusPlaybackContract {
     const val COMMAND_LOAD = "org.bilibilifocus.android.playback.LOAD"
     const val COMMAND_STOP = "org.bilibilifocus.android.playback.STOP"
+    const val COMMAND_SLEEP_TIMER = "org.bilibilifocus.android.playback.SLEEP_TIMER"
 
     val loadCommand: SessionCommand
         get() = SessionCommand(COMMAND_LOAD, Bundle.EMPTY)
     val stopCommand: SessionCommand
         get() = SessionCommand(COMMAND_STOP, Bundle.EMPTY)
+    val sleepTimerCommand: SessionCommand
+        get() = SessionCommand(COMMAND_SLEEP_TIMER, Bundle.EMPTY)
 
     internal const val KEY_BVID = "bvid"
     internal const val KEY_AID = "aid"

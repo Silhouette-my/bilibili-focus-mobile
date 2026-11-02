@@ -22,6 +22,8 @@ import org.bilibilifocus.core.service.VideoInfoService
 import org.bilibilifocus.core.service.VideoActionService
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertIs
+import kotlin.test.assertTrue
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class FocusContentCancellationTests {
@@ -32,7 +34,7 @@ class FocusContentCancellationTests {
             override suspend fun loadCookies(): List<Cookie> = emptyList()
         }
         try {
-            for (cancelledPath in listOf("/x/web-interface/nav", "/x/space/wbi/acc/info", "/history/cursor", "/fav/folder/created/list-all")) {
+            for (cancelledPath in listOf("/x/web-interface/nav", "/history/cursor", "/fav/folder/created/list-all")) {
                 val http = object : HttpClient {
                     override suspend fun get(url: String, headers: Map<String, String>): HttpResponse {
                         if (cancelledPath in url) throw CancellationException("cancelled my page request")
@@ -45,7 +47,16 @@ class FocusContentCancellationTests {
                 try {
                     viewModel.reload()
                     advanceUntilIdle()
-                    assertEquals(MyUiState.Loading, viewModel.state.value, cancelledPath)
+                    if (cancelledPath == "/x/web-interface/nav") assertEquals(MyUiState.Loading, viewModel.state.value, cancelledPath)
+                    else {
+                        // Metadata now publishes before independent sections.
+                        // Cancellation must leave the affected section pending,
+                        // never mark an empty list as a completed response.
+                        val loaded = assertIs<MyUiState.Loaded>(viewModel.state.value)
+                        assertTrue(loaded.isRefreshing)
+                        if (cancelledPath == "/history/cursor") assertTrue(loaded.isLoadingHistory)
+                        else assertTrue(loaded.isLoadingFolders)
+                    }
                 } finally {
                     viewModel.onCleared()
                 }

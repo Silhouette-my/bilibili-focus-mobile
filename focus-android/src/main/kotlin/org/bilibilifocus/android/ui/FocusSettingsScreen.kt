@@ -75,6 +75,7 @@ import org.bilibilifocus.core.service.FollowingAuthorsService
 import org.bilibilifocus.core.service.InMemoryNetworkEventSink
 import org.bilibilifocus.core.service.LoginHealthService
 import org.bilibilifocus.android.ui.theme.focusAccentColor
+import org.bilibilifocus.android.ui.video.PlaybackPreferencesEditor
 
 private val AccentColorPresets = listOf(
     "#FB7299",
@@ -239,6 +240,14 @@ private fun SettingsHomeScreen(
                         checked = settings.nativeDanmakuEnabled,
                         onCheckedChange = { enabled -> onUpdate { it.copy(nativeDanmakuEnabled = enabled) } },
                     )
+                    SettingsSwitchRow(
+                        title = "原生播放器默认显示字幕",
+                        checked = settings.nativeSubtitleEnabled,
+                        onCheckedChange = { enabled -> onUpdate { it.copy(nativeSubtitleEnabled = enabled) } },
+                    )
+                    PlaybackPreferencesEditor(settings.playbackPreferences) { preferences ->
+                        onUpdate { it.copy(playbackPreferences = preferences) }
+                    }
                 }
             }
 

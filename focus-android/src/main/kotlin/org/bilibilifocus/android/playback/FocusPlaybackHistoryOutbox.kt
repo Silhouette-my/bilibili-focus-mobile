@@ -4,6 +4,9 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.bilibilifocus.core.cookie.Cookie
+import org.bilibilifocus.core.cookie.CookieRequestPolicy
+import org.bilibilifocus.core.service.BiliApiContractCatalog
+import org.bilibilifocus.core.service.HistoryService
 import org.bilibilifocus.core.service.VideoActionService
 
 internal enum class FocusPlaybackHistoryDrainResult {
@@ -39,6 +42,25 @@ internal class FocusPlaybackHistoryOutbox(
         FocusPlaybackHistoryFailurePolicy::classify,
 ) {
     private val submissionMutex = Mutex()
+
+    suspend fun mutateRemoteHistory(
+        expectedMID: Long,
+        aid: Long?,
+        operation: suspend () -> Unit,
+    ) {
+        val account = accountScopeProvider.currentSnapshot() ?: throw HistoryService.ServiceError.LoginRequired
+        val matching = CookieRequestPolicy.matchingCookies(account.cookies, BiliApiContractCatalog.require("history.operate.clear").url)
+        if (matching.firstOrNull { it.name == "DedeUserID" }?.value?.toLongOrNull() != expectedMID) throw HistoryService.ServiceError.LoginRequired
+        val retired = progressStore.pendingHistoryReports(account.scope).filter { aid == null || it.aid == aid }
+        // The same mutex protects foreground and WorkManager submissions. A
+        // deletion therefore cannot be followed by a late, pre-deletion POST.
+        submissionMutex.withLock {
+            operation()
+            retired.forEach { report ->
+                progressStore.markHistorySubmitted(account.scope, report.aid, report.cid, report.revision)
+            }
+        }
+    }
 
     fun enqueue(
         accountScope: String,

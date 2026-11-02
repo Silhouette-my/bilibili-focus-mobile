@@ -58,6 +58,18 @@ class UserService(
         return (data.longValueAt("following") ?: 0L) to (data.longValueAt("follower") ?: 0L)
     }
 
+    suspend fun fetchRelationInfoStrict(mid: Long): Pair<Long, Long> {
+        val payload = requestObject(
+            url = BiliApiContractCatalog.require("user.info.relation_stat").url + "?vmid=$mid",
+            referer = "https://space.bilibili.com/$mid",
+        ) ?: throw ServiceError.InvalidResponse
+        requireSuccessful(payload)
+        val data = payload.dictionaryValueAt("data") ?: throw ServiceError.InvalidResponse
+        val following = data.longValueAt("following") ?: throw ServiceError.InvalidResponse
+        val followers = data.longValueAt("follower") ?: throw ServiceError.InvalidResponse
+        return following to followers
+    }
+
     suspend fun fetchUserVideos(mid: Long, page: Int = 1, pageSize: Int = 30): List<UserVideo> =
         fetchUserVideoPage(mid, page, pageSize).items
 
@@ -307,7 +319,7 @@ class UserService(
 
     private fun formatDuration(raw: String?, seconds: Long?): String {
         val normalizedRaw = raw?.trim().orEmpty()
-        if (normalizedRaw.isNotEmpty()) {
+        if (normalizedRaw.isNotEmpty() && normalizedRaw.toLongOrNull() == null) {
             val parts = normalizedRaw.split(":")
             return when (parts.size) {
                 2 -> "${parts[0].toIntOrNull() ?: 0}:${parts[1].padStart(2, '0')}"
@@ -315,7 +327,7 @@ class UserService(
                 else -> normalizedRaw
             }
         }
-        val value = seconds ?: return ""
+        val value = normalizedRaw.toLongOrNull() ?: seconds ?: return ""
         if (value <= 0) return ""
         val hours = value / 3600
         val minutes = (value % 3600) / 60

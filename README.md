@@ -11,9 +11,10 @@
 ## 🌟 核心特性与亮点
 
 * **广告与干扰全面净化**：WebView 区域内置自动化去干扰、导流拦截和布局修复机制，还你一个纯净的浏览界面。
-* **丝滑的原生体验**：
-    * **核心页面原生化**：关注动态流、搜索入口及结果页、个人中心、历史记录、关注列表、收藏夹/合集页、UP主空间等均采用原生组件渲染。
-    * **原生视频播放**：iOS 采用底层 `AVPlayer`，Android 采用 `Media3/ExoPlayer`，支持分 P 播放、弹幕、评论查看、点赞/投币/收藏三连互动，以及播放进度自动上报。iOS 还支持原生字幕轨道发现、语言选择与开关偏好，并已支持评论楼中楼分页和评论点赞。
+* **原生观看体验**：
+    * **核心页面原生化**：关注动态流、搜索入口及分类分页、个人中心、历史记录、关注列表、收藏夹/合集页、UP主空间等采用原生组件渲染。个人中心以历史、收藏和关注为常驻入口，不包含“稍后再看”功能。
+    * **原生视频播放**：iOS 使用 `AVPlayer`，Android 使用 `Media3/ExoPlayer`。支持分 P、字幕语言选择、弹幕/字幕显示设置、常用倍速记忆、可选下一 P、睡眠定时和有界断流恢复。自动模式允许恢复时降档，手动画质保持用户选择。
+    * **原生互动与内容管理**：支持点赞/投币/收藏、评论楼中楼及点赞、发送/回复/删除本人评论，提供历史与收藏管理。历史删除与待上报队列串行，不因旧队列重传恢复已删除记录。
     * **PiP 与后台播放**：播放中返回桌面会自动进入系统画中画；PiP 不可用或锁屏时继续后台音频，并提供通知、锁屏及控制中心媒体控制。
 
 
@@ -27,7 +28,7 @@
 
 为了方便无法在本地配置开发环境的读者，本项目在 Release 页面直接提供编译好的成品包：
 
-已发布版本：**1.0.1**。本地 iOS 候选为 **1.0.2（build 5）**，包含动态自动刷新、动态与搜索返回修复、手机全屏控件布局、弹幕刷新节奏及起播优化，尚未发布。构建与验证范围见 [动态返回专项](docs/DYNAMIC_SCROLL_RETURN_FIX.md) 和 [播放器与性能记录](docs/PERFORMANCE_FOLLOWUP.md)。下方 Release 下载仍为 1.0.1，不包含这些本地改动。
+已发布版本：**1.0.1**。此前本地 iOS 安装包为 **1.0.2（build 6）**，包含进度条、自动画质及前期播放/性能优化。当前源码正在推进双端个人中心与播放器改进，旧安装包不包含这些新改动。构建与验证范围见 [播放器与性能记录](docs/PERFORMANCE_FOLLOWUP.md) 和 [本次实施记录](docs/CLIENT_MATURITY_IMPLEMENTATION.md)。下方 Release 下载仍为 1.0.1。
 
 👉 **[前往 Releases 页面下载 1.0.1](https://github.com/Silhouette-my/bilibili-focus-mobile/releases/tag/1.0.1)**
 
@@ -170,8 +171,10 @@ Gradle 的测试与 assemble 任务也依赖同一份一致性门禁，未同步
 
 ### API 契约与升级路线
 
-Swift 与 KMP 共享一份 independently maintained、facts-only 的 Bilibili API
-端点子集。开发时可以用同级 `bilibili-api` 仓库校验当前 48 个端点的 URL 与 HTTP method：
+Swift 与 KMP 共享一份独立维护、仅含协议事实的 Bilibili API 端点子集。
+当前 52 个端点的 URL 与 HTTP method 可用同级 `bilibili-api` 仓库校验；历史搜索、删除与
+清空另有 3 个补充来源，记录在 catalog 的 `source.supplementalEndpoints` 中，
+不会被报告为通过同级仓库校验：
 
 ```bash
 ./Scripts/sync_bilibili_api_contracts.mjs --validate-source ../bilibili-api
@@ -179,6 +182,7 @@ Swift 与 KMP 共享一份 independently maintained、facts-only 的 Bilibili AP
 
 完整的 4–12 周改造成果、许可边界和后续功能顺序见
 [升级路线图](docs/UPGRADE_ROADMAP.md)。
+2026-10-29 双端改进与验收进展见 [本次实施记录](docs/CLIENT_MATURITY_IMPLEMENTATION.md)。
 真实账号的只读在线检查使用显式 opt-in，详见
 [在线 Smoke 说明](docs/ONLINE_SMOKE.md)。
 

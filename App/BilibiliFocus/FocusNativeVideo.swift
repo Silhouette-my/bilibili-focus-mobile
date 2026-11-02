@@ -34,6 +34,17 @@ final class FocusPlaybackProgressWriteCoordinator {
     }
 }
 
+/// Only time-dependent player surfaces observe ticks. Detail and comment
+/// subscribers continue to receive the view model's business-state changes.
+@MainActor
+final class FocusNativePlaybackProgress: ObservableObject {
+    @Published private(set) var positionMilliseconds: Int64 = 0
+
+    fileprivate func update(_ position: Int64) {
+        positionMilliseconds = position
+    }
+}
+
 @MainActor
 final class FocusNativeVideoViewModel: ObservableObject {
     typealias LandscapeRequest = @MainActor () -> Void
@@ -41,6 +52,7 @@ final class FocusNativeVideoViewModel: ObservableObject {
     typealias PortraitTransition = @MainActor () async -> Void
     typealias DanmakuPreferenceChange = @MainActor (Bool) -> Void
     typealias SubtitlePreferenceChange = @MainActor (Bool, String) -> Void
+    typealias PlaybackPreferenceChange = @MainActor (FocusPlaybackPreferences) -> Void
     typealias PlaybackReadyWaiter = @MainActor (AVPlayerItem) async throws -> Void
     typealias InitialPlaybackSeeker = @MainActor (AVQueuePlayer, Int64) async throws -> Void
     typealias PlaybackItemFactory = @MainActor (FocusVideoPlaybackSource) async throws -> [AVPlayerItem]
@@ -106,6 +118,12 @@ final class FocusNativeVideoViewModel: ObservableObject {
         let isLiked: Bool
     }
 
+    struct CommentReplyTarget {
+        let rootID: Int64
+        let parentID: Int64
+        let authorName: String
+    }
+
     @Published private(set) var state: State = .idle
     @Published private(set) var routePreview: RoutePreview?
     @Published private(set) var comments: [FocusVideoComment] = []
@@ -121,11 +139,22 @@ final class FocusNativeVideoViewModel: ObservableObject {
     @Published private(set) var playerErrorMessage: String?
     @Published private(set) var isPlaying = false
     @Published private(set) var playbackRate: Float = 1
-    @Published private(set) var playbackPositionMilliseconds: Int64 = 0
+    @Published private(set) var playbackPreferences: FocusPlaybackPreferences
+    @Published private(set) var playbackRecoveryMessage: String?
+    @Published private(set) var sleepTimerMinutes: Int?
+    let playbackProgress = FocusNativePlaybackProgress()
+    private(set) var playbackPositionMilliseconds: Int64 {
+        get { playbackProgress.positionMilliseconds }
+        set { playbackProgress.update(newValue) }
+    }
     @Published private(set) var availableQualities: [FocusVideoQuality] = []
-    @Published private(set) var selectedQuality = 80
+    @Published private(set) var selectedQuality = FocusVideoDetailService.defaultPlaybackQuality
     @Published private(set) var qualityDescription = "自动清晰度"
-    @Published private(set) var danmakus: [FocusVideoDanmaku] = []
+    // nil follows the service's default selection; the actual delivered quality
+    // remains in selectedQuality/qualityDescription and never changes this mode.
+    @Published private var preferredQuality: Int? = nil
+    var isAutomaticQuality: Bool { preferredQuality == nil }
+    @Published private(set) var danmakuSegments: [FocusNativeDanmakuSegment] = []
     @Published private(set) var danmakuLoadState: DanmakuLoadState = .idle
     @Published private(set) var isDanmakuEnabled: Bool
     @Published private(set) var subtitleTracks: [FocusVideoSubtitleTrack] = []
@@ -136,10 +165,20 @@ final class FocusNativeVideoViewModel: ObservableObject {
     @Published private(set) var commentThreadStates: [Int64: CommentThreadState] = [:]
     @Published private(set) var commentLikeOverrides: [Int64: CommentLikeState] = [:]
     @Published private(set) var commentLikeActionsInFlight: Set<Int64> = []
+    @Published var showsCommentComposer = false
+    @Published var commentDraft = ""
+    @Published private(set) var commentReplyTarget: CommentReplyTarget?
+    @Published private(set) var isSendingComment = false
+    @Published private(set) var commentComposeError: String?
+    @Published private(set) var commentDeletesInFlight: Set<Int64> = []
+    @Published private(set) var deletedCommentIDs: Set<Int64> = []
     @Published var isFullscreen = false
+    @Published var requestsSystemPlaybackControls = false
     @Published var actionErrorMessage: String?
 
-    let player: AVQueuePlayer
+    // Replacement publishes explicitly. A plain stored media handle also
+    // permits synchronous teardown without an isolated property-wrapper getter.
+    private(set) var player: AVQueuePlayer
 
     private let detailService: FocusVideoDetailService
     private let actionService: FocusVideoActionService
@@ -161,6 +200,9 @@ final class FocusNativeVideoViewModel: ObservableObject {
     private var isCommentsPaginationActive = false
     private var commentReplyTasks: [Int64: Task<Void, Never>] = [:]
     private var commentLikeTasks: [Int64: Task<Void, Never>] = [:]
+    private var commentMutationTask: Task<Void, Never>?
+    private var commentDeleteTasks: [Int64: Task<Void, Never>] = [:]
+    private var commentMutationGeneration: UInt64 = 0
     private var interactionTask: Task<Void, Never>?
     private var playbackTask: Task<Void, Never>?
     private var actionTasks: [Action: Task<Void, Never>] = [:]
@@ -180,6 +222,19 @@ final class FocusNativeVideoViewModel: ObservableObject {
     private var timeControlObservation: NSKeyValueObservation?
     private var rateObservation: NSKeyValueObservation?
     private var playerStatusObservation: NSKeyValueObservation?
+    private var currentItemObservation: NSKeyValueObservation?
+    private var itemStatusObservation: NSKeyValueObservation?
+    nonisolated(unsafe) private var itemEndObserver: NSObjectProtocol?
+    private var preparedItemIDs: Set<ObjectIdentifier> = []
+    private var completedItemIDs: Set<ObjectIdentifier> = []
+    private var runtimeRecoveryTask: Task<Void, Never>?
+    private var runtimeRecoveryAttempts = 0
+    private var lastRecoveryPosition: Int64 = 0
+    private var automaticRecoveryQuality: Int?
+    private var playbackWanted = false
+    private var lastKnownPlaybackPosition: Int64 = 0
+    private var hasCompletedPlaybackPreparation = false
+    private var sleepTimerTask: Task<Void, Never>?
     nonisolated(unsafe) private var periodicTimeObserver: Any?
     private var danmakuViewTask: Task<Void, Never>?
     private var danmakuSegmentTasks: [Int: Task<Void, Never>] = [:]
@@ -215,6 +270,7 @@ final class FocusNativeVideoViewModel: ObservableObject {
     private let portraitTransition: PortraitTransition
     private let danmakuPreferenceChange: DanmakuPreferenceChange
     private let subtitlePreferenceChange: SubtitlePreferenceChange
+    private let playbackPreferenceChange: PlaybackPreferenceChange
     private let playbackReadyWaiter: PlaybackReadyWaiter
     private let initialPlaybackSeeker: InitialPlaybackSeeker
     private let playbackItemFactory: PlaybackItemFactory
@@ -279,6 +335,8 @@ final class FocusNativeVideoViewModel: ObservableObject {
         detail != nil
     }
 
+    var isPlaybackRequestedByUser: Bool { playbackWanted }
+
     var hasActiveLoadTask: Bool {
         loadTask != nil || commentsTask != nil || interactionTask != nil || playbackTask != nil
     }
@@ -316,6 +374,8 @@ final class FocusNativeVideoViewModel: ObservableObject {
         nativeSubtitleEnabled: Bool = true,
         preferredSubtitleLanguageCode: String = "",
         subtitlePreferenceChange: SubtitlePreferenceChange? = nil,
+        playbackPreferences: FocusPlaybackPreferences = .defaults,
+        playbackPreferenceChange: PlaybackPreferenceChange? = nil,
         landscapeRequest: LandscapeRequest? = nil,
         portraitFullscreenRequest: PortraitFullscreenRequest? = nil,
         portraitTransition: PortraitTransition? = nil,
@@ -338,6 +398,9 @@ final class FocusNativeVideoViewModel: ObservableObject {
         self.preferredSubtitleLanguageCode = preferredSubtitleLanguageCode
         self.danmakuPreferenceChange = danmakuPreferenceChange ?? { _ in }
         self.subtitlePreferenceChange = subtitlePreferenceChange ?? { _, _ in }
+        self.playbackPreferences = playbackPreferences
+        self.playbackRate = Float(playbackPreferences.preferredRate)
+        self.playbackPreferenceChange = playbackPreferenceChange ?? { _ in }
         self.landscapeRequest = landscapeRequest ?? {
             FocusNativeVideoOrientation.update(to: .landscape)
         }
@@ -362,13 +425,19 @@ final class FocusNativeVideoViewModel: ObservableObject {
         player.audiovisualBackgroundPlaybackPolicy =
             FocusNativePlaybackLifecyclePolicy.audiovisualBackgroundPlaybackPolicy
         self.player = player
+        installPlayerObservers()
+        retryPendingWatchHistoryReports()
+    }
 
+    private func installPlayerObservers() {
+        let player = self.player
         timeControlObservation = player.observe(\.timeControlStatus, options: [.initial, .new]) { [weak self] player, _ in
             Task { @MainActor [weak self] in
-                guard let self else {
+                guard let self, self.player === player else {
                     return
                 }
                 self.isPlaying = player.rate > 0 && player.timeControlStatus == .playing
+                self.handleTimeControlChange()
                 if self.hasPlaybackEnded {
                     self.playbackPositionMilliseconds = self.playbackDurationMilliseconds
                 }
@@ -387,7 +456,7 @@ final class FocusNativeVideoViewModel: ObservableObject {
                 // before pause(). Re-read once on the actor; zero is transport
                 // state, not a new user-selected playback speed.
                 let rate = player.rate
-                guard let self, rate > 0 else {
+                guard let self, self.player === player, rate > 0 else {
                     return
                 }
                 self.playbackRate = rate
@@ -400,25 +469,69 @@ final class FocusNativeVideoViewModel: ObservableObject {
             }
             let message = player.error?.localizedDescription ?? "播放过程中断，请重试。"
             Task { @MainActor [weak self] in
-                self?.playerErrorMessage = message
-                self?.hasPreparedPlayer = false
+                guard let self, self.player === player else { return }
+                self.recoverInterruptedPlayback(error: player.error, terminalMessage: message)
+            }
+        }
+        currentItemObservation = player.observe(\.currentItem, options: [.new]) { [weak self] observed, _ in
+            Task { @MainActor [weak self] in
+                guard let self, self.player === observed else { return }
+                self.observeCurrentPlaybackItem()
+                self.handlePlaybackEndIfNeeded()
+            }
+        }
+        itemEndObserver = NotificationCenter.default.addObserver(
+            forName: AVPlayerItem.didPlayToEndTimeNotification, object: nil, queue: .main
+        ) { [weak self] notification in
+            guard let item = notification.object as? AVPlayerItem else { return }
+            Task { @MainActor [weak self] in
+                guard let self, self.preparedItemIDs.contains(ObjectIdentifier(item)) else { return }
+                self.completedItemIDs.insert(ObjectIdentifier(item))
+                // AVQueuePlayer advances its current item before the queued actor callback.
+                self.handlePlaybackEndIfNeeded()
             }
         }
         periodicTimeObserver = player.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: 1, preferredTimescale: 600),
             queue: .main
-        ) { [weak self] time in
+        ) { [weak self, weak player] time in
             Task { @MainActor [weak self] in
+                guard let self, let player, self.player === player else { return }
                 let milliseconds = Self.milliseconds(from: time)
-                self?.playbackPositionMilliseconds = milliseconds
-                self?.updateDanmakuPosition(milliseconds)
-                self?.updateNowPlayingInfoIfNeeded(milliseconds: milliseconds)
-                if self?.player.timeControlStatus == .playing {
-                    self?.queueWatchHistoryReport(force: false)
+                self.playbackPositionMilliseconds = milliseconds
+                if milliseconds > 0 {
+                    self.lastKnownPlaybackPosition = milliseconds
+                    if self.runtimeRecoveryAttempts > 0, milliseconds >= self.lastRecoveryPosition + 30_000 {
+                        self.runtimeRecoveryAttempts = 0
+                    }
+                }
+                self.updateDanmakuPosition(milliseconds)
+                self.updateNowPlayingInfoIfNeeded(milliseconds: milliseconds)
+                if self.player.timeControlStatus == .playing {
+                    self.queueWatchHistoryReport(force: false)
                 }
             }
         }
-        retryPendingWatchHistoryReports()
+    }
+
+    private func replaceFailedPlayerIfNeeded() {
+        guard player.status == .failed else { return }
+        timeControlObservation?.invalidate()
+        rateObservation?.invalidate()
+        playerStatusObservation?.invalidate()
+        currentItemObservation?.invalidate()
+        itemStatusObservation?.invalidate()
+        if let periodicTimeObserver { player.removeTimeObserver(periodicTimeObserver) }
+        if let itemEndObserver { NotificationCenter.default.removeObserver(itemEndObserver) }
+        player.pause()
+        player.removeAllItems()
+        let replacement = AVQueuePlayer()
+        replacement.actionAtItemEnd = .advance
+        replacement.automaticallyWaitsToMinimizeStalling = true
+        replacement.audiovisualBackgroundPlaybackPolicy = FocusNativePlaybackLifecyclePolicy.audiovisualBackgroundPlaybackPolicy
+        objectWillChange.send()
+        player = replacement
+        installPlayerObservers()
     }
 
     deinit {
@@ -426,6 +539,8 @@ final class FocusNativeVideoViewModel: ObservableObject {
         commentsTask?.cancel()
         commentReplyTasks.values.forEach { $0.cancel() }
         commentLikeTasks.values.forEach { $0.cancel() }
+        commentMutationTask?.cancel()
+        commentDeleteTasks.values.forEach { $0.cancel() }
         interactionTask?.cancel()
         playbackTask?.cancel()
         actionTasks.values.forEach { $0.cancel() }
@@ -436,6 +551,11 @@ final class FocusNativeVideoViewModel: ObservableObject {
         timeControlObservation?.invalidate()
         rateObservation?.invalidate()
         playerStatusObservation?.invalidate()
+        currentItemObservation?.invalidate()
+        itemStatusObservation?.invalidate()
+        runtimeRecoveryTask?.cancel()
+        sleepTimerTask?.cancel()
+        if let itemEndObserver { NotificationCenter.default.removeObserver(itemEndObserver) }
         if let periodicTimeObserver {
             player.removeTimeObserver(periodicTimeObserver)
         }
@@ -512,6 +632,8 @@ final class FocusNativeVideoViewModel: ObservableObject {
         }
 
         queueWatchHistoryReport(force: true)
+        resetPlaybackRecovery()
+        hasCompletedPlaybackPreparation = false
         activePlaybackAccountScope = nil
         cancelTasks()
         finishVideoStartup(outcome: .cancelled)
@@ -534,8 +656,9 @@ final class FocusNativeVideoViewModel: ObservableObject {
         actionsInFlight = []
         selectedPageCID = nil
         availableQualities = []
-        selectedQuality = 80
+        selectedQuality = FocusVideoDetailService.defaultPlaybackQuality
         qualityDescription = "自动清晰度"
+        preferredQuality = nil
         resetDanmakuSession()
         resetSubtitleSession()
         playerErrorMessage = nil
@@ -560,6 +683,8 @@ final class FocusNativeVideoViewModel: ObservableObject {
         }
 
         queueWatchHistoryReport(force: true)
+        resetPlaybackRecovery()
+        hasCompletedPlaybackPreparation = false
         activePlaybackAccountScope = nil
         cancelTasks()
         if videoStartupSpan == nil { beginVideoStartup() }
@@ -637,6 +762,8 @@ final class FocusNativeVideoViewModel: ObservableObject {
 
     func suspend() {
         endTemporaryPlaybackRate()
+        cancelRuntimeRecovery()
+        cancelCommentMutations()
         isCommentsPaginationActive = false
         finishVideoStartup(outcome: .cancelled)
         queueWatchHistoryReport(force: true)
@@ -688,10 +815,16 @@ final class FocusNativeVideoViewModel: ObservableObject {
     }
 
     func selectPage(_ page: FocusVideoPage) {
+        selectPage(page, fromBeginning: false)
+    }
+
+    private func selectPage(_ page: FocusVideoPage, fromBeginning: Bool) {
         guard selectedPageCID != page.cid else {
             return
         }
         queueWatchHistoryReport(force: true)
+        resetPlaybackRecovery()
+        hasCompletedPlaybackPreparation = false
         activePlaybackAccountScope = nil
         shouldResolveInitialResumePage = false
         selectedPageCID = page.cid
@@ -700,14 +833,150 @@ final class FocusNativeVideoViewModel: ObservableObject {
             configureDanmaku(for: detail, playbackPositionMilliseconds: 0)
             configureSubtitles(for: detail)
         }
-        preparePlayback()
+        preparePlayback(initialPosition: fromBeginning ? 0 : nil)
     }
 
     func retryPlayback() {
-        preparePlayback()
+        let position = max(lastKnownPlaybackPosition, playbackPositionMilliseconds)
+        resetPlaybackRecovery()
+        preparePlayback(initialPosition: hasCompletedPlaybackPreparation ? position : nil)
+    }
+
+    func applyPlaybackPreferences(_ preferences: FocusPlaybackPreferences) {
+        let rateChanged = playbackPreferences.preferredRate != preferences.preferredRate
+        playbackPreferences = preferences
+        if rateChanged {
+            playbackRateBeforeTemporaryChange = nil
+            applyPlaybackRate(Float(preferences.preferredRate))
+        }
+    }
+
+    func updatePlaybackPreferences(_ update: (inout FocusPlaybackPreferences) -> Void) {
+        var preferences = playbackPreferences
+        update(&preferences)
+        applyPlaybackPreferences(preferences)
+        playbackPreferenceChange(preferences)
+    }
+
+    func setSleepTimer(minutes: Int?) {
+        sleepTimerTask?.cancel()
+        sleepTimerTask = nil
+        sleepTimerMinutes = minutes
+        guard let minutes else { return }
+        sleepTimerTask = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: .seconds(minutes * 60)) }
+            catch is CancellationError { return }
+            catch { return }
+            guard let self, !Task.isCancelled else { return }
+            self.playbackWanted = false
+            self.endTemporaryPlaybackRate()
+            self.cancelRuntimeRecovery()
+            self.player.pause()
+            self.queueWatchHistoryReport(force: true)
+            self.sleepTimerMinutes = nil
+            self.sleepTimerTask = nil
+        }
+    }
+
+    private func observeCurrentPlaybackItem() {
+        itemStatusObservation?.invalidate()
+        guard let item = player.currentItem else { return }
+        itemStatusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self, weak item] _, _ in
+            Task { @MainActor [weak self, weak item] in
+                guard let self, let item, self.player.currentItem === item,
+                      item.status == .failed, !self.isReplacingPlayerItem else { return }
+                self.recoverInterruptedPlayback(error: item.error,
+                    terminalMessage: item.error?.localizedDescription ?? "播放中断，请重试。")
+            }
+        }
+    }
+
+    private func handleTimeControlChange() {
+        guard hasPreparedPlayer, !isReplacingPlayerItem else { return }
+        if player.timeControlStatus == .playing {
+            playbackWanted = true
+            cancelRuntimeRecovery()
+            playbackRecoveryMessage = nil
+        } else if player.timeControlStatus == .waitingToPlayAtSpecifiedRate, playbackWanted {
+            guard runtimeRecoveryTask == nil else { return }
+            playbackRecoveryMessage = "正在缓冲…"
+            let generation = playbackGeneration
+            runtimeRecoveryTask = Task { @MainActor [weak self] in
+                do { try await Task.sleep(for: .seconds(10)) }
+                catch is CancellationError { return }
+                catch { return }
+                guard let self, !Task.isCancelled, self.playbackGeneration == generation,
+                      self.playbackWanted, self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate else { return }
+                self.runtimeRecoveryTask = nil
+                self.recoverInterruptedPlayback(error: nil, terminalMessage: "缓冲时间过长，请重试或选择较低清晰度。")
+            }
+        } else if player.timeControlStatus == .paused {
+            cancelRuntimeRecovery()
+            playbackRecoveryMessage = nil
+            if let item = player.currentItem, item.status != .failed,
+               !item.duration.isNumeric || CMTimeCompare(item.currentTime(), item.duration) < 0 {
+                playbackWanted = false
+            }
+        }
+    }
+
+    private func recoverInterruptedPlayback(error: Error?, terminalMessage: String) {
+        guard hasPreparedPlayer, !isReplacingPlayerItem, playbackTask == nil else { return }
+        let position = max(lastKnownPlaybackPosition, playbackPositionMilliseconds)
+        let shouldPlay = playbackWanted
+        cancelRuntimeRecovery()
+        let recoverable = error.map { Self.canTryBackupStream(after: $0) } ?? true
+        guard recoverable, runtimeRecoveryAttempts < 2 else {
+            queueWatchHistoryReport(force: true)
+            player.pause()
+            hasPreparedPlayer = false
+            playerErrorMessage = terminalMessage
+            playbackRecoveryMessage = nil
+            return
+        }
+        queueWatchHistoryReport(force: true)
+        runtimeRecoveryAttempts += 1
+        lastRecoveryPosition = position
+        if isAutomaticQuality {
+            automaticRecoveryQuality = availableQualities.map(\.id).filter { $0 < selectedQuality }.max()
+                ?? automaticRecoveryQuality
+        }
+        let attempt = runtimeRecoveryAttempts
+        preparePlayback(initialPosition: position, startsPlaying: shouldPlay)
+        playbackRecoveryMessage = "正在恢复播放（\(attempt)/2）…"
+    }
+
+    private func cancelRuntimeRecovery() {
+        runtimeRecoveryTask?.cancel()
+        runtimeRecoveryTask = nil
+    }
+
+    private func resetPlaybackRecovery() {
+        cancelRuntimeRecovery()
+        runtimeRecoveryAttempts = 0
+        automaticRecoveryQuality = nil
+        lastKnownPlaybackPosition = 0
+        playbackRecoveryMessage = nil
+    }
+
+    private func handlePlaybackEndIfNeeded() {
+        guard hasPreparedPlayer, !isReplacingPlayerItem, player.items().isEmpty,
+              !preparedItemIDs.isEmpty, preparedItemIDs.isSubset(of: completedItemIDs) else { return }
+        queueWatchHistoryReport(force: true)
+        cancelRuntimeRecovery()
+        playbackRecoveryMessage = nil
+        guard playbackWanted, playbackPreferences.autoPlayNextPart,
+              let detail, let cid = selectedPageCID,
+              let index = detail.pages.firstIndex(where: { $0.cid == cid }),
+              detail.pages.indices.contains(index + 1) else { return }
+        selectPage(detail.pages[index + 1], fromBeginning: true)
     }
 
     func togglePlayback() {
+        if isLoadingPlayback, playbackRecoveryMessage != nil {
+            playbackWanted.toggle()
+            return
+        }
         guard !isLoadingPlayback else {
             return
         }
@@ -717,6 +986,8 @@ final class FocusNativeVideoViewModel: ObservableObject {
         }
 
         if isPlaybackRequested {
+            playbackWanted = false
+            cancelRuntimeRecovery()
             queueWatchHistoryReport(force: true)
             player.pause()
             isPlaying = false
@@ -730,6 +1001,7 @@ final class FocusNativeVideoViewModel: ObservableObject {
             player.seek(to: .zero)
         }
         configureAudioSession()
+        playbackWanted = true
         player.playImmediately(atRate: playbackRate)
     }
 
@@ -744,6 +1016,7 @@ final class FocusNativeVideoViewModel: ObservableObject {
         guard rate.isFinite, rate >= 0.5, rate <= 3 else { return }
         playbackRateBeforeTemporaryChange = nil
         applyPlaybackRate(rate)
+        updatePlaybackPreferences { $0.preferredRate = Double(rate) }
     }
 
     func beginTemporaryPlaybackRate(_ rate: Float = 2) {
@@ -774,6 +1047,9 @@ final class FocusNativeVideoViewModel: ObservableObject {
         let generation = playbackGeneration
         item.cancelPendingSeeks()
         playbackPositionMilliseconds = target
+        lastKnownPlaybackPosition = target
+        runtimeRecoveryAttempts = 0
+        lastRecoveryPosition = target
         updateDanmakuPosition(target)
         player.seek(to: CMTime(value: target, timescale: 1_000), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak item] finished in
             Task { @MainActor [weak self, weak item] in
@@ -786,12 +1062,28 @@ final class FocusNativeVideoViewModel: ObservableObject {
     }
 
     func selectQuality(_ quality: FocusVideoQuality) {
-        guard !isLoadingPlayback, quality.id != selectedQuality,
+        guard !isLoadingPlayback, preferredQuality != quality.id,
               availableQualities.contains(where: { $0.id == quality.id }) else { return }
+        preferredQuality = quality.id
+        resetPlaybackRecovery()
+        reloadSelectedQuality()
+    }
+
+    func isQualitySelected(_ quality: FocusVideoQuality) -> Bool {
+        preferredQuality == quality.id
+    }
+
+    func selectAutomaticQuality() {
+        guard !isLoadingPlayback, !isAutomaticQuality else { return }
+        preferredQuality = nil
+        resetPlaybackRecovery()
+        reloadSelectedQuality()
+    }
+
+    private func reloadSelectedQuality() {
         let position = currentPlaybackMilliseconds
         let shouldPlay = isPlaybackRequested
         queueWatchHistoryReport(force: true)
-        selectedQuality = quality.id
         preparePlayback(initialPosition: position, startsPlaying: shouldPlay)
     }
 
@@ -969,7 +1261,7 @@ final class FocusNativeVideoViewModel: ObservableObject {
 
                 var seen = Set(comments.map(\.id))
                 comments.append(
-                    contentsOf: page.comments.filter { seen.insert($0.id).inserted }
+                    contentsOf: page.comments.filter { !deletedCommentIDs.contains($0.id) && seen.insert($0.id).inserted }
                 )
                 commentTotalCount = max(commentTotalCount, page.totalCount)
                 consumedCommentCursors.insert(cursor)
@@ -985,9 +1277,119 @@ final class FocusNativeVideoViewModel: ObservableObject {
 
     func replies(for comment: FocusVideoComment) -> [FocusVideoComment] {
         guard let thread = commentThreadStates[comment.id], thread.isExpanded else {
-            return Array(comment.previewReplies.prefix(2))
+            return Array(comment.previewReplies.filter { !deletedCommentIDs.contains($0.id) }.prefix(2))
         }
-        return thread.replies
+        return thread.replies.filter { !deletedCommentIDs.contains($0.id) }
+    }
+
+    var canComposeComment: Bool { commentService != nil && commentAccountScope != nil }
+    var hasLoadedComments: Bool { commentAccountScope != nil }
+
+    func composeComment(replyingTo comment: FocusVideoComment? = nil, rootID: Int64? = nil) {
+        guard !isSendingComment else { return }
+        commentReplyTarget = comment.map {
+            CommentReplyTarget(rootID: rootID ?? $0.id, parentID: $0.id, authorName: $0.authorName)
+        }
+        commentComposeError = nil
+        showsCommentComposer = true
+    }
+
+    func sendComment() {
+        guard let detail, let service = commentService, let scope = commentAccountScope,
+              !isSendingComment else { return }
+        let text = commentDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, text.count <= 1_000 else {
+            commentComposeError = "请输入 1–1000 字的评论"
+            return
+        }
+        let target = commentReplyTarget
+        let generation = commentMutationGeneration
+        isSendingComment = true
+        commentComposeError = nil
+        commentMutationTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if self.commentMutationGeneration == generation {
+                    self.isSendingComment = false
+                    self.commentMutationTask = nil
+                }
+            }
+            do {
+                let comment = try await service.sendComment(aid: detail.aid, message: text,
+                    rootCommentID: target?.rootID, parentCommentID: target?.parentID, expectedAccountScope: scope)
+                let resultingScope = await self.accountScopeProvider()
+                try Task.checkCancellation()
+                guard self.commentMutationGeneration == generation,
+                      self.detail?.aid == detail.aid, resultingScope == scope else { return }
+                if let target, let root = self.comments.first(where: { $0.id == target.rootID }) {
+                    var thread = self.commentThreadStates[root.id] ?? self.initialCommentThreadState(for: root)
+                    thread.replies.removeAll { $0.id == comment.id }
+                    thread.replies.append(comment)
+                    thread.totalCount += 1
+                    thread.isExpanded = true
+                    self.commentThreadStates[root.id] = thread
+                } else {
+                    self.comments.removeAll { $0.id == comment.id }
+                    self.comments.insert(comment, at: 0)
+                }
+                self.commentTotalCount += 1
+                self.commentDraft = ""
+                self.commentReplyTarget = nil
+                self.showsCommentComposer = false
+            } catch is CancellationError {
+                return
+            } catch is URLError {
+                guard self.commentMutationGeneration == generation else { return }
+                self.commentComposeError = "发送结果未确认，请先返回评论区查看，草稿已保留。"
+            } catch {
+                guard self.commentMutationGeneration == generation else { return }
+                self.commentComposeError = error.localizedDescription
+            }
+        }
+    }
+
+    func canDeleteComment(_ comment: FocusVideoComment) -> Bool {
+        comment.authorMID > 0 && commentAccountScope == .accountID(comment.authorMID)
+    }
+
+    func deleteComment(_ comment: FocusVideoComment) {
+        guard let detail, let service = commentService, let scope = commentAccountScope,
+              canDeleteComment(comment), !commentDeletesInFlight.contains(comment.id) else { return }
+        let generation = commentMutationGeneration
+        commentDeletesInFlight.insert(comment.id)
+        commentDeleteTasks[comment.id] = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if self.commentMutationGeneration == generation {
+                    self.commentDeletesInFlight.remove(comment.id)
+                    self.commentDeleteTasks[comment.id] = nil
+                }
+            }
+            do {
+                try await service.deleteComment(aid: detail.aid, commentID: comment.id,
+                    authorMID: comment.authorMID, expectedAccountScope: scope)
+                let resultingScope = await self.accountScopeProvider()
+                try Task.checkCancellation()
+                guard self.commentMutationGeneration == generation,
+                      self.detail?.aid == detail.aid, resultingScope == scope else { return }
+                self.deletedCommentIDs.insert(comment.id)
+                for root in self.comments where root.previewReplies.contains(where: { $0.id == comment.id }) ||
+                    self.commentThreadStates[root.id]?.replies.contains(where: { $0.id == comment.id }) == true {
+                    var thread = self.commentThreadStates[root.id] ?? self.initialCommentThreadState(for: root)
+                    thread.replies.removeAll { $0.id == comment.id }
+                    thread.totalCount = max(thread.totalCount - 1, 0)
+                    self.commentThreadStates[root.id] = thread
+                }
+                let removedCount = self.comments.contains(where: { $0.id == comment.id }) ? 1 + comment.replies : 1
+                self.comments.removeAll { $0.id == comment.id }
+                self.commentThreadStates[comment.id] = nil
+                self.commentTotalCount = max(self.commentTotalCount - removedCount, 0)
+            } catch is CancellationError { return }
+            catch {
+                guard self.commentMutationGeneration == generation else { return }
+                self.actionErrorMessage = error.localizedDescription
+            }
+        }
     }
 
     func commentThreadState(for commentID: Int64) -> CommentThreadState? {
@@ -1147,6 +1549,11 @@ final class FocusNativeVideoViewModel: ObservableObject {
         default:
             landscapeRequest()
         }
+    }
+
+    func requestSystemPlaybackControls() {
+        requestsSystemPlaybackControls = true
+        requestFullscreen()
     }
 
     func exitFullscreen() {
@@ -1312,9 +1719,11 @@ final class FocusNativeVideoViewModel: ObservableObject {
         // Only a multi-part video needs history before choosing a stream CID.
         // Single-part videos can fetch the stream while history is still loading.
         let mayResolveResumePage = shouldResolveInitialResumePage && detail.pages.count > 1
-        let requestedQuality = selectedQuality
+        let requestedQuality = preferredQuality ?? automaticRecoveryQuality ?? FocusVideoDetailService.defaultPlaybackQuality
 
         endTemporaryPlaybackRate()
+        cancelRuntimeRecovery()
+        playbackWanted = startsPlaying
         cancelPlaybackTask()
         playbackDiagnosticID = correlationID ?? (videoStartupSpan == nil ? UUID() : videoStartupID)
         requestSessionVersion = detailService.sessionVersion
@@ -1324,9 +1733,11 @@ final class FocusNativeVideoViewModel: ObservableObject {
         activePlaybackAccountScope = nil
         let generation = playbackGeneration
         isReplacingPlayerItem = true
+        replaceFailedPlayerIfNeeded()
         player.pause()
         player.removeAllItems()
-        playbackPositionMilliseconds = 0
+        playbackPositionMilliseconds = initialPosition ?? 0
+        lastKnownPlaybackPosition = initialPosition ?? 0
         preparedMediaDurationMilliseconds = nil
         isLoadingPlayback = true
         hasPreparedPlayer = false
@@ -1474,12 +1885,14 @@ final class FocusNativeVideoViewModel: ObservableObject {
                 activePlaybackAccountScope = accountScope
                 isLoadingPlayback = false
                 hasPreparedPlayer = true
+                hasCompletedPlaybackPreparation = true
                 finishFirstFrameIfPresentable()
                 configureAudioSession()
                 player.defaultRate = playbackRate
                 isReplacingPlayerItem = false
                 updateNowPlayingInfo()
-                if startsPlaying { player.playImmediately(atRate: playbackRate) }
+                playbackRecoveryMessage = nil
+                if playbackWanted { player.playImmediately(atRate: playbackRate) }
                 else { player.pause() }
                 queueWatchHistoryReport(force: true)
             } catch is CancellationError {
@@ -1495,6 +1908,12 @@ final class FocusNativeVideoViewModel: ObservableObject {
                 firstFrameSpan = nil
                 finishVideoStartup(outcome: .failure)
                 playerErrorMessage = error.localizedDescription
+                playbackRecoveryMessage = nil
+                if runtimeRecoveryAttempts > 0, runtimeRecoveryAttempts < 2,
+                   Self.canTryBackupStream(after: error) {
+                    hasPreparedPlayer = true
+                    recoverInterruptedPlayback(error: error, terminalMessage: error.localizedDescription)
+                }
             }
         }
     }
@@ -1555,12 +1974,12 @@ final class FocusNativeVideoViewModel: ObservableObject {
         let failure = error as NSError
         if failure.domain == NSURLErrorDomain {
             return [URLError.timedOut, .cannotFindHost, .cannotConnectToHost, .networkConnectionLost,
-                    .dnsLookupFailed, .badServerResponse, .resourceUnavailable, .cannotLoadFromNetwork]
+                    .dnsLookupFailed, .badServerResponse, .resourceUnavailable, .cannotLoadFromNetwork, .notConnectedToInternet]
                 .contains(URLError.Code(rawValue: failure.code))
         }
         if failure.domain == AVFoundationErrorDomain {
             return [AVError.failedToLoadMediaData, .serverIncorrectlyConfigured, .fileFormatNotRecognized,
-                    .contentIsUnavailable].contains(AVError.Code(rawValue: failure.code))
+                    .contentIsUnavailable, .contentIsNotAuthorized].contains(AVError.Code(rawValue: failure.code))
         }
         if let underlying = failure.userInfo[NSUnderlyingErrorKey] as? Error {
             return canTryBackupStream(after: underlying)
@@ -1579,6 +1998,8 @@ final class FocusNativeVideoViewModel: ObservableObject {
             guard playbackGeneration == generation, detailService.sessionVersion == sessionVersion else { throw CancellationError() }
             guard !items.isEmpty else { throw FocusVideoDetailService.ServiceError.noStream }
             player.removeAllItems()
+            preparedItemIDs = Set(items.map(ObjectIdentifier.init))
+            completedItemIDs.removeAll()
             var previous: AVPlayerItem?
             for item in items where player.canInsert(item, after: previous) {
                 player.insert(item, after: previous)
@@ -1675,7 +2096,9 @@ final class FocusNativeVideoViewModel: ObservableObject {
             aid: detail.aid,
             bvid: detail.bvid,
             cid: cid,
-            positionMilliseconds: max(currentPlaybackMilliseconds, 0)
+            positionMilliseconds: player.status == .failed || player.currentItem?.status == .failed
+                ? max(lastKnownPlaybackPosition, playbackPositionMilliseconds)
+                : max(currentPlaybackMilliseconds, 0)
         )
 
         if let previous = lastQueuedWatchHistoryReport,
@@ -2095,14 +2518,11 @@ final class FocusNativeVideoViewModel: ObservableObject {
                     return
                 }
                 danmakuSegmentCache[segmentIndex] = segment.danmakus
-                danmakus = danmakuSegmentCache.keys.sorted().flatMap {
-                    danmakuSegmentCache[$0] ?? []
-                }.sorted {
-                    if $0.progressMilliseconds != $1.progressMilliseconds {
-                        return $0.progressMilliseconds < $1.progressMilliseconds
-                    }
-                    return $0.weight > $1.weight
-                }
+                // Decoding already sorts each segment. Publish only segment
+                // references instead of sorting/copying all downloaded comments.
+                danmakuSegments = (danmakuSegments + [
+                    FocusNativeDanmakuSegment(index: segmentIndex, danmakus: segment.danmakus),
+                ]).sorted { $0.index < $1.index }
                 danmakuLoadState = .ready
             } catch {
                 guard
@@ -2159,7 +2579,7 @@ final class FocusNativeVideoViewModel: ObservableObject {
         danmakuSegmentCache.removeAll()
         danmakuView = nil
         danmakuContext = nil
-        danmakus = []
+        danmakuSegments = []
         danmakuLoadState = .idle
     }
 
@@ -2175,7 +2595,7 @@ final class FocusNativeVideoViewModel: ObservableObject {
         danmakuRevision &+= 1
         cancelDanmakuRequests()
         danmakuSegmentCache.removeAll()
-        danmakus = []
+        danmakuSegments = []
         danmakuLoadState = .closed
     }
 
@@ -2232,7 +2652,7 @@ final class FocusNativeVideoViewModel: ObservableObject {
                 }
 
                 var seen: Set<Int64> = []
-                self.comments = page.comments.filter { seen.insert($0.id).inserted }
+                self.comments = page.comments.filter { !self.deletedCommentIDs.contains($0.id) && seen.insert($0.id).inserted }
                 self.commentTotalCount = page.totalCount
                 self.commentsNextCursor = page.nextCursor
                 self.commentAccountScope = accountScope
@@ -2675,6 +3095,10 @@ final class FocusNativeVideoViewModel: ObservableObject {
     }
 
     private func playFromRemoteCommand() {
+        if isPlaybackSessionActive, isLoadingPlayback, playbackRecoveryMessage != nil {
+            playbackWanted = true
+            return
+        }
         guard
             isPlaybackSessionActive,
             hasPreparedPlayer,
@@ -2684,6 +3108,7 @@ final class FocusNativeVideoViewModel: ObservableObject {
             return
         }
         configureAudioSession()
+        playbackWanted = true
         player.playImmediately(atRate: playbackRate)
         updateNowPlayingInfo()
     }
@@ -2692,6 +3117,8 @@ final class FocusNativeVideoViewModel: ObservableObject {
         guard isPlaybackSessionActive else {
             return
         }
+        playbackWanted = false
+        cancelRuntimeRecovery()
         queueWatchHistoryReport(force: true)
         player.pause()
         updateNowPlayingInfo()
@@ -2711,6 +3138,9 @@ final class FocusNativeVideoViewModel: ObservableObject {
         let position = min(max(seconds, 0), max(upperBound, 0))
         player.seek(to: CMTime(seconds: position, preferredTimescale: 600))
         playbackPositionMilliseconds = Int64(position * 1_000)
+        lastKnownPlaybackPosition = playbackPositionMilliseconds
+        runtimeRecoveryAttempts = 0
+        lastRecoveryPosition = playbackPositionMilliseconds
         updateDanmakuPosition(playbackPositionMilliseconds)
         queueWatchHistoryReport(force: true)
         updateNowPlayingInfo()
@@ -2867,6 +3297,7 @@ final class FocusNativeVideoViewModel: ObservableObject {
     }
 
     private func cancelTasks() {
+        cancelCommentMutations()
         cancelLoadTask()
         cancelCommentsTask()
         cancelInteractionTask()
@@ -2915,6 +3346,12 @@ final class FocusNativeVideoViewModel: ObservableObject {
     }
 
     private func resetCommentInteractionSession() {
+        cancelCommentMutations()
+        commentDraft = ""
+        commentReplyTarget = nil
+        showsCommentComposer = false
+        commentComposeError = nil
+        deletedCommentIDs.removeAll()
         cancelCommentReplyTasks()
         cancelCommentLikeTasks()
         commentThreadStates.removeAll()
@@ -2924,6 +3361,16 @@ final class FocusNativeVideoViewModel: ObservableObject {
         // after a new session has started with the same comment identifier.
     }
 
+    private func cancelCommentMutations() {
+        commentMutationGeneration &+= 1
+        commentMutationTask?.cancel()
+        commentMutationTask = nil
+        commentDeleteTasks.values.forEach { $0.cancel() }
+        commentDeleteTasks.removeAll()
+        commentDeletesInFlight.removeAll()
+        isSendingComment = false
+    }
+
     private func cancelInteractionTask() {
         interactionGeneration &+= 1
         interactionTask?.cancel()
@@ -2931,6 +3378,7 @@ final class FocusNativeVideoViewModel: ObservableObject {
     }
 
     private func cancelPlaybackTask() {
+        cancelRuntimeRecovery()
         if let firstFrameSpan { BiliPerformanceStore.shared.end(firstFrameSpan, outcome: .cancelled) }
         firstFrameSpan = nil
         readySurface = nil
@@ -3031,8 +3479,36 @@ enum FocusDanmakuSegmentScheduler {
     }
 }
 
+struct FocusNativeDanmakuSegment: Identifiable {
+    let id = UUID()
+    let index: Int
+    let danmakus: [FocusVideoDanmaku]
+}
+
 #if DEBUG
 extension FocusNativeVideoViewModel {
+    var fixtureCommentMutationTasks: [Task<Void, Never>] {
+        [commentMutationTask].compactMap { $0 } + Array(commentDeleteTasks.values)
+    }
+
+    func simulateFixturePlaybackInterruption(_ error: Error? = nil) {
+        precondition(FocusTestRuntime.isRunningFixtures)
+        recoverInterruptedPlayback(error: error, terminalMessage: "测试播放中断")
+    }
+
+    func simulateFixturePlaybackEnd() {
+        precondition(FocusTestRuntime.isRunningFixtures)
+        completedItemIDs = preparedItemIDs
+        player.removeAllItems()
+        handlePlaybackEndIfNeeded()
+    }
+    var danmakus: [FocusVideoDanmaku] { danmakuSegments.flatMap(\.danmakus) }
+
+    func publishFixturePlaybackPosition(_ position: Int64) {
+        precondition(FocusTestRuntime.isRunningFixtures)
+        playbackPositionMilliseconds = position
+    }
+
     func installFixtureDetail(_ detail: FocusVideoDetail) {
         precondition(FocusTestRuntime.isRunningFixtures)
         cancelTasks()
@@ -3040,11 +3516,19 @@ extension FocusNativeVideoViewModel {
         selectedPageCID = detail.cid
     }
 
+    func installFixtureComments(_ comments: [FocusVideoComment], accountScope: FocusPlaybackAccountScope) {
+        precondition(FocusTestRuntime.isRunningFixtures)
+        resetCommentInteractionSession()
+        self.comments = comments
+        self.commentTotalCount = Int64(comments.count)
+        self.commentAccountScope = accountScope
+    }
+
     func installFixtureDanmakus(_ comments: [FocusVideoDanmaku]) {
         precondition(FocusTestRuntime.isRunningFixtures)
         cancelDanmakuRequests()
         danmakuContext = nil
-        danmakus = comments
+        danmakuSegments = [FocusNativeDanmakuSegment(index: 1, danmakus: comments)]
         danmakuLoadState = .ready
         isDanmakuEnabled = true
     }

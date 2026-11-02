@@ -26,12 +26,10 @@ class BiliApiContractTests {
     }
 
     @Test
-    fun `includes watch later contracts`() {
-        assertEquals(
-            "https://api.bilibili.com/x/v2/history/toview",
-            BiliApiContractCatalog.require("toview.info.list").url,
-        )
-        assertEquals("POST", BiliApiContractCatalog.require("toview.operate.add").method)
-        assertTrue(BiliApiContractCatalog.require("toview.operate.del").requiresAuthentication)
+    fun `includes authenticated management contracts and excludes removed features`() {
+        assertTrue(BiliApiContractCatalog.require("common.comment.send").usesWbi)
+        assertTrue(BiliApiContractCatalog.require("common.comment.del").requiresAuthentication)
+        assertEquals("POST", BiliApiContractCatalog.require("favorite-list.operate.content_move").method)
+        assertTrue(BiliApiContractCatalog.snapshot.endpoints.keys.none { it.startsWith("toview.") })
     }
 }

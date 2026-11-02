@@ -161,6 +161,9 @@ struct FocusBrowserView: View {
             .onChange(of: settingsStore.settings.nativeDanmakuEnabled) { enabled in
                 viewModel.applyNativeDanmakuPreference(enabled)
             }
+            .onChange(of: settingsStore.settings.playbackPreferences) { preferences in
+                viewModel.applyPlaybackPreferences(preferences)
+            }
             .onChange(of: settingsStore.settings.nativeSubtitleEnabled) { enabled in
                 viewModel.applyNativeSubtitlePreference(
                     enabled: enabled,
@@ -183,7 +186,7 @@ struct FocusBrowserView: View {
         Group {
             if viewModel.hasInstantiatedBrowser {
                 ZStack {
-                    FocusWebView(viewModel: viewModel.browserViewModel, settingsStore: settingsStore)
+                    FocusWebView(viewModel: viewModel.browserViewModel, isActive: viewModel.isBrowserActive, settingsStore: settingsStore)
                         .background(colorScheme == .dark ? Color(red: 0.06, green: 0.07, blue: 0.09) : Color(red: 0.965, green: 0.969, blue: 0.98))
 
                     if let message = viewModel.browserViewModel.webContentFailureMessage {
@@ -295,6 +298,7 @@ struct FocusBrowserView: View {
         case .my:
             FocusMyView(
                 viewModel: viewModel.myViewModel,
+                followingService: FocusFollowingAuthorsService(cookieProvider: appGraph.cookieProvider),
                 onOpenLogin: viewModel.openLogin,
                 onOpenHistory: viewModel.openHistory,
                 onOpenFavoriteFolder: { folder in
@@ -302,7 +306,11 @@ struct FocusBrowserView: View {
                 },
                 onOpenVideo: { url in
                     viewModel.openMyVideo(url)
-                }
+                },
+                onOpenUser: { mid in
+                    viewModel.openNativeUserSpace(URL(string: "https://space.bilibili.com/\(mid)")!)
+                },
+                onOpenSettings: { viewModel.showSettings = true }
             )
         case .history:
             FocusHistoryView(

@@ -24,13 +24,11 @@ struct BiliAPIContractTests {
         #expect(endpoint.usesWBI)
     }
 
-    @Test("includes watch-later read and write contracts")
-    func includesWatchLaterContracts() {
-        #expect(
-            BiliAPIContractCatalog.require("toview.info.list").url.path ==
-                "/x/v2/history/toview"
-        )
-        #expect(BiliAPIContractCatalog.require("toview.operate.add").method == "POST")
-        #expect(BiliAPIContractCatalog.require("toview.operate.del").requiresAuthentication)
+    @Test("includes authenticated content management and excludes removed features")
+    func includesManagementContracts() {
+        #expect(BiliAPIContractCatalog.require("common.comment.send").usesWBI)
+        #expect(BiliAPIContractCatalog.require("common.comment.del").requiresAuthentication)
+        #expect(BiliAPIContractCatalog.require("favorite-list.operate.content_move").method == "POST")
+        #expect(!BiliAPIContractCatalog.snapshot.endpoints.keys.contains { $0.hasPrefix("toview.") })
     }
 }

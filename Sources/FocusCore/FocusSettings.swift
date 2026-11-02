@@ -10,6 +10,7 @@ public struct FocusSettings: Codable, Equatable, Sendable {
     public var nativeDanmakuEnabled: Bool
     public var nativeSubtitleEnabled: Bool
     public var nativeSubtitleLanguageCode: String
+    public var playbackPreferences: FocusPlaybackPreferences
     public var searchMaskEnabled: Bool
     public var dynamicMaskEnabled: Bool
     public var debugMode: Bool
@@ -25,6 +26,7 @@ public struct FocusSettings: Codable, Equatable, Sendable {
         nativeDanmakuEnabled: Bool = true,
         nativeSubtitleEnabled: Bool = true,
         nativeSubtitleLanguageCode: String = "",
+        playbackPreferences: FocusPlaybackPreferences = .defaults,
         searchMaskEnabled: Bool = true,
         dynamicMaskEnabled: Bool = true,
         debugMode: Bool = false,
@@ -39,6 +41,7 @@ public struct FocusSettings: Codable, Equatable, Sendable {
         self.nativeDanmakuEnabled = nativeDanmakuEnabled
         self.nativeSubtitleEnabled = nativeSubtitleEnabled
         self.nativeSubtitleLanguageCode = nativeSubtitleLanguageCode
+        self.playbackPreferences = playbackPreferences
         self.searchMaskEnabled = searchMaskEnabled
         self.dynamicMaskEnabled = dynamicMaskEnabled
         self.debugMode = debugMode
@@ -56,6 +59,7 @@ public struct FocusSettings: Codable, Equatable, Sendable {
         case nativeDanmakuEnabled
         case nativeSubtitleEnabled
         case nativeSubtitleLanguageCode
+        case playbackPreferences
         case searchMaskEnabled
         case dynamicMaskEnabled
         case debugMode
@@ -76,6 +80,7 @@ public struct FocusSettings: Codable, Equatable, Sendable {
             String.self,
             forKey: .nativeSubtitleLanguageCode
         ) ?? ""
+        playbackPreferences = try container.decodeIfPresent(FocusPlaybackPreferences.self, forKey: .playbackPreferences) ?? .defaults
         searchMaskEnabled = try container.decodeIfPresent(Bool.self, forKey: .searchMaskEnabled) ?? true
         dynamicMaskEnabled = try container.decodeIfPresent(Bool.self, forKey: .dynamicMaskEnabled) ?? true
         debugMode = try container.decodeIfPresent(Bool.self, forKey: .debugMode) ?? false
@@ -135,6 +140,62 @@ public struct FocusSettings: Codable, Equatable, Sendable {
         }
 
         userDefaults.set(data, forKey: Self.storageKey)
+    }
+}
+
+/// Display preferences are shared by inline/fullscreen players. Missing fields
+/// retain the pre-existing appearance when upgrading an installed client.
+public struct FocusPlaybackPreferences: Codable, Equatable, Sendable {
+    public static let defaults = FocusPlaybackPreferences()
+    public var preferredRate: Double
+    public var autoPlayNextPart: Bool
+    public var danmakuOpacity: Double
+    public var danmakuFontScale: Double
+    public var danmakuArea: Double
+    public var danmakuDensity: Double
+    public var subtitleFontScale: Double
+    public var subtitleBackgroundOpacity: Double
+
+    public init(preferredRate: Double = 1, autoPlayNextPart: Bool = false,
+                danmakuOpacity: Double = 0.94, danmakuFontScale: Double = 1,
+                danmakuArea: Double = 1, danmakuDensity: Double = 1,
+                subtitleFontScale: Double = 1, subtitleBackgroundOpacity: Double = 0.72) {
+        self.preferredRate = Self.bounded(preferredRate, 0.5...3, fallback: 1)
+        self.autoPlayNextPart = autoPlayNextPart
+        self.danmakuOpacity = Self.bounded(danmakuOpacity, 0.1...1, fallback: 0.94)
+        self.danmakuFontScale = Self.bounded(danmakuFontScale, 0.75...1.5, fallback: 1)
+        self.danmakuArea = Self.bounded(danmakuArea, 0.25...1, fallback: 1)
+        self.danmakuDensity = Self.bounded(danmakuDensity, 0.25...1, fallback: 1)
+        self.subtitleFontScale = Self.bounded(subtitleFontScale, 0.75...1.5, fallback: 1)
+        self.subtitleBackgroundOpacity = Self.bounded(subtitleBackgroundOpacity, 0...1, fallback: 0.72)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case preferredRate, autoPlayNextPart, danmakuOpacity, danmakuFontScale
+        case danmakuArea, danmakuDensity, subtitleFontScale, subtitleBackgroundOpacity
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            preferredRate: try values.decodeIfPresent(Double.self, forKey: .preferredRate) ?? 1,
+            autoPlayNextPart: try values.decodeIfPresent(Bool.self, forKey: .autoPlayNextPart) ?? false,
+            danmakuOpacity: try values.decodeIfPresent(Double.self, forKey: .danmakuOpacity) ?? 0.94,
+            danmakuFontScale: try values.decodeIfPresent(Double.self, forKey: .danmakuFontScale) ?? 1,
+            danmakuArea: try values.decodeIfPresent(Double.self, forKey: .danmakuArea) ?? 1,
+            danmakuDensity: try values.decodeIfPresent(Double.self, forKey: .danmakuDensity) ?? 1,
+            subtitleFontScale: try values.decodeIfPresent(Double.self, forKey: .subtitleFontScale) ?? 1,
+            subtitleBackgroundOpacity: try values.decodeIfPresent(Double.self, forKey: .subtitleBackgroundOpacity) ?? 0.72
+        )
+    }
+
+    private static func bounded(_ value: Double, _ range: ClosedRange<Double>, fallback: Double) -> Double {
+        value.isFinite ? min(max(value, range.lowerBound), range.upperBound) : fallback
+    }
+
+    public func includesDanmaku(id: Int64) -> Bool {
+        // Stable sampling keeps the same comments while seeking or resizing.
+        Double(UInt64(bitPattern: id) % 100) < danmakuDensity * 100
     }
 }
 

@@ -6,6 +6,96 @@ import XCTest
 
 @MainActor
 final class PerformanceImageTests: XCTestCase {
+    func testCDNThumbnailsUseStableBucketsWithoutCroppingOrChangingProtectedSources() {
+        let raw = URL(string: "https://i0.hdslb.com/bfs/archive/cover.jpg")!
+        let resized = FocusImageCDNRequest.thumbnailURL(for: raw, pixelSize: 300)
+        XCTAssertEqual(resized?.absoluteString, "https://i0.hdslb.com/bfs/archive/cover.jpg@384w_384h_0e.webp")
+        XCTAssertEqual(FocusImageRepository.imageURLCandidates(for: raw, quality: .thumbnail, pixelSize: 300), [resized!, raw])
+        XCTAssertEqual(FocusImageRepository.imageURLCandidates(for: raw, quality: .gallery), [raw])
+        XCTAssertEqual(FocusImageRepository.imageURLCandidates(for: raw, quality: .emote), [raw])
+        for string in [
+            "https://i0.hdslb.com/bfs/archive/cover.jpg?token=secret",
+            "https://i0.hdslb.com/bfs/archive/cover.jpg#fragment",
+            "https://i0.hdslb.com.evil.test/bfs/archive/cover.jpg",
+            "https://other.test/bfs/archive/cover.jpg",
+            "https://i0.hdslb.com/bfs/emote/emote.png",
+            "https://i0.hdslb.com/bfs/new_dyn/animation.gif",
+            "https://user@i0.hdslb.com/bfs/face/avatar.jpg",
+            "https://i0.hdslb.com:444/bfs/face/avatar.jpg"
+        ] {
+            XCTAssertNil(FocusImageCDNRequest.thumbnailURL(for: URL(string: string)!, pixelSize: 128), string)
+        }
+        let derivative = URL(string: "https://i1.hdslb.com/bfs/new_dyn/long.png@100w.webp")!
+        XCTAssertEqual(FocusImageRepository.imageURLCandidates(for: derivative, quality: .gallery).first?.absoluteString,
+                       "https://i1.hdslb.com/bfs/new_dyn/long.png")
+        let signed = URL(string: "https://i1.hdslb.com/bfs/face/a.jpg@100w.webp?signature=keep")!
+        XCTAssertEqual(FocusImageRepository.imageURLCandidates(for: signed, quality: .thumbnail), [signed])
+    }
+
+    func testResourcePolicyStopsOnlyOptionalWorkAndDoesNotReplayAnOldWindow() async throws {
+        let (repository, session) = makeRepository(held: true)
+        defer { session.invalidateAndCancel() }
+        let monitor = FocusImageResourceMonitor()
+        let urls = (0..<24).map { imageURL("resource-\($0)") }
+        let prefetch = Task {
+            await FocusRemoteImageLoader.prefetch(urls: urls, referer: "", repository: repository,
+                                                  limiter: FocusImagePrefetchLimiter(limit: 2), resourceMonitor: monitor)
+        }
+        await eventually { PerformanceImageProtocol.activeCount == 2 }
+        let visible = Task { try await repository.image(for: urls[0], preferredReferer: "", pixelSize: 512) }
+        await eventuallyAsync { await repository.activeConsumerCount == 3 }
+        monitor.update { $0.lowPower = true }
+        await eventuallyAsync { await repository.activeConsumerCount == 1 }
+        monitor.update { $0.lowPower = false }
+        XCTAssertEqual(PerformanceImageProtocol.requestCount, 2, "Restoring normal state must not replay canceled windows")
+        PerformanceImageProtocol.releaseAll()
+        let image = try await visible.value
+        await prefetch.value
+        XCTAssertNotNil(image.cgImage, "Visible peer retains its shared request")
+        await repository.releaseDecodedImages()
+        let cached = await repository.cachedImage(for: urls[0], quality: .thumbnail, pixelSize: 768)
+        XCTAssertNil(cached)
+        XCTAssertNotNil(image.cgImage, "Cache eviction does not clear a displayed image")
+    }
+
+    func testRejectedCDNDerivativeFallsBackToOriginalOnce() async throws {
+        let format = UIGraphicsImageRendererFormat(); format.scale = 1
+        let data = UIGraphicsImageRenderer(size: CGSize(width: 256, height: 256), format: format).pngData { context in
+            UIColor.systemBlue.setFill(); context.fill(CGRect(x: 0, y: 0, width: 256, height: 256))
+        }
+        PerformanceImageProtocol.configure(data: data, held: false, offline: false, rejectDerivative: true)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.urlCache = nil
+        configuration.protocolClasses = [PerformanceImageProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let image = try await FocusImageRepository(session: session).image(
+            for: URL(string: "https://i0.hdslb.com/bfs/archive/fallback.jpg")!, preferredReferer: "", pixelSize: 128
+        )
+        XCTAssertEqual(image.cgImage?.width, 128)
+        XCTAssertEqual(PerformanceImageProtocol.requestCount, 2)
+        XCTAssertEqual(PerformanceImageProtocol.requestedURLs.map(\.absoluteString), [
+            "https://i0.hdslb.com/bfs/archive/fallback.jpg@128w_128h_0e.webp",
+            "https://i0.hdslb.com/bfs/archive/fallback.jpg"
+        ])
+    }
+
+    func testConstrainedOfflinePowerAndThermalStatesSuppressPrefetch() async {
+        let (repository, session) = makeRepository()
+        defer { session.invalidateAndCancel() }
+        let states = [
+            FocusImageResourceState(networkAvailable: false),
+            FocusImageResourceState(constrainedNetwork: true),
+            FocusImageResourceState(lowPower: true),
+            FocusImageResourceState(thermalPressure: true)
+        ]
+        for state in states {
+            await FocusRemoteImageLoader.prefetch(urls: [imageURL("suppressed")], referer: "", repository: repository,
+                                                  resourceMonitor: FocusImageResourceMonitor(state: state))
+        }
+        XCTAssertEqual(PerformanceImageProtocol.requestCount, 0)
+    }
+
     func testPixelBucketsAreStableAndDecodeCacheIncludesSize() async throws {
         XCTAssertEqual(FocusImagePixelSize.bucket(for: CGSize(width: 42, height: 42), scale: 3), 128)
         XCTAssertEqual(FocusImagePixelSize.bucket(for: CGSize(width: 149, height: 84), scale: 3), 512)
@@ -20,6 +110,17 @@ final class PerformanceImageTests: XCTestCase {
         let larger = try await repository.image(for: url, preferredReferer: "", pixelSize: 500)
         XCTAssertEqual(larger.cgImage?.width, 512)
         XCTAssertEqual(PerformanceImageProtocol.requestCount, 2)
+    }
+
+    func testLargerWarmedThumbnailSatisfiesSmallerVisibleBucketWithoutAnotherRequest() async throws {
+        let (repository, session) = makeRepository(size: CGSize(width: 1_024, height: 1_024))
+        defer { session.invalidateAndCancel() }
+        let url = imageURL("warmed-larger")
+        let warmed = try await repository.image(for: url, preferredReferer: "", pixelSize: 768, priority: .prefetch)
+        let visible = try await repository.image(for: url, preferredReferer: "", pixelSize: 512)
+        XCTAssertTrue(warmed === visible)
+        XCTAssertEqual(visible.cgImage?.width, 768)
+        XCTAssertEqual(PerformanceImageProtocol.requestCount, 1)
     }
 
     func testCancellingOneSharedConsumerDoesNotCancelVisiblePeer() async throws {
@@ -47,7 +148,8 @@ final class PerformanceImageTests: XCTestCase {
         let limiter = FocusImagePrefetchLimiter(limit: 2)
         let urls = (0..<30).map { imageURL("prefetch-\($0)") }
         let task = Task {
-            await FocusRemoteImageLoader.prefetch(urls: urls + urls, referer: "", repository: repository, limiter: limiter)
+            await FocusRemoteImageLoader.prefetch(urls: urls + urls, referer: "", repository: repository, limiter: limiter,
+                                                  resourceMonitor: FocusImageResourceMonitor())
         }
         await eventually { PerformanceImageProtocol.activeCount == 2 }
         let visible = Task { try await repository.image(for: imageURL("visible"), preferredReferer: "", pixelSize: 256) }
@@ -68,7 +170,7 @@ final class PerformanceImageTests: XCTestCase {
         defer { session.invalidateAndCancel() }
         await FocusRemoteImageLoader.prefetch(
             urls: (0..<30).map { imageURL("offline-\($0).png@100w") }, referer: "https://example.test/",
-            repository: repository, limiter: FocusImagePrefetchLimiter(limit: 2)
+            repository: repository, limiter: FocusImagePrefetchLimiter(limit: 2), resourceMonitor: FocusImageResourceMonitor()
         )
         XCTAssertGreaterThanOrEqual(PerformanceImageProtocol.requestCount, 1)
         XCTAssertLessThanOrEqual(PerformanceImageProtocol.requestCount, 2)
@@ -201,35 +303,45 @@ private final class PerformanceImageProtocol: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) private static var offline = false
     nonisolated(unsafe) private static var count = 0
     nonisolated(unsafe) private static var peak = 0
+    nonisolated(unsafe) private static var rejectDerivative = false
+    nonisolated(unsafe) private static var urls: [URL] = []
     nonisolated(unsafe) private static var active: [ObjectIdentifier: PerformanceImageProtocol] = [:]
     static var requestCount: Int { lock.withLock { count } }
     static var activeCount: Int { lock.withLock { active.count } }
     static var peakActiveCount: Int { lock.withLock { peak } }
-    static func configure(data: Data, held: Bool, offline: Bool) {
-        lock.withLock { self.data = data; self.held = held; self.offline = offline; count = 0; peak = 0; active.removeAll() }
+    static var requestedURLs: [URL] { lock.withLock { urls } }
+    static func configure(data: Data, held: Bool, offline: Bool, rejectDerivative: Bool = false) {
+        lock.withLock {
+            self.data = data; self.held = held; self.offline = offline; self.rejectDerivative = rejectDerivative
+            count = 0; peak = 0; active.removeAll(); urls.removeAll()
+        }
     }
     static func releaseAll() {
         let requests = lock.withLock { held = false; return Array(active.values) }
         requests.forEach { $0.finish() }
     }
-    override class func canInit(with request: URLRequest) -> Bool { request.url?.host == "focus-image.test" }
+    override class func canInit(with request: URLRequest) -> Bool {
+        ["focus-image.test", "i0.hdslb.com"].contains(request.url?.host ?? "")
+    }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
         let shouldFinish = Self.lock.withLock {
             Self.count += 1; Self.active[ObjectIdentifier(self)] = self
+            if let url = request.url { Self.urls.append(url) }
             Self.peak = max(Self.peak, Self.active.count)
             return !Self.held
         }
         if shouldFinish { finish() }
     }
     private func finish() {
-        let result: (Data, Bool)? = Self.lock.withLock {
+        let result: (Data, Bool, Bool)? = Self.lock.withLock {
             guard Self.active.removeValue(forKey: ObjectIdentifier(self)) != nil else { return nil }
-            return (Self.data, Self.offline)
+            return (Self.data, Self.offline, Self.rejectDerivative)
         }
-        guard let (data, offline) = result else { return }
+        guard let (data, offline, rejectDerivative) = result else { return }
         if offline { client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet)); return }
-        let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "image/png"])!
+        let status = rejectDerivative && request.url!.path.contains("@") ? 404 : 200
+        let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: ["Content-Type": "image/png"])!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: data)
         client?.urlProtocolDidFinishLoading(self)

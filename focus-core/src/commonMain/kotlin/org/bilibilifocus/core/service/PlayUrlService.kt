@@ -4,6 +4,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import org.bilibilifocus.core.cookie.CookieProvider
 import org.bilibilifocus.core.model.PlayUrlResult
+import org.bilibilifocus.core.model.VideoQuality
 
 /**
  * 取视频 DASH 流地址，供 ExoPlayer 播放。基于 x/player/wbi/playurl（需 WBI 签名）。
@@ -25,7 +26,8 @@ class PlayUrlService(
 
     private val json = Json { ignoreUnknownKeys = true }
 
-    suspend fun fetchPlayUrl(bvid: String, cid: Long): PlayUrlResult {
+    suspend fun fetchPlayUrl(bvid: String, cid: Long, quality: Int = 80): PlayUrlResult {
+        require(quality > 0)
         val endpoint = BiliApiContractCatalog.require("video.info.playurl").url
         val parameters = mapOf(
             "bvid" to bvid,
@@ -34,7 +36,7 @@ class PlayUrlService(
             "fourk" to "1",
             "otype" to "json",
             "platform" to "pc",
-            "qn" to "80",
+            "qn" to quality.toString(),
         )
         val result = try {
             wbiSigner.execute(parameters) { signedQuery ->
@@ -59,28 +61,43 @@ class PlayUrlService(
         val videos = payload.arrayValueAt("data", "dash", "video") ?: throw ServiceError.NoStream
         val audios = payload.arrayValueAt("data", "dash", "audio") ?: emptyList()
 
-        // 收集 baseUrl + backupUrl，优先非 PCDN(mcdn/szbdyd)地址，规避第三方播放器 403
-        fun pickUrl(item: JsonObject): String? {
+        // Keep all routes for bounded recovery, preferring regular CDN hosts.
+        fun urls(item: JsonObject): List<String> {
             val candidates = mutableListOf<String>()
             (item.stringValueAt("baseUrl") ?: item.stringValueAt("base_url"))?.let { candidates.add(it) }
             (item.arrayValueAt("backupUrl") ?: item.arrayValueAt("backup_url"))?.forEach { el ->
                 (el as? kotlinx.serialization.json.JsonPrimitive)?.content?.let { candidates.add(it) }
             }
-            return candidates.firstOrNull { "mcdn" !in it && "szbdyd" !in it } ?: candidates.firstOrNull()
+            return candidates.filter(String::isNotBlank).distinct().sortedBy { "mcdn" in it || "szbdyd" in it }
         }
 
         val videoObjs = videos.mapNotNull { it as? JsonObject }
-        // 优先 AVC(codecid=7)，否则取第一个
-        val videoUrl = (videoObjs.firstOrNull { it.intValueAt("codecid") == 7 } ?: videoObjs.firstOrNull())
-            ?.let { pickUrl(it) }
+        val deliveredQuality = payload.intValueAt("data", "quality") ?: quality
+        val requestedCandidates = videoObjs.filter { it.intValueAt("id") == deliveredQuality }
+            .ifEmpty { videoObjs.filter { (it.intValueAt("id") ?: Int.MAX_VALUE) <= quality } }
+            .ifEmpty { videoObjs }
+        val selectedQuality = requestedCandidates.maxOfOrNull { it.intValueAt("id") ?: 0 }
+        val matching = requestedCandidates.filter { it.intValueAt("id") == selectedQuality }.ifEmpty { requestedCandidates }
+        val selected = matching.firstOrNull { it.intValueAt("codecid") == 7 } ?: matching.firstOrNull()
             ?: throw ServiceError.NoStream
-
-        val audioUrl = audios.mapNotNull { it as? JsonObject }.firstOrNull()?.let { pickUrl(it) }
+        val videoUrls = urls(selected)
+        val videoUrl = videoUrls.firstOrNull() ?: throw ServiceError.NoStream
+        val audioUrls = audios.mapNotNull { it as? JsonObject }.firstOrNull()?.let(::urls).orEmpty()
+        val descriptions = payload.arrayValueAt("data", "accept_description").orEmpty()
+        val qualities = payload.arrayValueAt("data", "accept_quality").orEmpty().mapIndexedNotNull { index, raw ->
+            val id = (raw as? kotlinx.serialization.json.JsonPrimitive)?.content?.toIntOrNull() ?: return@mapIndexedNotNull null
+            val title = (descriptions.getOrNull(index) as? kotlinx.serialization.json.JsonPrimitive)?.content ?: "${id}P"
+            VideoQuality(id, title)
+        }
 
         return PlayUrlResult(
             videoUrl = videoUrl,
-            audioUrl = audioUrl,
+            audioUrl = audioUrls.firstOrNull(),
             userAgent = userAgent,
+            quality = selectedQuality?.takeIf { it > 0 } ?: deliveredQuality,
+            availableQualities = qualities,
+            backupVideoUrls = videoUrls.drop(1),
+            backupAudioUrls = audioUrls.drop(1),
         )
     }
 

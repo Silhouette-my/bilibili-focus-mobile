@@ -7,6 +7,13 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import io.ktor.http.Url
+import org.bilibilifocus.core.cookie.CookieRequestPolicy
+import org.bilibilifocus.core.model.VideoCommentRepliesPage
+import org.bilibilifocus.core.model.VideoSubtitleTrack
+import org.bilibilifocus.core.model.VideoSubtitleCue
+import org.bilibilifocus.core.model.VideoSubtitleDocument
+import org.bilibilifocus.core.routing.urlEncode
 import org.bilibilifocus.core.cookie.CookieProvider
 import org.bilibilifocus.core.model.CommentCursor
 import org.bilibilifocus.core.model.CommentPage
@@ -226,7 +233,7 @@ class VideoInfoService(
         oid: Long,
         cursor: CommentCursor = CommentCursor(),
     ): CommentPage {
-        return try {
+        return run {
             val pagination = buildJsonObject {
                 put("offset", cursor.nextOffset.orEmpty())
             }.toString()
@@ -254,11 +261,111 @@ class VideoInfoService(
                 totalCount = total,
                 cursor = CommentCursor(nextOffset),
             )
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (_: Exception) {
-            CommentPage(emptyList(), 0L, CommentCursor())
         }
+    }
+
+    suspend fun currentAccountMid(): Long? = CookieRequestPolicy.matchingCookies(cookieProvider.loadCookies(), "https://api.bilibili.com/")
+        .firstOrNull { it.name == "DedeUserID" }?.value?.toLongOrNull()?.takeIf { it > 0 }
+
+    suspend fun fetchCommentReplies(aid: Long, root: Long, page: Int = 1): VideoCommentRepliesPage {
+        require(aid > 0 && root > 0 && page > 0)
+        val url = BiliApiContractCatalog.require("common.comment.sub_reply").url +
+            "?type=1&oid=$aid&root=$root&pn=$page&ps=20"
+        val response = httpClient.get(url, buildHeaders(url))
+        if (response.statusCode !in 200..299) throw ServiceError.InvalidResponse
+        val data = parseDataField(response.body)
+        val replies = data.arrayValueAt("replies").orEmpty().mapNotNull { parseComment(it as? JsonObject) }
+        val count = data.longValueAt("page", "count") ?: replies.size.toLong()
+        return VideoCommentRepliesPage(replies, (page + 1).takeIf { replies.isNotEmpty() && page * 20L < count })
+    }
+
+    suspend fun setCommentLiked(aid: Long, rpid: Long, liked: Boolean, expectedMid: Long) {
+        commentWrite("common.comment.like", mapOf("oid" to "$aid", "type" to "1", "rpid" to "$rpid", "action" to if (liked) "1" else "0"), expectedMid)
+    }
+
+    suspend fun sendComment(aid: Long, message: String, root: Long = 0, parent: Long = 0, expectedMid: Long): VideoComment {
+        require(message.isNotBlank() && message.length <= 1000)
+        val data = commentWrite(
+            "common.comment.send",
+            mapOf("oid" to "$aid", "type" to "1", "message" to message, "plat" to "1", "root" to "$root", "parent" to "$parent"),
+            expectedMid,
+        )
+        return parseComment(data.dictionaryValueAt("reply")) ?: throw ServiceError.InvalidResponse
+    }
+
+    suspend fun deleteComment(aid: Long, rpid: Long, expectedMid: Long) {
+        commentWrite("common.comment.del", mapOf("oid" to "$aid", "type" to "1", "rpid" to "$rpid"), expectedMid)
+    }
+
+    private suspend fun commentWrite(key: String, fields: Map<String, String>, expectedMid: Long): JsonObject {
+        val endpoint = BiliApiContractCatalog.require(key).url
+        val cookies = CookieRequestPolicy.matchingCookies(cookieProvider.loadCookies(), endpoint)
+        val mid = cookies.firstOrNull { it.name == "DedeUserID" }?.value?.toLongOrNull()
+        if (expectedMid <= 0 || mid != expectedMid || cookies.none { it.name == "SESSDATA" && it.value.isNotBlank() }) {
+            throw ServiceError.LoginRequired
+        }
+        val csrf = cookies.firstOrNull { it.name == "bili_jct" }?.value?.takeIf(String::isNotBlank)
+            ?: throw ServiceError.LoginRequired
+        val body = (fields + ("csrf" to csrf)).entries.joinToString("&") { (key, value) -> "${urlEncode(key)}=${urlEncode(value)}" }
+        val headers = cookieProvider.attachCookies(
+            mapOf("User-Agent" to userAgent, "Referer" to "https://www.bilibili.com/", "Content-Type" to "application/x-www-form-urlencoded"),
+            cookies, endpoint,
+        )
+        val response = if (key == "common.comment.send") {
+            // Sign once. A write must never be retried after an ambiguous response.
+            val query = wbiSigner.signedQuery(emptyMap())
+            if (currentAccountMid() != expectedMid) throw ServiceError.LoginRequired
+            httpClient.post("$endpoint?$query", body, headers)
+        } else httpClient.post(endpoint, body, headers)
+        if (response.statusCode !in 200..299) throw ServiceError.InvalidResponse
+        val payload = json.parseToJsonElement(response.body) as? JsonObject ?: throw ServiceError.InvalidResponse
+        val code = payload.intValueAt("code") ?: throw ServiceError.InvalidResponse
+        if (code == -101) throw ServiceError.LoginRequired
+        if (code != 0) throw ServiceError.Api(code, payload.stringValueAt("message") ?: "评论操作失败")
+        return payload.dictionaryValueAt("data") ?: JsonObject(emptyMap())
+    }
+
+    suspend fun fetchSubtitleTracks(aid: Long, cid: Long): List<VideoSubtitleTrack> {
+        val response = executeWbiText(
+            BiliApiContractCatalog.require("video.info.get_player_info").url,
+            mapOf("aid" to "$aid", "cid" to "$cid"),
+        )
+        if (response.statusCode !in 200..299) throw ServiceError.InvalidResponse
+        val data = parseDataField(response.body)
+        return data.arrayValueAt("subtitle", "subtitles").orEmpty().mapNotNull { element ->
+            val track = element as? JsonObject ?: return@mapNotNull null
+            val id = track.longValueAt("id_str") ?: track.longValueAt("id") ?: return@mapNotNull null
+            val rawUrl = track.stringValueAt("subtitle_url")?.takeIf(String::isNotBlank) ?: return@mapNotNull null
+            VideoSubtitleTrack(
+                id, track.stringValueAt("lan").orEmpty(), track.stringValueAt("lan_doc").orEmpty(),
+                validatedSubtitleUrl(rawUrl), track.intValueAt("is_lock") == 1 || track.stringValueAt("is_lock") == "true",
+            )
+        }
+    }
+
+    suspend fun fetchSubtitleDocument(track: VideoSubtitleTrack): VideoSubtitleDocument {
+        val response = httpClient.get(validatedSubtitleUrl(track.url), mapOf("User-Agent" to userAgent))
+        if (response.statusCode !in 200..299) throw ServiceError.InvalidResponse
+        val root = json.parseToJsonElement(response.body) as? JsonObject ?: throw ServiceError.InvalidResponse
+        val body = root.arrayValueAt("body") ?: throw ServiceError.InvalidResponse
+        val cues = body.mapNotNull { element ->
+            val cue = element as? JsonObject ?: return@mapNotNull null
+            val from = cue["from"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: return@mapNotNull null
+            val to = cue["to"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: return@mapNotNull null
+            val content = cue.stringValueAt("content")?.takeIf(String::isNotBlank) ?: return@mapNotNull null
+            if (!from.isFinite() || !to.isFinite() || from < 0 || to <= from) return@mapNotNull null
+            VideoSubtitleCue((from * 1000).toLong(), (to * 1000).toLong(), content)
+        }.sortedBy { it.fromMillis }
+        return VideoSubtitleDocument(cues)
+    }
+
+    private fun validatedSubtitleUrl(raw: String): String {
+        val url = Url(if (raw.startsWith("//")) "https:$raw" else raw)
+        val host = url.host.lowercase().trimEnd('.')
+        if (url.protocol.name != "https" || url.port != 443 || url.user != null || url.password != null || url.fragment.isNotEmpty() ||
+            listOf("hdslb.com", "bilibili.com", "bilivideo.com").none { host == it || host.endsWith(".$it") }
+        ) throw ServiceError.InvalidResponse
+        return url.toString()
     }
 
     suspend fun fetchDanmakuView(aid: Long, cid: Long): VideoDanmakuView {
@@ -354,6 +461,7 @@ class VideoInfoService(
             publishTime = obj["ctime"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0,
             replies = subReplies?.mapNotNull { parseComment(it as? JsonObject) } ?: emptyList(),
             imageURLs = CommentRichTextParser.parseImageURLs(content),
+            isLiked = obj.intValueAt("action") == 1,
         )
     }
 

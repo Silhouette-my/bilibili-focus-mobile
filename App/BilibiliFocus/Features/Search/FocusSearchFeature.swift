@@ -19,6 +19,8 @@ final class FocusSearchResultsViewModel: ObservableObject {
     @Published private(set) var selectedVideoSort: SearchVideoSortOption = .default
     @Published private(set) var currentQuery: SearchQuery?
     @Published private(set) var isLoadingMore = false
+    @Published private(set) var pagingFilter: SearchResultFilter?
+    @Published private(set) var loadMoreErrorMessage: String?
 
     let availableFilters = SearchResultFilter.defaultOrder
     let availableVideoSortOptions = SearchVideoSortOption.allCases
@@ -51,6 +53,8 @@ final class FocusSearchResultsViewModel: ObservableObject {
         loadMoreTask?.cancel()
         loadMoreTask = nil
         isLoadingMore = false
+        pagingFilter = nil
+        loadMoreErrorMessage = nil
         if case .loading = state {
             state = .idle
         }
@@ -145,19 +149,23 @@ final class FocusSearchResultsViewModel: ObservableObject {
             case let .loaded(sections) = state,
             let activeSection = sections.first(where: { $0.id == section.id }),
             shouldLoadMore(after: currentItemID, in: activeSection.items),
-            !isLoadingMore
+            !isLoadingMore, loadMoreErrorMessage == nil
         else {
             return
         }
 
         let pagingFilter = selectedFilter == .all ? section.filter : selectedFilter
-        guard pagingFilter == .video,
-              let nextPage = nextPageByFilter[pagingFilter]
+        let cursorFilter = selectedFilter == .all ? SearchResultFilter.all : pagingFilter
+        // Overview sections are previews; only its video section has a cursor.
+        // Other categories start at page 1 when opened through their filter.
+        guard selectedFilter != .all || pagingFilter == .video,
+              let nextPage = nextPageByFilter[cursorFilter]
         else {
             return
         }
 
         isLoadingMore = true
+        self.pagingFilter = pagingFilter
         loadMoreTask?.cancel()
         loadMoreTask = Task { [weak self] in
             guard let self else {
@@ -165,7 +173,7 @@ final class FocusSearchResultsViewModel: ObservableObject {
             }
 
             do {
-                let currentVideoSort = pagingFilter == .video ? selectedVideoSort : .default
+                let currentVideoSort = selectedFilter == .video ? selectedVideoSort : .default
                 let extraPage = try await service.fetchPage(
                     for: query,
                     filter: pagingFilter,
@@ -181,39 +189,39 @@ final class FocusSearchResultsViewModel: ObservableObject {
                     extraSections: extraPage.sections,
                     targetFilter: pagingFilter
                 )
-                let mergedVideoSections = mergedSectionsForCache(
-                    existing: cache[pagingFilter]?.sections ?? [],
-                    incoming: extraPage.sections,
-                    targetFilter: pagingFilter
-                )
-                cachePage(
-                    SearchResultPage(
-                        sections: mergedVideoSections,
-                        nextPage: extraPage.nextPage
-                    ),
-                    for: pagingFilter
-                )
-
+                let didAppend = mergedSections.flatMap(\.items).count > sections.flatMap(\.items).count
+                let followingPage = didAppend ? extraPage.nextPage.flatMap { $0 > nextPage ? $0 : nil } : nil
                 if selectedFilter == .all {
                     cachePage(
                         SearchResultPage(
                             sections: mergedSections,
-                            nextPage: extraPage.nextPage
+                            nextPage: followingPage
                         ),
                         for: .all
                     )
+                } else {
+                    cachePage(SearchResultPage(sections: mergedSections, nextPage: followingPage), for: pagingFilter)
                 }
                 state = .loaded(mergedSections)
             } catch {
                 guard !Task.isCancelled else {
                     return
                 }
+                loadMoreErrorMessage = error.localizedDescription
             }
 
             if !Task.isCancelled {
                 isLoadingMore = false
             }
         }
+    }
+
+    func retryLoadMore() {
+        guard let pagingFilter, case let .loaded(sections) = state,
+              let section = sections.first(where: { $0.filter == pagingFilter }),
+              let item = section.items.last else { return }
+        loadMoreErrorMessage = nil
+        loadMoreIfNeeded(currentItemID: item.id, in: section)
     }
 
     private func shouldLoadMore(after currentItemID: String, in items: [SearchResultItem]) -> Bool {
@@ -243,18 +251,6 @@ final class FocusSearchResultsViewModel: ObservableObject {
         }
     }
 
-    private func mergedSectionsForCache(
-        existing: [SearchResultSection],
-        incoming: [SearchResultSection],
-        targetFilter: SearchResultFilter
-    ) -> [SearchResultSection] {
-        if existing.isEmpty {
-            return incoming
-        }
-
-        return merge(currentSections: existing, extraSections: incoming, targetFilter: targetFilter)
-    }
-
     private func mergeItems(existing: [SearchResultItem], incoming: [SearchResultItem]) -> [SearchResultItem] {
         var merged = existing
         var seen = Set(existing.map(\.id))
@@ -270,7 +266,7 @@ final class FocusSearchResultsViewModel: ObservableObject {
         cache[filter] = page
         nextPageByFilter[filter] = page.nextPage
 
-        guard filter == .all,
+        guard filter == .all, selectedVideoSort == .default,
               let videoSection = page.sections.first(where: { $0.filter == .video })
         else {
             return
@@ -290,6 +286,8 @@ struct FocusSearchResultsView: View {
     let onOpenItem: (SearchResultItem) -> Void
     let onOpenPreview: (SearchResultItem.PreviewVideo) -> Void
     let onEditQuery: () -> Void
+
+    @State private var prefetchAnchor: FocusSearchPrefetchAnchor?
 
     var body: some View {
         content
@@ -312,14 +310,6 @@ struct FocusSearchResultsView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
 
         case let .loaded(sections):
-            if sections.isEmpty {
-                FocusStateView(
-                    title: "没有找到结果",
-                    message: "换个关键词试试，或者稍后再搜一次。",
-                    buttonTitle: "重新搜索",
-                    action: onEditQuery
-                )
-            } else {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 14) {
                         FocusSearchQueryButton(
@@ -337,12 +327,25 @@ struct FocusSearchResultsView: View {
                             onSelect: viewModel.selectFilter
                         )
 
+                        if sections.isEmpty {
+                            Text("没有找到结果，换个分类或关键词试试。")
+                                .foregroundStyle(.secondary)
+                                .padding(.vertical, 32)
+                                .frame(maxWidth: .infinity)
+                        }
+
                         ForEach(sections) { section in
                             FocusSearchSectionView(
                                 section: section,
-                                isLoadingMore: viewModel.isLoadingMore && section.filter == .video,
+                                isLoadingMore: viewModel.isLoadingMore && section.filter == viewModel.pagingFilter,
+                                loadMoreError: section.filter == viewModel.pagingFilter ? viewModel.loadMoreErrorMessage : nil,
+                                onRetry: viewModel.retryLoadMore,
+                                onShowAll: viewModel.selectedFilter == .all ? { viewModel.selectFilter(section.filter) } : nil,
                                 onOpenItem: onOpenItem,
                                 onOpenPreview: onOpenPreview,
+                                onPrefetchTrigger: { item in
+                                    recordPrefetchAnchor(item, in: sections)
+                                },
                                 onLoadMoreTrigger: { item in
                                     viewModel.loadMoreIfNeeded(currentItemID: item.id, in: section)
                                 }
@@ -356,10 +359,10 @@ struct FocusSearchResultsView: View {
                 .refreshable {
                     await viewModel.refresh()
                 }
-                .task(id: prefetchSignature(for: sections)) {
-                    await prefetchImages(for: sections)
+                .task(id: prefetchTaskID(for: sections)) {
+                    let anchorID = prefetchAnchor.flatMap { $0.scope == prefetchScope ? $0.itemID : nil }
+                    await prefetchImages(for: sections, after: anchorID)
                 }
-            }
 
         case let .failed(message):
             FocusStateView(
@@ -371,19 +374,47 @@ struct FocusSearchResultsView: View {
         }
     }
 
-    private func prefetchSignature(for sections: [SearchResultSection]) -> String {
-        sections
-            .flatMap(\.items)
-            .prefix(12)
-            .map(\.id)
-            .joined(separator: "|")
+    private func recordPrefetchAnchor(_ item: SearchResultItem, in sections: [SearchResultSection]) {
+        let items = sections.flatMap(\.items)
+        guard let index = items.firstIndex(where: { $0.id == item.id }) else { return }
+        let scope = prefetchScope
+        let bucket = FocusSearchPrefetchWindow.bucket(for: index)
+        if let prefetchAnchor,
+           prefetchAnchor.scope == scope,
+           !FocusSearchPrefetchWindow.shouldAdvance(from: prefetchAnchor.bucket, to: bucket) {
+            return
+        }
+        prefetchAnchor = FocusSearchPrefetchAnchor(scope: scope, itemID: item.id, bucket: bucket)
     }
 
-    private func prefetchImages(for sections: [SearchResultSection]) async {
-        for item in sections.flatMap(\.items).prefix(10) {
+    private var prefetchScope: FocusSearchPrefetchScope {
+        FocusSearchPrefetchScope(
+            keyword: viewModel.currentQuery?.keyword ?? "",
+            filter: viewModel.selectedFilter,
+            sort: viewModel.selectedVideoSort
+        )
+    }
+
+    private func prefetchTaskID(for sections: [SearchResultSection]) -> FocusSearchPrefetchTaskID {
+        let scope = prefetchScope
+        let anchorID = prefetchAnchor.flatMap { $0.scope == scope ? $0.itemID : nil }
+        return FocusSearchPrefetchTaskID(
+            scope: scope,
+            windowItemIDs: FocusSearchPrefetchWindow.itemIDs(
+                in: sections.flatMap(\.items).map(\.id),
+                after: anchorID
+            )
+        )
+    }
+
+    private func prefetchImages(for sections: [SearchResultSection], after anchorID: String?) async {
+        let items = sections.flatMap(\.items)
+        let windowIDs = Set(FocusSearchPrefetchWindow.itemIDs(in: items.map(\.id), after: anchorID))
+        let candidates = items.filter { windowIDs.contains($0.id) }
+        await FocusSearchPrefetchWindow.prefetch(candidates) { item in
             let urls = ([item.coverURL, item.avatarURL] + item.previews.prefix(3).map(\.coverURL)).compactMap { $0 }
             guard !urls.isEmpty else {
-                continue
+                return
             }
 
             await FocusRemoteImageLoader.prefetch(
@@ -392,6 +423,52 @@ struct FocusSearchResultsView: View {
             )
         }
     }
+}
+
+enum FocusSearchPrefetchWindow {
+    static let lookAheadItemCount = 10
+
+    static func itemIDs(in itemIDs: [String], after anchorID: String?) -> [String] {
+        guard let anchorID, let anchorIndex = itemIDs.firstIndex(of: anchorID) else {
+            return Array(itemIDs.prefix(lookAheadItemCount))
+        }
+        let start = anchorIndex + 1
+        guard start < itemIDs.count else { return [] }
+        return Array(itemIDs[start..<min(start + lookAheadItemCount, itemIDs.count)])
+    }
+
+    static func bucket(for index: Int) -> Int { index / lookAheadItemCount }
+
+    static func shouldAdvance(from currentBucket: Int, to newBucket: Int) -> Bool {
+        currentBucket != newBucket
+    }
+
+    static func prefetch<Item: Sendable>(
+        _ items: [Item],
+        operation: @Sendable (Item) async -> Void
+    ) async {
+        for item in items {
+            guard !Task.isCancelled else { return }
+            await operation(item)
+        }
+    }
+}
+
+struct FocusSearchPrefetchScope: Equatable {
+    let keyword: String
+    let filter: SearchResultFilter
+    let sort: SearchVideoSortOption
+}
+
+private struct FocusSearchPrefetchAnchor {
+    let scope: FocusSearchPrefetchScope
+    let itemID: String
+    let bucket: Int
+}
+
+struct FocusSearchPrefetchTaskID: Equatable {
+    let scope: FocusSearchPrefetchScope
+    let windowItemIDs: [String]
 }
 
 struct FocusSearchQueryButton: View {
@@ -530,15 +607,22 @@ private struct FocusSearchFilterStrip: View {
 private struct FocusSearchSectionView: View {
     let section: SearchResultSection
     let isLoadingMore: Bool
+    let loadMoreError: String?
+    let onRetry: () -> Void
+    let onShowAll: (() -> Void)?
     let onOpenItem: (SearchResultItem) -> Void
     let onOpenPreview: (SearchResultItem.PreviewVideo) -> Void
+    let onPrefetchTrigger: (SearchResultItem) -> Void
     let onLoadMoreTrigger: (SearchResultItem) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text(section.title)
-                .font(.headline.weight(.semibold))
-                .padding(.horizontal, 2)
+            HStack {
+                Text(section.title).font(.headline.weight(.semibold))
+                Spacer()
+                if let onShowAll { Button("查看全部", action: onShowAll).font(.subheadline) }
+            }
+            .padding(.horizontal, 2)
 
             switch section.filter {
             case .video:
@@ -550,6 +634,7 @@ private struct FocusSearchSectionView: View {
                             FocusSearchVideoCard(item: item)
                         }
                         .buttonStyle(.plain)
+                        .onAppear { onPrefetchTrigger(item) }
                         .onAppear {
                             onLoadMoreTrigger(item)
                         }
@@ -564,6 +649,8 @@ private struct FocusSearchSectionView: View {
                             onOpenItem: onOpenItem,
                             onOpenPreview: onOpenPreview
                         )
+                        .onAppear { onPrefetchTrigger(item) }
+                        .onAppear { onLoadMoreTrigger(item) }
                     }
                 }
 
@@ -576,12 +663,14 @@ private struct FocusSearchSectionView: View {
                             FocusSearchLiveCard(item: item)
                         }
                         .buttonStyle(.plain)
+                        .onAppear { onPrefetchTrigger(item) }
+                        .onAppear { onLoadMoreTrigger(item) }
                     }
                 }
 
             case .bangumi, .film:
                 ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 10) {
+                    LazyHStack(spacing: 10) {
                         ForEach(section.items) { item in
                             Button {
                                 onOpenItem(item)
@@ -589,6 +678,12 @@ private struct FocusSearchSectionView: View {
                                 FocusSearchMediaCard(item: item)
                             }
                             .buttonStyle(.plain)
+                            .onAppear { onLoadMoreTrigger(item) }
+                            .onAppear {
+                                if item.id == section.items.first?.id {
+                                    onPrefetchTrigger(item)
+                                }
+                            }
                         }
                     }
                     .padding(.vertical, 2)
@@ -602,6 +697,14 @@ private struct FocusSearchSectionView: View {
                 ProgressView()
                     .frame(maxWidth: .infinity)
                     .padding(.top, 4)
+            }
+            if let loadMoreError {
+                HStack(alignment: .top) {
+                    Text(loadMoreError).font(.footnote).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("重试", action: onRetry)
+                }
+                .padding(.vertical, 8)
             }
         }
     }

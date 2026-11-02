@@ -4,6 +4,76 @@ import Testing
 
 struct FocusVideoCommentServiceTests {
     @Test
+    func commentSendSignsQueryPreservesTextAndUsesReplyIDs() async throws {
+        let cookies = commentAccountCookies(mid: "1001", session: "session-a")
+        let recorder = CommentServiceRequestRecorder(firstPage: Data(), secondPage: Data())
+        let service = FocusVideoCommentService(cookieProvider: StaticCommentCookieProvider(cookies: cookies),
+            requestLoader: { try await recorder.response(for: $0) }, signer: WBISigner())
+        let posted = try await service.sendComment(aid: 42, message: "你好! (B站) & +", rootCommentID: 80,
+            parentCommentID: 81, expectedAccountScope: .resolve(cookies: cookies))
+        #expect(posted.id == 90099)
+        let request = try #require(await recorder.requests.first { $0.httpMethod == "POST" })
+        #expect(request.url?.path == "/x/v2/reply/add")
+        #expect(queryValues(in: request.url!)["w_rid"]?.isEmpty == false)
+        let form = formValues(in: request)
+        #expect(form["message"] == "你好! (B站) & +")
+        #expect(form["root"] == "80")
+        #expect(form["parent"] == "81")
+        #expect(form["csrf"] == "csrf-1001")
+        #expect(form["oid"] == "42")
+        #expect(form["type"] == "1")
+        #expect(String(data: request.httpBody!, encoding: .utf8)?.contains("%2B") == true)
+    }
+
+    @Test
+    func ownCommentDeletionChecksAuthorAndUsesCSRF() async throws {
+        let cookies = commentAccountCookies(mid: "1001", session: "session-a")
+        let recorder = CommentServiceRequestRecorder(firstPage: Data(), secondPage: Data())
+        let service = FocusVideoCommentService(cookieProvider: StaticCommentCookieProvider(cookies: cookies),
+            requestLoader: { try await recorder.response(for: $0) }, signer: WBISigner())
+        await #expect(throws: FocusVideoCommentService.ServiceError.invalidParameters) {
+            try await service.deleteComment(aid: 42, commentID: 90001, authorMID: 2002,
+                                            expectedAccountScope: .resolve(cookies: cookies))
+        }
+        #expect(await recorder.requests.isEmpty)
+        try await service.deleteComment(aid: 42, commentID: 90001, authorMID: 1001,
+                                        expectedAccountScope: .resolve(cookies: cookies))
+        let request = try #require(await recorder.requests.first)
+        #expect(request.url?.path == "/x/v2/reply/del")
+        #expect(formValues(in: request)["rpid"] == "90001")
+        #expect(formValues(in: request)["csrf"] == "csrf-1001")
+    }
+
+    @Test
+    func sendingDoesNotRetryAnAmbiguousTransportFailure() async throws {
+        let cookies = commentAccountCookies(mid: "1001", session: "session-a")
+        let recorder = CommentServiceRequestRecorder(firstPage: Data(), secondPage: Data())
+        await recorder.failMutations()
+        let service = FocusVideoCommentService(cookieProvider: StaticCommentCookieProvider(cookies: cookies),
+            requestLoader: { try await recorder.response(for: $0) }, signer: WBISigner())
+        await #expect(throws: URLError.self) {
+            try await service.sendComment(aid: 42, message: "只发一次", expectedAccountScope: .resolve(cookies: cookies))
+        }
+        #expect(await recorder.requests.filter { $0.httpMethod == "POST" }.count == 1)
+    }
+
+    @Test
+    func newCommentMutationsRejectAChangedAccountBeforeSending() async throws {
+        let original = commentAccountCookies(mid: "1001", session: "session-a")
+        let changed = commentAccountCookies(mid: "2002", session: "session-b")
+        let recorder = CommentServiceRequestRecorder(firstPage: Data(), secondPage: Data())
+        let service = FocusVideoCommentService(cookieProvider: StaticCommentCookieProvider(cookies: changed),
+            requestLoader: { try await recorder.response(for: $0) }, signer: WBISigner())
+        await #expect(throws: FocusVideoCommentService.ServiceError.accountScopeChanged) {
+            try await service.sendComment(aid: 42, message: "不能串号", expectedAccountScope: .resolve(cookies: original))
+        }
+        await #expect(throws: FocusVideoCommentService.ServiceError.accountScopeChanged) {
+            try await service.deleteComment(aid: 42, commentID: 90001, authorMID: 1001,
+                                            expectedAccountScope: .resolve(cookies: original))
+        }
+        #expect(await recorder.requests.isEmpty)
+    }
+    @Test
     func replyFixturesDecodeLikedStateAndOpaqueContinuation() throws {
         let firstPage = try FocusVideoCommentService.decodeRepliesPageResponse(
             commentFixture(named: "comment-sub-replies-page-1"),
@@ -228,6 +298,9 @@ private actor CommentServiceRequestRecorder {
     private let firstPage: Data
     private let secondPage: Data
     private(set) var requests: [URLRequest] = []
+    private var mutationsFail = false
+
+    func failMutations() { mutationsFail = true }
 
     init(firstPage: Data, secondPage: Data) {
         self.firstPage = firstPage
@@ -236,6 +309,7 @@ private actor CommentServiceRequestRecorder {
 
     func response(for request: URLRequest) throws -> (Data, URLResponse) {
         requests.append(request)
+        if mutationsFail, request.httpMethod == "POST" { throw URLError(.networkConnectionLost) }
         let data: Data
         switch request.url?.path {
         case "/x/v2/reply/reply":
@@ -243,6 +317,12 @@ private actor CommentServiceRequestRecorder {
             data = page == "2" ? secondPage : firstPage
         case "/x/v2/reply/action":
             data = Data(#"{"code":0,"message":"0","data":{}}"#.utf8)
+        case "/x/v2/reply/del":
+            data = Data(#"{"code":0,"data":{}}"#.utf8)
+        case "/x/v2/reply/add":
+            data = Data(#"{"code":0,"data":{"reply":{"rpid":90099,"mid":1001,"ctime":1700000000,"member":{"mid":"1001","uname":"测试用户","avatar":""},"content":{"message":"已发送"}}}}"#.utf8)
+        case "/x/web-interface/nav":
+            data = Data(#"{"code":0,"data":{"wbi_img":{"img_url":"https://i0.hdslb.com/bfs/wbi/7cd084941338484aae1ad9425b84077c.png","sub_url":"https://i0.hdslb.com/bfs/wbi/4932caff0ff746eab6f01bf08b70ac45.png"}}}"#.utf8)
         default:
             data = Data(#"{"code":-404,"message":"unexpected"}"#.utf8)
         }

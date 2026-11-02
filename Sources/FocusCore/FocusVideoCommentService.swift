@@ -85,6 +85,7 @@ public actor FocusVideoCommentService {
 
     private let cookieProvider: any CookieSnapshotProvider
     private let requestLoader: RequestLoader
+    private let signer: WBISigner
 
     public init(
         cookieProvider: any CookieSnapshotProvider,
@@ -94,6 +95,13 @@ public actor FocusVideoCommentService {
     ) {
         self.cookieProvider = cookieProvider
         self.requestLoader = requestLoader
+        self.signer = .shared
+    }
+
+    init(cookieProvider: any CookieSnapshotProvider, requestLoader: @escaping RequestLoader, signer: WBISigner) {
+        self.cookieProvider = cookieProvider
+        self.requestLoader = requestLoader
+        self.signer = signer
     }
 
     public func fetchReplies(
@@ -231,6 +239,83 @@ public actor FocusVideoCommentService {
         try Self.validateMutationResponse(data)
     }
 
+    /// Sends once: a transport failure is ambiguous and must not duplicate a comment.
+    public func sendComment(
+        aid: Int64, message: String, rootCommentID: Int64? = nil, parentCommentID: Int64? = nil,
+        expectedAccountScope: FocusPlaybackAccountScope
+    ) async throws -> FocusVideoComment {
+        let text = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard aid > 0, !text.isEmpty, text.count <= 1_000,
+              rootCommentID.map({ $0 > 0 }) ?? true,
+              parentCommentID.map({ $0 > 0 && rootCommentID != nil }) ?? true else {
+            throw ServiceError.invalidParameters
+        }
+        var values = ["oid": String(aid), "type": "1", "message": text, "plat": "1",
+                      "statistics": "{\"appId\":100,\"platform\":5}", "gaia_source": "main_web"]
+        if let rootCommentID {
+            values["root"] = String(rootCommentID)
+            values["parent"] = String(parentCommentID ?? rootCommentID)
+        }
+        let data = try await mutate(key: "common.comment.send", aid: aid, values: values,
+                                    expectedAccountScope: expectedAccountScope)
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let reply = Self.nestedValue(root, path: ["data", "reply"]) as? [String: Any] else {
+            throw ServiceError.invalidResponse
+        }
+        // Reuse the canonical rich-comment decoder rather than manufacturing a
+        // local author or treating a successful HTTP response as a visible post.
+        let envelope = try JSONSerialization.data(withJSONObject: ["code": 0, "data": ["replies": [reply]]])
+        guard let comment = try FocusVideoDetailService.decodeCommentsPageResponse(envelope).comments.first else {
+            throw ServiceError.invalidResponse
+        }
+        return comment
+    }
+
+    public func deleteComment(aid: Int64, commentID: Int64, authorMID: Int64,
+                              expectedAccountScope: FocusPlaybackAccountScope) async throws {
+        guard aid > 0, commentID > 0, authorMID > 0,
+              FocusPlaybackAccountScope.accountID(authorMID) == expectedAccountScope else {
+            throw ServiceError.invalidParameters
+        }
+        _ = try await mutate(key: "common.comment.del", aid: aid,
+                             values: ["oid": String(aid), "type": "1", "rpid": String(commentID)],
+                             expectedAccountScope: expectedAccountScope)
+    }
+
+    private func mutate(key: String, aid: Int64, values: [String: String],
+                        expectedAccountScope: FocusPlaybackAccountScope) async throws -> Data {
+        guard expectedAccountScope != .anonymous else { throw ServiceError.loginRequired }
+        let snapshot = await cookieProvider.loadSnapshot()
+        guard FocusPlaybackAccountScope.resolve(cookies: snapshot.cookies) == expectedAccountScope else {
+            throw ServiceError.accountScopeChanged
+        }
+        let endpoint = BiliAPIContractCatalog.require(key)
+        let cookies = CookieRequestPolicy.cookies(snapshot.cookies, matching: endpoint.url)
+        let session = Self.cookieValues(named: "SESSDATA", in: cookies)
+        let csrf = Self.cookieValues(named: "bili_jct", in: cookies)
+        guard session.count == 1, csrf.count == 1 else { throw ServiceError.loginRequired }
+        var url = endpoint.url
+        if endpoint.usesWBI {
+            let nav = Self.makeRequest(url: URL(string: "https://api.bilibili.com/x/web-interface/nav")!,
+                                       method: "GET", referer: Self.videoReferer(aid: aid), cookies: snapshot.cookies)
+            let signed = try await signer.signedQuery(
+                parameters: [:], navigationRequest: nav, requestLoader: requestLoader)
+            var components = URLComponents(url: url, resolvingAgainstBaseURL: false)!
+            components.percentEncodedQuery = signed.percentEncodedQuery
+            url = components.url!
+        }
+        try Task.checkCancellation()
+        guard snapshot.version == cookieProvider.sessionVersion else { throw ServiceError.accountScopeChanged }
+        var request = Self.makeRequest(url: url, method: "POST", referer: Self.videoReferer(aid: aid), cookies: cookies)
+        request.setValue("application/x-www-form-urlencoded; charset=UTF-8", forHTTPHeaderField: "Content-Type")
+        request.setValue("https://www.bilibili.com", forHTTPHeaderField: "Origin")
+        request.httpBody = Self.formBody(values: values.merging(["csrf": csrf[0], "csrf_token": csrf[0]]) { _, new in new })
+        let data = try await loadData(for: request)
+        guard snapshot.version == cookieProvider.sessionVersion else { throw ServiceError.accountScopeChanged }
+        try Self.validateMutationResponse(data)
+        return data
+    }
+
     public nonisolated static func decodeRepliesPageResponse(
         _ data: Data,
         aid: Int64,
@@ -343,7 +428,7 @@ public actor FocusVideoCommentService {
         components.queryItems = values.keys.sorted().map { key in
             URLQueryItem(name: key, value: values[key])
         }
-        return components.percentEncodedQuery?.data(using: .utf8)
+        return components.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B").data(using: .utf8)
     }
 
     private nonisolated static func validateMutationResponse(

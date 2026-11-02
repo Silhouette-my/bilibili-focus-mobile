@@ -10,6 +10,7 @@ data class FocusSettings(
     val nativeDanmakuEnabled: Boolean = true,
     val nativeSubtitleEnabled: Boolean = true,
     val nativeSubtitleLanguageCode: String = "",
+    val playbackPreferences: FocusPlaybackPreferences = FocusPlaybackPreferences(),
     val searchMaskEnabled: Boolean = true,
     val dynamicMaskEnabled: Boolean = true,
     val debugMode: Boolean = false,
@@ -32,6 +33,31 @@ data class FocusSettings(
             return "#${digits.uppercase()}"
         }
     }
+}
+
+@Serializable
+data class FocusPlaybackPreferences(
+    val preferredRate: Float = 1f,
+    val autoPlayNextPart: Boolean = false,
+    val danmakuOpacity: Float = 0.94f,
+    val danmakuFontScale: Float = 1f,
+    val danmakuArea: Float = 1f,
+    val danmakuDensity: Float = 1f,
+    val subtitleFontScale: Float = 1f,
+    val subtitleBackgroundOpacity: Float = 0.72f,
+) {
+    /** Stored settings are a trust boundary; old versions omit all these fields. */
+    fun normalized() = copy(
+        preferredRate = preferredRate.finiteOr(1f).coerceIn(0.5f, 3f),
+        danmakuOpacity = danmakuOpacity.finiteOr(0.94f).coerceIn(0.1f, 1f),
+        danmakuFontScale = danmakuFontScale.finiteOr(1f).coerceIn(0.75f, 1.5f),
+        danmakuArea = danmakuArea.finiteOr(1f).coerceIn(0.25f, 1f),
+        danmakuDensity = danmakuDensity.finiteOr(1f).coerceIn(0.25f, 1f),
+        subtitleFontScale = subtitleFontScale.finiteOr(1f).coerceIn(0.75f, 1.75f),
+        subtitleBackgroundOpacity = subtitleBackgroundOpacity.finiteOr(0.72f).coerceIn(0f, 1f),
+    )
+
+    private fun Float.finiteOr(default: Float) = if (isFinite()) this else default
 }
 
 @Serializable

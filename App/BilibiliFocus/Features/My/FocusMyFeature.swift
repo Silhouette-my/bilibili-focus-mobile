@@ -24,12 +24,21 @@ struct FocusMyHistoryItem: Identifiable, Sendable {
     let viewAt: Int64
     let progress: Int64
     let duration: Int64
+    var cid: Int64 = 0
+    var page: Int = 0
+    var historyKey: String = ""
 
     var videoURL: URL? {
         guard !bvid.isEmpty else {
             return nil
         }
-        return URL(string: "https://www.bilibili.com/video/\(bvid)/")
+        var components = URLComponents(string: "https://www.bilibili.com/video/\(bvid)/")!
+        if cid > 0 { components.queryItems = [URLQueryItem(name: "cid", value: String(cid))] }
+        else if page > 0 { components.queryItems = [URLQueryItem(name: "p", value: String(page))] }
+        if components.queryItems != nil, progress > 0, progress <= Int64.max / 1000 {
+            components.queryItems?.append(URLQueryItem(name: "focus_history_position_ms", value: String(progress * 1000)))
+        }
+        return components.url
     }
 }
 
@@ -38,14 +47,12 @@ struct FocusMyFolder: Identifiable, Sendable {
     let title: String
     let mediaCount: Int
     let coverURL: URL?
-    let previews: [FocusMyFavoriteItem]
 }
 
 struct FocusMyPage: Sendable {
     let profile: FocusMyProfile
     let history: [FocusMyHistoryItem]
     let folders: [FocusMyFolder]
-    let watchLater: [FocusWatchLaterItem]
 }
 
 struct FocusMyFavoriteItem: Identifiable, Sendable {
@@ -56,6 +63,7 @@ struct FocusMyFavoriteItem: Identifiable, Sendable {
     let authorName: String
     let durationText: String
     let playText: String
+    var aid: Int64 = 0
 
     var videoURL: URL? {
         guard !bvid.isEmpty else {
@@ -283,7 +291,10 @@ private enum FocusMyServiceError: Error {
 }
 
 final class FocusMyDataService: @unchecked Sendable {
+    typealias RequestLoader = @Sendable (URLRequest) async throws -> (Data, URLResponse)
     private let cookieProvider: any CookieSnapshotProvider
+    private let playbackProgressStore: FocusPlaybackProgressStore
+    private let historyWriteBarrier: @Sendable () async -> Void
 
     var sessionVersion: UInt64 { cookieProvider.sessionVersion }
     var sessionReadiness: CookieSessionReadiness { cookieProvider.sessionReadiness }
@@ -291,13 +302,17 @@ final class FocusMyDataService: @unchecked Sendable {
     func prepareSessionVersion() async -> UInt64 {
         await cookieProvider.loadSnapshot().version
     }
-    private let requestLoader: FocusWatchLaterService.RequestLoader
+    private let requestLoader: RequestLoader
 
     init(
         cookieProvider: any CookieSnapshotProvider,
-        requestLoader: FocusWatchLaterService.RequestLoader? = nil
+        requestLoader: RequestLoader? = nil,
+        playbackProgressStore: FocusPlaybackProgressStore = .shared,
+        historyWriteBarrier: @escaping @Sendable () async -> Void = {}
     ) {
         self.cookieProvider = cookieProvider
+        self.playbackProgressStore = playbackProgressStore
+        self.historyWriteBarrier = historyWriteBarrier
         self.requestLoader = requestLoader ?? { request in try await BiliAPINetwork.data(for: request) }
     }
 
@@ -334,10 +349,14 @@ final class FocusMyDataService: @unchecked Sendable {
         )
     }
 
-    fileprivate func fetchHistoryPage(pageSize: Int, cursor: FocusHistoryCursor? = nil) async throws -> FocusMyHistoryPage {
-        var components = URLComponents(string: "https://api.bilibili.com/x/web-interface/history/cursor")
-        var queryItems = [URLQueryItem(name: "ps", value: "\(pageSize)")]
-        if let cursor {
+    fileprivate func fetchHistoryPage(pageSize: Int, cursor: FocusHistoryCursor? = nil, searchKeyword: String? = nil, searchPage: Int = 1) async throws -> FocusMyHistoryPage {
+        let endpoint = BiliAPIContractCatalog.require(searchKeyword == nil ? "user.info.history_new" : "history.info.search").url
+        var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false)
+        var queryItems: [URLQueryItem]
+        if let searchKeyword {
+            queryItems = [URLQueryItem(name: "keyword", value: searchKeyword), URLQueryItem(name: "pn", value: String(searchPage)), URLQueryItem(name: "business", value: "all")]
+        } else { queryItems = [URLQueryItem(name: "ps", value: "\(pageSize)")] }
+        if searchKeyword == nil, let cursor {
             if cursor.max > 0 {
                 queryItems.append(URLQueryItem(name: "max", value: "\(cursor.max)"))
             }
@@ -382,8 +401,15 @@ final class FocusMyDataService: @unchecked Sendable {
                 authorName: item.stringValue(at: "author_name") ?? "",
                 viewAt: item.int64Value(at: "view_at") ?? 0,
                 progress: item.int64Value(at: "progress") ?? 0,
-                duration: item.int64Value(at: "duration") ?? 0
+                duration: item.int64Value(at: "duration") ?? 0,
+                cid: history?.int64Value(at: "cid") ?? 0,
+                page: history?.intValue(at: "page") ?? 0,
+                historyKey: Self.historyDeletionKey(item)
             )
+        }
+
+        if searchKeyword != nil {
+            return FocusMyHistoryPage(items: await enrichHistoryItems(rawItems), nextCursor: nil)
         }
 
         let cursorData = root.dictionaryValue(at: "data", "cursor")
@@ -422,8 +448,7 @@ final class FocusMyDataService: @unchecked Sendable {
                 id: id,
                 title: folder.stringValue(at: "title") ?? "",
                 mediaCount: folder.intValue(at: "media_count") ?? 0,
-                coverURL: URL(string: Self.normalizedURLString(folder.stringValue(at: "cover")) ?? ""),
-                previews: []
+                coverURL: URL(string: Self.normalizedURLString(folder.stringValue(at: "cover")) ?? "")
             ))
         }
         return folders
@@ -458,9 +483,109 @@ final class FocusMyDataService: @unchecked Sendable {
                     media.stringValue(at: "duration"),
                     seconds: media.int64Value(at: "duration")
                 ),
-                playText: Self.formatCount(media.int64Value(at: "cnt_info", "play") ?? 0)
+                playText: Self.formatCount(media.int64Value(at: "cnt_info", "play") ?? 0),
+                aid: media.int64Value(at: "id") ?? 0
             )
         }
+    }
+
+    func createFolder(title: String, isPrivate: Bool, version: UInt64) async throws {
+        try await mutate("favorite-list.operate.new", fields: ["title": title, "intro": "", "privacy": isPrivate ? "1" : "0", "cover": ""], version: version)
+    }
+
+    private static func historyDeletionKey(_ item: [String: Any]) -> String {
+        let history = item.dictionaryValue(at: "history")
+        guard history?.stringValue(at: "business") == "archive" else { return "" }
+        if let key = item.stringValue(at: "kid"), key.hasPrefix("archive_") { return key }
+        if let aid = item.int64Value(at: "kid") ?? history?.int64Value(at: "oid"), aid > 0 { return "archive_\(aid)" }
+        return ""
+    }
+
+    func deleteHistory(key: String, version: UInt64) async throws {
+        guard key.hasPrefix("archive_"), let aid = Int64(key.dropFirst("archive_".count)), aid > 0 else { throw FocusMyServiceError.message("这条记录暂不支持删除") }
+        await historyWriteBarrier()
+        let snapshot = await cookieProvider.loadSnapshot()
+        guard snapshot.version == version else { throw CancellationError() }
+        try await playbackProgressStore.mutateRemoteHistory(accountScope: .resolve(cookies: snapshot.cookies), aid: aid) {
+            try await self.mutate("history.operate.delete", fields: ["kid": key], version: version)
+        }
+    }
+
+    func clearHistory(version: UInt64) async throws {
+        await historyWriteBarrier()
+        let snapshot = await cookieProvider.loadSnapshot()
+        guard snapshot.version == version else { throw CancellationError() }
+        try await playbackProgressStore.mutateRemoteHistory(accountScope: .resolve(cookies: snapshot.cookies)) {
+            try await self.mutate("history.operate.clear", fields: [:], version: version)
+        }
+    }
+
+    func renameFolder(id: Int64, title: String, version: UInt64) async throws {
+        let endpoint = BiliAPIContractCatalog.require("favorite-list.info.info").url
+        let root = try await requestObject(urlString: "\(endpoint.absoluteString)?media_id=\(id)", referer: "https://www.bilibili.com/")
+        guard root.intValue(at: "code") == 0, let info = root.dictionaryValue(at: "data") else {
+            throw FocusMyServiceError.message(root.stringValue(at: "message") ?? "收藏夹资料加载失败")
+        }
+        // Renaming must not reset the folder's introduction, cover or privacy.
+        try await mutate("favorite-list.operate.modify", fields: [
+            "media_id": String(id), "title": title,
+            "intro": info.stringValue(at: "intro") ?? "",
+            "privacy": ((info.intValue(at: "attr") ?? 0) & 1) == 1 ? "1" : "0",
+            "cover": info.stringValue(at: "cover") ?? "",
+        ], version: version)
+    }
+
+    func deleteFolder(id: Int64, version: UInt64) async throws {
+        try await mutate("favorite-list.operate.delete", fields: ["media_ids": String(id)], version: version)
+    }
+
+    func removeFavorite(aid: Int64, folderID: Int64, version: UInt64) async throws {
+        try await mutate("favorite-list.operate.content_rm", fields: ["media_id": String(folderID), "resources": "\(aid):2"], version: version)
+    }
+
+    func transferFavorite(aid: Int64, from source: Int64, to target: Int64, copy: Bool, version: UInt64) async throws {
+        try await mutate(copy ? "favorite-list.operate.content_copy" : "favorite-list.operate.content_move", fields: [
+            "src_media_id": String(source), "tar_media_id": String(target), "resources": "\(aid):2",
+        ], version: version, includesMID: copy)
+    }
+
+    private func mutate(_ key: String, fields: [String: String], version: UInt64, includesMID: Bool = false) async throws {
+        let endpoint = BiliAPIContractCatalog.require(key).url
+        let snapshot = await cookieProvider.loadSnapshot()
+        guard version == snapshot.version, version == cookieProvider.sessionVersion else { throw CancellationError() }
+        let cookies = CookieRequestPolicy.cookies(snapshot.cookies, matching: endpoint)
+        guard let csrf = cookies.first(where: { $0.name == "bili_jct" })?.value, !csrf.isEmpty,
+              cookies.contains(where: { $0.name == "SESSDATA" && !$0.value.isEmpty }) else {
+            throw FocusMyServiceError.loginRequired
+        }
+        var values = fields
+        values["csrf"] = csrf
+        if includesMID {
+            guard let mid = cookies.first(where: { $0.name == "DedeUserID" })?.value, Int64(mid) != nil else { throw FocusMyServiceError.loginRequired }
+            values["mid"] = mid
+        }
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
+        let body = values.sorted(by: { $0.key < $1.key }).map { key, value in
+            "\(key.addingPercentEncoding(withAllowedCharacters: allowed)!)=\(value.addingPercentEncoding(withAllowedCharacters: allowed)!)"
+        }.joined(separator: "&")
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.httpShouldHandleCookies = false
+        request.timeoutInterval = 18
+        request.httpBody = Data(body.utf8)
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        request.setValue(FocusNativePageAugmentService.userAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue("https://www.bilibili.com/", forHTTPHeaderField: "Referer")
+        request = CookieRequestPolicy.attach(cookies: cookies, to: request)
+        let (data, response) = try await requestLoader(request)
+        // A confirmed write belongs to the captured account even if navigation
+        // or login changed while it was in flight. The caller fences UI state;
+        // the history mutation gate must still retire that account's old outbox.
+        guard let response = response as? HTTPURLResponse, (200...299).contains(response.statusCode),
+              let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw FocusMyServiceError.message("操作失败，请重试") }
+        let code = root.intValue(at: "code") ?? -1
+        if code == -101 { throw FocusMyServiceError.loginRequired }
+        guard code == 0 else { throw FocusMyServiceError.message(root.stringValue(at: "message") ?? "操作失败，请重试") }
     }
 
     private func requestObject(urlString: String, referer: String) async throws -> [String: Any] {
@@ -535,7 +660,8 @@ final class FocusMyDataService: @unchecked Sendable {
                     authorName: item.authorName,
                     viewAt: item.viewAt,
                     progress: item.progress,
-                    duration: item.duration
+                    duration: item.duration,
+                    cid: item.cid, page: item.page, historyKey: item.historyKey
                 )
             )
         }
@@ -1056,11 +1182,12 @@ final class FocusMyDataService: @unchecked Sendable {
         }
     }
 
-    private static func formatVideoLength(_ length: String?, seconds: Int64?) -> String {
-        if let length = length?.nilIfBlank {
+    static func formatVideoLength(_ length: String?, seconds: Int64?) -> String {
+        let length = length?.nilIfBlank
+        if let length, Int64(length) == nil {
             return length
         }
-        guard let seconds, seconds > 0 else {
+        guard let seconds = length.flatMap(Int64.init) ?? seconds, seconds > 0 else {
             return ""
         }
         let hours = seconds / 3600
@@ -1097,15 +1224,13 @@ final class FocusMyViewModel: ObservableObject {
     }
 
     enum Section: String, CaseIterable, Sendable {
-        case relation, history, folders, previews, watchLater
+        case relation, history, folders
 
         var title: String {
             switch self {
             case .relation: return "关注与粉丝"
             case .history: return "播放历史"
             case .folders: return "收藏夹"
-            case .previews: return "收藏夹预览"
-            case .watchLater: return "稍后再看"
             }
         }
     }
@@ -1118,33 +1243,24 @@ final class FocusMyViewModel: ObservableObject {
     @Published private(set) var isRefreshing = false
     @Published private(set) var refreshErrorMessage: String?
     @Published private(set) var sectionStates: [Section: SectionState] = [:]
-    @Published private(set) var previewErrors: [Int64: String] = [:]
-    @Published private(set) var watchLaterActionsInFlight: Set<Int64> = []
-    @Published var actionErrorMessage: String?
+    @Published private(set) var isManagingFolder = false
+    @Published var folderActionError: String?
 
     private let service: FocusMyDataService
-    private let watchLaterService: FocusWatchLaterService
     private var task: Task<Void, Never>?
     private var generation = UUID()
     private var loadedSessionVersion: UInt64?
     private var requestSessionVersion: UInt64?
     private var sectionTasks: [Section: Task<Void, Never>] = [:]
-    private var watchLaterActionTasks: [Int64: Task<Void, Never>] = [:]
+    private var folderActionTask: Task<Void, Never>?
 
-    static let previewFolderLimit = 6
-    static let previewConcurrency = 2
-
-    init(
-        service: FocusMyDataService,
-        watchLaterService: FocusWatchLaterService
-    ) {
+    init(service: FocusMyDataService) {
         self.service = service
-        self.watchLaterService = watchLaterService
     }
 
     deinit {
         task?.cancel()
-        watchLaterActionTasks.values.forEach { $0.cancel() }
+        folderActionTask?.cancel()
     }
 
     func suspend() {
@@ -1153,9 +1269,9 @@ final class FocusMyViewModel: ObservableObject {
         task = nil
         sectionTasks.values.forEach { $0.cancel() }
         sectionTasks.removeAll()
-        watchLaterActionTasks.values.forEach { $0.cancel() }
-        watchLaterActionTasks.removeAll()
-        watchLaterActionsInFlight.removeAll()
+        folderActionTask?.cancel()
+        folderActionTask = nil
+        isManagingFolder = false
         isRefreshing = false
         if case .loading = state { state = .idle }
     }
@@ -1165,9 +1281,8 @@ final class FocusMyViewModel: ObservableObject {
         state = .idle
         loadedSessionVersion = nil
         sectionStates.removeAll()
-        previewErrors.removeAll()
+        folderActionError = nil
         refreshErrorMessage = nil
-        actionErrorMessage = nil
     }
 
     func reconcileSessionVersion(_ version: UInt64) {
@@ -1181,49 +1296,6 @@ final class FocusMyViewModel: ObservableObject {
         } else if case .loading = state, task == nil {
             reload()
         }
-    }
-
-    func removeFromWatchLater(aid: Int64) {
-        guard case .loaded = state, loadedSessionVersion == service.sessionVersion,
-              aid > 0, watchLaterActionsInFlight.insert(aid).inserted else {
-            return
-        }
-        actionErrorMessage = nil
-        let actionGeneration = generation
-        let actionVersion = service.sessionVersion
-        let actionTask = Task { [weak self] in
-            guard let self else { return }
-            defer {
-                if generation == actionGeneration {
-                    watchLaterActionsInFlight.remove(aid)
-                    watchLaterActionTasks[aid] = nil
-                }
-            }
-            do {
-                try await watchLaterService.remove(aid: aid)
-                guard isCurrent(actionGeneration, version: actionVersion), case let .loaded(page) = state else {
-                    return
-                }
-                state = .loaded(
-                    FocusMyPage(
-                        profile: page.profile,
-                        history: page.history,
-                        folders: page.folders,
-                        watchLater: page.watchLater.filter { $0.aid != aid }
-                    )
-                )
-            } catch is CancellationError {
-                return
-            } catch {
-                guard isCurrent(actionGeneration, version: actionVersion) else { return }
-                actionErrorMessage = error.localizedDescription
-            }
-        }
-        watchLaterActionTasks[aid] = actionTask
-    }
-
-    func dismissActionError() {
-        actionErrorMessage = nil
     }
 
     var navigationTitle: String {
@@ -1245,7 +1317,7 @@ final class FocusMyViewModel: ObservableObject {
         switch state {
         case .idle, .loginRequired, .failed: reload()
         case .loaded:
-            if task == nil && sectionStates.values.contains(.loading) { reload() }
+            reload()
         case .loading: break
         }
     }
@@ -1273,6 +1345,40 @@ final class FocusMyViewModel: ObservableObject {
         }
     }
 
+    func saveFolder(_ folder: FocusMyFolder?, title: String, isPrivate: Bool) {
+        let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else { folderActionError = "请输入收藏夹名称"; return }
+        manageFolder { service, version in
+            if let folder { try await service.renameFolder(id: folder.id, title: title, version: version) }
+            else { try await service.createFolder(title: title, isPrivate: isPrivate, version: version) }
+        }
+    }
+
+    func deleteFolder(_ folder: FocusMyFolder) {
+        manageFolder { service, version in try await service.deleteFolder(id: folder.id, version: version) }
+    }
+
+    private func manageFolder(_ operation: @escaping @Sendable (FocusMyDataService, UInt64) async throws -> Void) {
+        guard !isManagingFolder, let version = loadedSessionVersion, version == service.sessionVersion else { return }
+        let requestID = generation
+        isManagingFolder = true
+        folderActionError = nil
+        folderActionTask = Task { [weak self] in
+            guard let self else { return }
+            defer { if generation == requestID { isManagingFolder = false; folderActionTask = nil } }
+            do {
+                try await operation(service, version)
+                guard isCurrent(requestID, version: version) else { return }
+                await loadSection(.folders, requestID: requestID, version: version)
+            } catch is CancellationError { return }
+            catch {
+                guard isCurrent(requestID, version: version) else { return }
+                if case FocusMyServiceError.loginRequired = error { expireSession() }
+                else { folderActionError = displayError(error) }
+            }
+        }
+    }
+
     private func isCurrent(_ requestID: UUID, version: UInt64) -> Bool {
         !Task.isCancelled && generation == requestID && service.sessionVersion == version
     }
@@ -1285,13 +1391,12 @@ final class FocusMyViewModel: ObservableObject {
     private func updatePage(
         profile: FocusMyProfile? = nil,
         history: [FocusMyHistoryItem]? = nil,
-        folders: [FocusMyFolder]? = nil,
-        watchLater: [FocusWatchLaterItem]? = nil
+        folders: [FocusMyFolder]? = nil
     ) {
         guard let page else { return }
         state = .loaded(FocusMyPage(
             profile: profile ?? page.profile, history: history ?? page.history,
-            folders: folders ?? page.folders, watchLater: watchLater ?? page.watchLater
+            folders: folders ?? page.folders
         ))
     }
 
@@ -1299,7 +1404,7 @@ final class FocusMyViewModel: ObservableObject {
         suspend()
         loadedSessionVersion = nil
         sectionStates.removeAll()
-        previewErrors.removeAll()
+        folderActionError = nil
         state = .loginRequired
     }
 
@@ -1339,18 +1444,17 @@ final class FocusMyViewModel: ObservableObject {
             )
             loadedSessionVersion = version
             sectionStates = Dictionary(uniqueKeysWithValues: Section.allCases.map { ($0, .loading) })
-            previewErrors.removeAll()
+            folderActionError = nil
             state = .loaded(FocusMyPage(
                 profile: profile, history: previous?.history ?? [],
-                folders: previous?.folders ?? [], watchLater: previous?.watchLater ?? []
+                folders: previous?.folders ?? []
             ))
             BiliPerformanceStore.shared.end(span)
             // Each branch publishes on completion; none is on the basic-profile path.
             async let relation: Void = loadSection(.relation, requestID: requestID, version: version)
             async let history: Void = loadSection(.history, requestID: requestID, version: version)
             async let folders: Void = loadSection(.folders, requestID: requestID, version: version)
-            async let watchLater: Void = loadSection(.watchLater, requestID: requestID, version: version)
-            _ = await (relation, history, folders, watchLater)
+            _ = await (relation, history, folders)
         } catch {
             BiliPerformanceStore.shared.end(span, outcome: error is CancellationError ? .cancelled : .failure)
             guard isCurrent(requestID, version: version) else { return }
@@ -1362,17 +1466,11 @@ final class FocusMyViewModel: ObservableObject {
 
     private func loadSection(_ section: Section, requestID: UUID, version: UInt64) async {
         guard isCurrent(requestID, version: version), let currentPage = page else { return }
-        if section == .previews {
-            await loadPreviews(requestID: requestID, version: version)
-            return
-        }
         let stage: BiliPerformanceStage
         switch section {
         case .relation: stage = .myFollowing
         case .history: stage = .myHistory
         case .folders: stage = .myFavorites
-        case .watchLater: stage = .myWatchLater
-        case .previews: stage = .favoritePreviews
         }
         let span = BiliPerformanceStore.shared.begin(stage, correlationID: requestID)
         do {
@@ -1392,82 +1490,18 @@ final class FocusMyViewModel: ObservableObject {
             case .folders:
                 let folders = try await service.fetchFolders(mid: currentPage.profile.mid)
                 guard isCurrent(requestID, version: version) else { throw CancellationError() }
-                let previousPreviews = Dictionary(uniqueKeysWithValues: currentPage.folders.map { ($0.id, $0.previews) })
-                updatePage(folders: folders.map { folder in
-                    FocusMyFolder(id: folder.id, title: folder.title, mediaCount: folder.mediaCount,
-                                  coverURL: folder.coverURL, previews: previousPreviews[folder.id] ?? [])
-                })
-            case .watchLater:
-                let items = try await watchLaterService.fetchList().items
-                guard isCurrent(requestID, version: version) else { throw CancellationError() }
-                updatePage(watchLater: items)
-            case .previews: break
+                updatePage(folders: folders)
             }
             sectionStates[section] = .loaded
             BiliPerformanceStore.shared.end(span)
-            if section == .folders {
-                await loadPreviews(requestID: requestID, version: version)
-            }
         } catch {
             BiliPerformanceStore.shared.end(span, outcome: error is CancellationError ? .cancelled : .failure)
             guard isCurrent(requestID, version: version) else { return }
             if case FocusMyServiceError.loginRequired = error { expireSession(); return }
-            if case FocusWatchLaterService.ServiceError.loginRequired = error { expireSession(); return }
             sectionStates[section] = .failed(displayError(error))
-            if section == .folders { sectionStates[.previews] = .failed("请先重试收藏夹列表") }
         }
     }
 
-    private enum PreviewResult: Sendable {
-        case value(Int64, [FocusMyFavoriteItem]), failure(Int64, String), expired, cancelled
-    }
-
-    private nonisolated static func preview(service: FocusMyDataService, id: Int64) async -> PreviewResult {
-        do { return .value(id, try await service.fetchFolderContents(mediaID: id, pageSize: 3)) }
-        catch is CancellationError { return .cancelled }
-        catch FocusMyServiceError.loginRequired { return .expired }
-        catch { return .failure(id, error.localizedDescription) }
-    }
-
-    private func loadPreviews(requestID: UUID, version: UInt64) async {
-        guard isCurrent(requestID, version: version), let page else { return }
-        let folders = Array(page.folders.prefix(Self.previewFolderLimit))
-        let span = BiliPerformanceStore.shared.begin(.favoritePreviews, correlationID: requestID)
-        sectionStates[.previews] = .loading
-        previewErrors.removeAll()
-        await withTaskGroup(of: PreviewResult.self) { group in
-            var next = 0
-            for folder in folders.prefix(Self.previewConcurrency) {
-                next += 1
-                group.addTask { [service] in await Self.preview(service: service, id: folder.id) }
-            }
-            for await result in group {
-                guard isCurrent(requestID, version: version) else { group.cancelAll(); break }
-                switch result {
-                case let .value(id, items):
-                    updatePage(folders: self.page?.folders.map { folder in
-                        guard folder.id == id else { return folder }
-                        return FocusMyFolder(id: id, title: folder.title, mediaCount: folder.mediaCount,
-                                             coverURL: folder.coverURL, previews: items)
-                    })
-                case let .failure(id, message): previewErrors[id] = message
-                case .expired: expireSession(); group.cancelAll()
-                case .cancelled: break
-                }
-                if isCurrent(requestID, version: version), next < folders.count {
-                    let id = folders[next].id
-                    next += 1
-                    group.addTask { [service] in await Self.preview(service: service, id: id) }
-                }
-            }
-        }
-        guard isCurrent(requestID, version: version) else {
-            BiliPerformanceStore.shared.end(span, outcome: .cancelled)
-            return
-        }
-        sectionStates[.previews] = previewErrors.isEmpty ? .loaded : .failed("部分收藏夹预览加载失败，列表仍可打开")
-        BiliPerformanceStore.shared.end(span, outcome: previewErrors.isEmpty ? .success : .failure, count: folders.count)
-    }
 }
 
 @MainActor
@@ -1482,11 +1516,20 @@ final class FocusHistoryViewModel: ObservableObject {
 
     @Published private(set) var state: State = .idle
     @Published private(set) var isLoadingMore = false
+    @Published private(set) var isMutating = false
+    @Published var actionError: String?
+    @Published var query = ""
+    @Published private(set) var loadMoreError: String?
 
     private let service: FocusMyDataService
     private var nextCursor: FocusHistoryCursor?
     private var task: Task<Void, Never>?
     private var loadMoreTask: Task<Void, Never>?
+    private var actionTask: Task<Void, Never>?
+    private var loadedVersion: UInt64?
+    private var generation = UUID()
+    private var activeQuery = ""
+    private var nextSearchPage: Int?
 
     init(service: FocusMyDataService) {
         self.service = service
@@ -1495,14 +1538,19 @@ final class FocusHistoryViewModel: ObservableObject {
     deinit {
         task?.cancel()
         loadMoreTask?.cancel()
+        actionTask?.cancel()
     }
 
     func suspend() {
+        generation = UUID()
         task?.cancel()
         task = nil
         loadMoreTask?.cancel()
         loadMoreTask = nil
         isLoadingMore = false
+        actionTask?.cancel()
+        actionTask = nil
+        isMutating = false
         if case .loading = state {
             state = .idle
         }
@@ -1512,6 +1560,11 @@ final class FocusHistoryViewModel: ObservableObject {
         suspend()
         state = .idle
         nextCursor = nil
+        loadedVersion = nil
+        activeQuery = ""
+        nextSearchPage = nil
+        query = ""
+        actionError = nil
     }
 
     var navigationTitle: String {
@@ -1537,16 +1590,26 @@ final class FocusHistoryViewModel: ObservableObject {
 
     func reload() {
         suspend()
+        let requestID = generation
         task = Task { [weak self] in
-            await self?.performLoad()
+            await self?.performLoad(requestID: requestID)
         }
+    }
+
+    func submitSearch() {
+        activeQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        reload()
+    }
+
+    func clearSearchIfNeeded() {
+        if query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !activeQuery.isEmpty { submitSearch() }
     }
 
     func loadMoreIfNeeded(currentItemID: String) {
         guard case let .loaded(items) = state else {
             return
         }
-        guard !isLoadingMore, let nextCursor else {
+        guard !isLoadingMore, !isMutating, canLoadMore, loadedVersion == service.sessionVersion else {
             return
         }
         guard let index = items.firstIndex(where: { $0.id == currentItemID }), index >= items.count - 6 else {
@@ -1554,42 +1617,55 @@ final class FocusHistoryViewModel: ObservableObject {
         }
 
         isLoadingMore = true
+        loadMoreError = nil
+        let requestID = generation
+        let keyword = activeQuery
+        let searchPage = nextSearchPage ?? 1
+        let cursor = nextCursor
         loadMoreTask?.cancel()
         loadMoreTask = Task { [weak self] in
             guard let self else {
                 return
             }
             do {
-                let page = try await service.fetchHistoryPage(pageSize: 20, cursor: nextCursor)
-                guard !Task.isCancelled else {
+                let page = try await service.fetchHistoryPage(pageSize: 20, cursor: cursor, searchKeyword: keyword.isEmpty ? nil : keyword, searchPage: searchPage)
+                guard !Task.isCancelled, requestID == generation, loadedVersion == service.sessionVersion else {
                     return
                 }
 
                 var seen = Set<String>()
                 let merged = (items + page.items).filter { seen.insert($0.id).inserted }
-                self.nextCursor = page.nextCursor
+                if keyword.isEmpty { self.nextCursor = page.nextCursor }
+                else { nextSearchPage = !page.items.isEmpty && merged.count > items.count ? searchPage + 1 : nil }
                 self.state = .loaded(merged)
             } catch {
-                // 保留当前历史列表，下一次滚动或下拉刷新时继续尝试。
+                guard !Task.isCancelled, requestID == generation else { return }
+                loadMoreError = error.localizedDescription
             }
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, requestID == generation else { return }
             self.isLoadingMore = false
         }
     }
 
-    private func performLoad() async {
+    private func performLoad(requestID: UUID) async {
         state = .loading
         nextCursor = nil
+        nextSearchPage = nil
+        loadMoreError = nil
+        let keyword = activeQuery
 
         do {
-            let page = try await service.fetchHistoryPage(pageSize: 20)
-            guard !Task.isCancelled else {
+            let version = await service.prepareSessionVersion()
+            let page = try await service.fetchHistoryPage(pageSize: 20, searchKeyword: keyword.isEmpty ? nil : keyword)
+            guard !Task.isCancelled, requestID == generation, version == service.sessionVersion else {
                 return
             }
             nextCursor = page.nextCursor
+            nextSearchPage = keyword.isEmpty || page.items.isEmpty ? nil : 2
+            loadedVersion = version
             state = .loaded(page.items)
         } catch let error as FocusMyServiceError {
-            guard !Task.isCancelled else {
+            guard !Task.isCancelled, requestID == generation else {
                 return
             }
             switch error {
@@ -1599,10 +1675,55 @@ final class FocusHistoryViewModel: ObservableObject {
                 state = .failed(message)
             }
         } catch {
-            guard !Task.isCancelled else {
+            guard !Task.isCancelled, requestID == generation else {
                 return
             }
             state = .failed(error.localizedDescription)
+        }
+    }
+
+    var canLoadMore: Bool { activeQuery.isEmpty ? nextCursor != nil : nextSearchPage != nil }
+    var isSearchingHistory: Bool { !activeQuery.isEmpty }
+    var visibleItems: [FocusMyHistoryItem] {
+        guard case let .loaded(items) = state else { return [] }
+        return items
+    }
+
+    func loadMore() {
+        guard case let .loaded(items) = state, let last = items.last else { return }
+        loadMoreIfNeeded(currentItemID: last.id)
+    }
+
+    func delete(_ item: FocusMyHistoryItem) {
+        mutateHistory(key: item.historyKey)
+    }
+
+    func clear() { mutateHistory(key: nil) }
+
+    private func mutateHistory(key: String?) {
+        guard !isMutating, let version = loadedVersion, version == service.sessionVersion else { return }
+        loadMoreTask?.cancel()
+        isLoadingMore = false
+        isMutating = true
+        actionError = nil
+        let requestID = generation
+        actionTask = Task { [weak self] in
+            guard let self else { return }
+            defer { if !Task.isCancelled { isMutating = false; actionTask = nil } }
+            do {
+                if let key { try await service.deleteHistory(key: key, version: version) }
+                else { try await service.clearHistory(version: version) }
+                guard !Task.isCancelled, requestID == generation, version == service.sessionVersion, case let .loaded(items) = state else { return }
+                if key != nil && !activeQuery.isEmpty { await performLoad(requestID: requestID) }
+                else { state = .loaded(key == nil ? [] : items.filter { $0.historyKey != key }) }
+                if key == nil { nextCursor = nil; nextSearchPage = nil }
+            } catch is CancellationError { return }
+            catch {
+                guard !Task.isCancelled, requestID == generation, version == service.sessionVersion else { return }
+                if case FocusMyServiceError.loginRequired = error { state = .loginRequired }
+                else if case let FocusMyServiceError.message(message) = error { actionError = message }
+                else { actionError = error.localizedDescription }
+            }
         }
     }
 }
@@ -1800,6 +1921,9 @@ final class FocusFavoriteFolderViewModel: ObservableObject {
 
     @Published private(set) var state: State = .idle
     @Published private(set) var isLoadingMore = false
+    @Published private(set) var isMutating = false
+    @Published private(set) var transferTargets: [FocusMyFolder] = []
+    @Published var actionError: String?
 
     private let service: FocusMyDataService
     private var folder: FocusMyFolder?
@@ -1807,6 +1931,8 @@ final class FocusFavoriteFolderViewModel: ObservableObject {
     private var hasMore = false
     private var task: Task<Void, Never>?
     private var loadMoreTask: Task<Void, Never>?
+    private var mutationTask: Task<Void, Never>?
+    private var loadedVersion: UInt64?
 
     init(service: FocusMyDataService) {
         self.service = service
@@ -1815,6 +1941,7 @@ final class FocusFavoriteFolderViewModel: ObservableObject {
     deinit {
         task?.cancel()
         loadMoreTask?.cancel()
+        mutationTask?.cancel()
     }
 
     func loadIfNeeded() {
@@ -1830,6 +1957,9 @@ final class FocusFavoriteFolderViewModel: ObservableObject {
         loadMoreTask?.cancel()
         loadMoreTask = nil
         isLoadingMore = false
+        mutationTask?.cancel()
+        mutationTask = nil
+        isMutating = false
         if case .loading = state {
             state = .idle
         }
@@ -1850,6 +1980,9 @@ final class FocusFavoriteFolderViewModel: ObservableObject {
         folder = nil
         currentPage = 1
         hasMore = false
+        loadedVersion = nil
+        transferTargets = []
+        actionError = nil
     }
 
     func open(_ folder: FocusMyFolder) {
@@ -1871,7 +2004,7 @@ final class FocusFavoriteFolderViewModel: ObservableObject {
         guard case let .loaded(folder, items) = state else {
             return
         }
-        guard hasMore, !isLoadingMore else {
+        guard hasMore, !isLoadingMore, !isMutating else {
             return
         }
         guard let index = items.firstIndex(where: { $0.id == currentItemID }), index >= items.count - 6 else {
@@ -1909,11 +2042,13 @@ final class FocusFavoriteFolderViewModel: ObservableObject {
         hasMore = false
 
         do {
+            let version = await service.prepareSessionVersion()
             let items = try await service.fetchFolderContents(mediaID: folder.id, page: 1)
             guard !Task.isCancelled else {
                 return
             }
             hasMore = items.count >= 20
+            loadedVersion = version
             state = .loaded(folder, items)
         } catch let error as FocusMyServiceError {
             guard !Task.isCancelled else {
@@ -1930,6 +2065,52 @@ final class FocusFavoriteFolderViewModel: ObservableObject {
                 return
             }
             state = .failed(error.localizedDescription)
+        }
+    }
+
+    func loadTransferTargets() {
+        guard !isMutating, let version = loadedVersion else { return }
+        isMutating = true
+        actionError = nil
+        mutationTask = Task { [weak self] in
+            guard let self else { return }
+            defer { if !Task.isCancelled { isMutating = false; mutationTask = nil } }
+            do {
+                let nav = try await service.resolveLoggedInNavData()
+                let folders = try await service.fetchFolders(mid: nav.int64Value(at: "mid") ?? 0)
+                guard !Task.isCancelled, version == service.sessionVersion else { return }
+                transferTargets = folders.filter { $0.id != folder?.id }
+            } catch {
+                guard !Task.isCancelled, version == service.sessionVersion else { return }
+                actionError = error.localizedDescription
+            }
+        }
+    }
+
+    func remove(_ item: FocusMyFavoriteItem) { mutate(item: item, target: nil, copy: false) }
+    func transfer(_ item: FocusMyFavoriteItem, to target: FocusMyFolder, copy: Bool) { mutate(item: item, target: target, copy: copy) }
+
+    private func mutate(item: FocusMyFavoriteItem, target: FocusMyFolder?, copy: Bool) {
+        guard !isMutating, item.aid > 0, let folder, let version = loadedVersion, version == service.sessionVersion else { return }
+        loadMoreTask?.cancel()
+        isLoadingMore = false
+        isMutating = true
+        actionError = nil
+        mutationTask = Task { [weak self] in
+            guard let self else { return }
+            defer { if !Task.isCancelled { isMutating = false; mutationTask = nil } }
+            do {
+                if let target { try await service.transferFavorite(aid: item.aid, from: folder.id, to: target.id, copy: copy, version: version) }
+                else { try await service.removeFavorite(aid: item.aid, folderID: folder.id, version: version) }
+                guard !Task.isCancelled, version == service.sessionVersion, case let .loaded(currentFolder, items) = state else { return }
+                if !copy { state = .loaded(currentFolder, items.filter { $0.id != item.id }) }
+            } catch is CancellationError { return }
+            catch {
+                guard !Task.isCancelled, version == service.sessionVersion else { return }
+                if case FocusMyServiceError.loginRequired = error { state = .loginRequired }
+                else if case let FocusMyServiceError.message(message) = error { actionError = message }
+                else { actionError = error.localizedDescription }
+            }
         }
     }
 }
@@ -2026,16 +2207,17 @@ final class FocusFollowingAuthorsService: @unchecked Sendable {
         }
     }
 
-    private let cookieProvider: WebViewCookieSnapshotProvider
-    private let session: URLSession
+    private let cookieProvider: any CookieSnapshotProvider
+    private let requestLoader: FocusMyDataService.RequestLoader
 
-    init(cookieProvider: WebViewCookieSnapshotProvider) {
+    init(cookieProvider: any CookieSnapshotProvider, requestLoader: FocusMyDataService.RequestLoader? = nil) {
         self.cookieProvider = cookieProvider
         let configuration = URLSessionConfiguration.default
         configuration.timeoutIntervalForRequest = 16
         configuration.timeoutIntervalForResource = 24
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
-        self.session = URLSession(configuration: configuration)
+        let session = URLSession(configuration: configuration)
+        self.requestLoader = requestLoader ?? { request in try await session.data(for: request) }
     }
 
     func fetchFollowingAuthors() async throws -> [DynamicCard.Author] {
@@ -2149,12 +2331,13 @@ final class FocusFollowingAuthorsService: @unchecked Sendable {
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.timeoutInterval = 18
+        request.httpShouldHandleCookies = false
         request.setValue(FocusNativePageAugmentService.userAgent, forHTTPHeaderField: "User-Agent")
         request.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
         request.setValue(referer, forHTTPHeaderField: "Referer")
         let cookies = await cookieProvider.loadCookies()
         request = CookieRequestPolicy.attach(cookies: cookies, to: request)
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await requestLoader(request)
         guard let httpResponse = response as? HTTPURLResponse, (200 ... 299).contains(httpResponse.statusCode) else {
             throw ServiceError.invalidResponse
         }
@@ -2707,13 +2890,7 @@ actor FocusUserSpaceService {
     }
 
     private static func formatVideoLength(_ raw: String?, seconds: Int64?) -> String {
-        if let raw = raw?.nilIfBlank {
-            return raw
-        }
-        guard let seconds else {
-            return ""
-        }
-        return formatDuration(seconds)
+        FocusMyDataService.formatVideoLength(raw, seconds: seconds)
     }
 
     private static func formatDuration(_ seconds: Int64) -> String {
@@ -3776,303 +3953,280 @@ final class FocusOpusDetailService: @unchecked Sendable {
 
 struct FocusMyView: View {
     @ObservedObject var viewModel: FocusMyViewModel
+    let followingService: FocusFollowingAuthorsService
     let onOpenLogin: () -> Void
     let onOpenHistory: () -> Void
     let onOpenFavoriteFolder: (FocusMyFolder) -> Void
     let onOpenVideo: (URL) -> Void
+    let onOpenUser: (Int64) -> Void
+    let onOpenSettings: () -> Void
+    @State private var showsFolders = false
+    @State private var showsFollowing = false
+
+    private var page: FocusMyPage? {
+        if case let .loaded(page) = viewModel.state { return page }
+        return nil
+    }
+    private var requiresLogin: Bool { if case .loginRequired = viewModel.state { return true }; return false }
+    private var isProfileLoading: Bool { switch viewModel.state { case .idle, .loading: return true; default: return false } }
 
     var body: some View {
-        content
-            .task {
-                viewModel.loadIfNeeded()
-            }
-            .alert(
-                "稍后再看操作失败",
-                isPresented: Binding(
-                    get: { viewModel.actionErrorMessage != nil },
-                    set: { presented in
-                        if !presented {
-                            viewModel.dismissActionError()
-                        }
-                    }
-                )
-            ) {
-                Button("知道了", role: .cancel) {
-                    viewModel.dismissActionError()
-                }
-            } message: {
-                Text(viewModel.actionErrorMessage ?? "请稍后重试")
-            }
-    }
-
-    @ViewBuilder
-    private var content: some View {
-        switch viewModel.state {
-        case .idle, .loading:
-            ProgressView("加载个人页面…")
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-        case .loginRequired:
-            FocusLoginRequiredView(
-                title: "需要登录",
-                message: "登录后即可查看你的播放历史和收藏夹。",
-                reloadTitle: "重新检测登录态",
-                reloadAction: viewModel.reload,
-                loginAction: onOpenLogin
-            )
-
-        case let .failed(message):
-            FocusStateView(
-                title: "个人页面加载失败",
-                message: message,
-                buttonTitle: "重试",
-                action: viewModel.reload
-            )
-
-        case let .loaded(page):
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    FocusMyProfileCard(profile: page.profile)
-
-                    if viewModel.isRefreshing { ProgressView("正在刷新，保留已加载内容…") }
-                    if let message = viewModel.refreshErrorMessage {
-                        HStack {
-                            Text(message).font(.footnote).foregroundStyle(.secondary)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                if let page {
+                    FocusMyProfileCard(profile: page.profile, hasRelation: viewModel.sectionStates[.relation] == .loaded, onOpenProfile: { onOpenUser(page.profile.mid) }, onOpenFollowing: { showsFollowing = true })
+                    sectionFeedback(.relation)
+                } else {
+                    Button(action: { if requiresLogin { onOpenLogin() } else { viewModel.reload() } }) {
+                        HStack(spacing: 14) {
+                            Image(systemName: "person.crop.circle.fill").font(.system(size: 52)).foregroundStyle(.secondary)
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(requiresLogin ? "登录 B 站" : isProfileLoading ? "正在加载个人资料" : "个人资料暂不可用").font(.title3.bold())
+                                Text(requiresLogin ? "同步播放历史与收藏" : "历史、收藏与关注入口仍可使用").font(.subheadline).foregroundStyle(.secondary)
+                            }
                             Spacer()
-                            Button("重试", action: viewModel.reload)
+                            Image(systemName: "chevron.right").foregroundStyle(.secondary)
                         }
+                        .padding(16)
+                        .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 18))
+                    }.buttonStyle(.plain).disabled(isProfileLoading)
+                }
+
+                HStack(spacing: 0) {
+                    quickAction("历史记录", icon: "clock.arrow.circlepath", action: onOpenHistory)
+                    quickAction("我的收藏", icon: "star", action: { showsFolders = true })
+                    quickAction("我的关注", icon: "person.2", action: { showsFollowing = true })
+                }
+                .padding(.vertical, 16)
+                .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 18))
+
+                if let message = viewModel.refreshErrorMessage {
+                    HStack {
+                        Text(message).font(.footnote).foregroundStyle(.secondary)
+                        Spacer()
+                        Button("重试", action: viewModel.reload)
                     }
-                    ForEach(FocusMyViewModel.Section.allCases, id: \.self) { section in
-                        sectionStatus(section)
-                    }
-
-                    if !page.watchLater.isEmpty {
-                        VStack(alignment: .leading, spacing: 12) {
-                            Text("稍后再看")
-                                .font(.headline.weight(.semibold))
-                                .padding(.horizontal, 2)
-
-                            ScrollView(.horizontal, showsIndicators: false) {
-                                LazyHStack(spacing: 12) {
-                                    ForEach(page.watchLater) { item in
-                                        FocusWatchLaterCard(
-                                            item: item,
-                                            isRemoving: viewModel.watchLaterActionsInFlight.contains(
-                                                item.aid
-                                            ),
-                                            onOpen: {
-                                                guard let url = item.targetURL else {
-                                                    return
-                                                }
-                                                onOpenVideo(url)
-                                            },
-                                            onRemove: {
-                                                viewModel.removeFromWatchLater(aid: item.aid)
-                                            }
-                                        )
-                                    }
-                                }
-                                .padding(.vertical, 2)
-                            }
-                        }
-                    }
-
-                    if !page.history.isEmpty {
-                        VStack(alignment: .leading, spacing: 12) {
-                            HStack(spacing: 12) {
-                                Text("播放历史")
-                                    .font(.headline.weight(.semibold))
-
-                                Spacer(minLength: 0)
-
-                                Button("更多") {
-                                    onOpenHistory()
-                                }
-                                .font(.subheadline.weight(.semibold))
-                                .foregroundStyle(FocusDesign.primary)
-                            }
-                            .padding(.horizontal, 2)
-
-                            ScrollView(.horizontal, showsIndicators: false) {
-                                HStack(spacing: 12) {
-                                    ForEach(page.history) { item in
-                                        Button {
-                                            guard let url = item.videoURL else {
-                                                return
-                                            }
-                                            onOpenVideo(url)
-                                        } label: {
-                                            FocusMyHistoryCard(item: item)
-                                        }
-                                        .buttonStyle(.plain)
-                                    }
-                                }
-                                .padding(.vertical, 2)
-                            }
-                        }
-                    }
-
+                }
+                if let page {
+                    continuationSection(page)
                     if !page.folders.isEmpty {
                         VStack(alignment: .leading, spacing: 12) {
-                            HStack(spacing: 12) {
-                                Text("收藏夹")
-                                    .font(.headline.weight(.semibold))
-
-                                Spacer(minLength: 0)
+                            HStack {
+                                Text("我的收藏").font(.headline)
+                                Spacer()
+                                Button("查看全部") { showsFolders = true }
                             }
-                            .padding(.horizontal, 2)
-
-                            VStack(spacing: 12) {
-                                ForEach(page.folders) { folder in
-                                    FocusMyFolderSection(
-                                        folder: folder,
-                                        onOpenFolder: {
-                                            onOpenFavoriteFolder(folder)
-                                        },
-                                        onOpenVideo: { url in
-                                            onOpenVideo(url)
-                                        }
-                                    )
-                                }
+                            ForEach(page.folders.prefix(3)) { folder in
+                                Button { onOpenFavoriteFolder(folder) } label: {
+                                    HStack {
+                                        Image(systemName: "folder.fill").foregroundStyle(FocusDesign.primary)
+                                        Text(folder.title).lineLimit(1)
+                                        Spacer()
+                                        Text("\(folder.mediaCount)").foregroundStyle(.secondary)
+                                        Image(systemName: "chevron.right").font(.caption).foregroundStyle(.secondary)
+                                    }.padding(.vertical, 8)
+                                }.buttonStyle(.plain)
                             }
                         }
+                        .padding(16)
+                        .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 18))
+                    }
+                    sectionFeedback(.folders)
+                } else {
+                    switch viewModel.state {
+                    case .idle, .loading: ProgressView("正在加载个人资料…").frame(maxWidth: .infinity)
+                    case let .failed(message):
+                        HStack { Text(message).font(.footnote).foregroundStyle(.secondary); Spacer(); Button("重试", action: viewModel.reload) }
+                    default: EmptyView()
                     }
                 }
-                .padding(.horizontal, 16)
-                .padding(.top, 14)
-                .padding(.bottom, 132)
+                Button(action: onOpenSettings) {
+                    Label("播放、外观与动态设置", systemImage: "slider.horizontal.3")
+                        .frame(maxWidth: .infinity, alignment: .leading).padding(16)
+                        .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16))
+                }.buttonStyle(.plain)
             }
-            .background(Color(uiColor: .systemGroupedBackground))
-            .task(id: page.history.map(\.id).joined(separator: "|")) {
-                await prefetchAssets(for: page)
+            .padding(.horizontal, 16).padding(.top, 14).padding(.bottom, 132)
+        }
+        .background(Color(uiColor: .systemGroupedBackground))
+        .task { viewModel.loadIfNeeded() }
+        .refreshable { await viewModel.refresh() }
+        .sheet(isPresented: $showsFolders) {
+            FocusMyFoldersView(viewModel: viewModel, onOpenLogin: onOpenLogin) { folder in
+                showsFolders = false
+                onOpenFavoriteFolder(folder)
             }
-            .refreshable {
-                await viewModel.refresh()
+        }
+        .sheet(isPresented: $showsFollowing) {
+            FocusMyFollowingView(service: followingService) { mid in
+                showsFollowing = false
+                onOpenUser(mid)
             }
         }
     }
 
-    @ViewBuilder
-    private func sectionStatus(_ section: FocusMyViewModel.Section) -> some View {
-        switch viewModel.sectionStates[section] {
-        case .loading:
-            ProgressView("\(section.title)加载中…").font(.footnote)
-        case let .failed(message):
-            HStack(alignment: .top) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("\(section.title)暂不可用").font(.subheadline)
-                    Text(message).font(.footnote).foregroundStyle(.secondary)
-                }
-                Spacer(minLength: 8)
-                Button("重试") { viewModel.retrySection(section) }
-            }
-        case .loaded, .none: EmptyView()
-        }
+    private func quickAction(_ title: String, icon: String, action: @escaping () -> Void) -> some View {
+        Button {
+            if requiresLogin { onOpenLogin() } else { action() }
+        } label: {
+            VStack(spacing: 9) {
+                Image(systemName: icon).font(.system(size: 23)).foregroundStyle(FocusDesign.primary)
+                Text(title).font(.subheadline)
+            }.frame(maxWidth: .infinity).contentShape(Rectangle())
+        }.buttonStyle(.plain)
     }
 
-    private func prefetchAssets(for page: FocusMyPage) async {
-        let historyURLs = page.history.compactMap(\.coverURL)
-        let watchLaterURLs = page.watchLater.compactMap(\.coverURL)
-        if !historyURLs.isEmpty || !watchLaterURLs.isEmpty {
-            await FocusRemoteImageLoader.prefetch(
-                urls: historyURLs + watchLaterURLs,
-                referer: "https://www.bilibili.com/"
-            )
+    @ViewBuilder private func continuationSection(_ page: FocusMyPage) -> some View {
+        if let item = page.history.first(where: { $0.progress > 0 && $0.duration > $0.progress + 10 }) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack { Text("继续观看").font(.headline); Spacer(); Button("播放历史", action: onOpenHistory).font(.subheadline) }
+                Button {
+                    if let url = item.videoURL { onOpenVideo(url) }
+                } label: {
+                    HStack(alignment: .top, spacing: 12) {
+                        FocusRemoteImage(url: item.coverURL, referer: "https://www.bilibili.com/") { phase in
+                            if case let .success(image) = phase { image.resizable().scaledToFill() }
+                            else { Color(uiColor: .tertiarySystemFill) }
+                        }.frame(width: 128, height: 72).clipped().clipShape(RoundedRectangle(cornerRadius: 10))
+                        VStack(alignment: .leading, spacing: 7) {
+                            Text(item.title).font(.subheadline.weight(.semibold)).lineLimit(2)
+                            Text(FocusHistoryCardFormatter.durationText(progress: item.progress, duration: item.duration)).font(.caption).foregroundStyle(.secondary)
+                            ProgressView(value: Double(item.progress), total: Double(item.duration)).tint(FocusDesign.primary)
+                        }
+                    }.contentShape(Rectangle())
+                }.buttonStyle(.plain)
+            }.padding(16).background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 18))
         }
+        sectionFeedback(.history)
+    }
 
-        let folderURLs = page.folders.flatMap { folder in
-            folder.previews.compactMap(\.coverURL)
-        }
-        if !folderURLs.isEmpty {
-            await FocusRemoteImageLoader.prefetch(urls: folderURLs, referer: "https://www.bilibili.com/")
+    @ViewBuilder private func sectionFeedback(_ section: FocusMyViewModel.Section) -> some View {
+        if case let .failed(message) = viewModel.sectionStates[section] {
+            HStack { Text("\(section.title)：\(message)").font(.footnote).foregroundStyle(.secondary); Spacer(); Button("重试") { viewModel.retrySection(section) } }
         }
     }
 }
 
-private struct FocusWatchLaterCard: View {
-    let item: FocusWatchLaterItem
-    let isRemoving: Bool
-    let onOpen: () -> Void
-    let onRemove: () -> Void
+struct FocusMyFoldersView: View {
+    @ObservedObject var viewModel: FocusMyViewModel
+    let onOpenLogin: () -> Void
+    let onOpenFolder: (FocusMyFolder) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var showsEditor = false
+    @State private var editingFolder: FocusMyFolder?
+    @State private var deletingFolder: FocusMyFolder?
+    @State private var title = ""
+    @State private var isPrivate = false
+    private var canManage: Bool { if case .loaded = viewModel.state { return true }; return false }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            FocusRemoteImage(url: item.coverURL, referer: "https://www.bilibili.com/") { phase in
-                switch phase {
-                case let .success(image):
-                    image.resizable().scaledToFill()
-                case .failure:
-                    Color(uiColor: .tertiarySystemFill)
-                        .overlay(Image(systemName: "play.rectangle").foregroundStyle(.secondary))
-                case .empty:
-                    Color(uiColor: .tertiarySystemFill)
-                        .overlay(ProgressView())
-                }
-            }
-            .frame(width: 220, height: 124)
-            .clipped()
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .overlay(alignment: .bottomLeading) {
-                if item.progressSeconds > 0 {
-                    Text("上次看到 \(durationText(item.progressSeconds))")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 4)
-                        .background(.black.opacity(0.64), in: Capsule())
-                        .padding(7)
-                }
-            }
-            .contentShape(Rectangle())
-            .onTapGesture(perform: onOpen)
-
-            Text(item.title)
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(.primary)
-                .lineLimit(2)
-                .frame(width: 220, alignment: .leading)
-
-            HStack(spacing: 8) {
-                Text(item.author.name)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-
-                Spacer(minLength: 0)
-
-                Button(role: .destructive, action: onRemove) {
-                    if isRemoving {
-                        ProgressView()
-                            .controlSize(.small)
-                    } else {
-                        Label("移除", systemImage: "trash")
-                            .labelStyle(.iconOnly)
+        NavigationStack {
+            Group {
+                if case let .loaded(page) = viewModel.state {
+                    List {
+                        if let message = viewModel.folderActionError { Text(message).font(.footnote).foregroundStyle(.red) }
+                        if case let .failed(message) = viewModel.sectionStates[.folders] {
+                            HStack { Text(message).font(.footnote); Spacer(); Button("重试") { viewModel.retrySection(.folders) } }
+                        }
+                        if viewModel.sectionStates[.folders] == .loading && page.folders.isEmpty { ProgressView("加载收藏夹…") }
+                        ForEach(page.folders) { folder in
+                            Button { onOpenFolder(folder) } label: {
+                                HStack {
+                                    Label(folder.title, systemImage: "folder")
+                                    Spacer()
+                                    Text("\(folder.mediaCount)").foregroundStyle(.secondary)
+                                }.foregroundStyle(.primary)
+                            }
+                            .contextMenu {
+                                Button("重命名", systemImage: "pencil") { editingFolder = folder; title = folder.title; showsEditor = true }
+                                Button("删除收藏夹", systemImage: "trash", role: .destructive) { deletingFolder = folder }
+                            }
+                            .swipeActions {
+                                Button("删除", role: .destructive) { deletingFolder = folder }
+                                Button("重命名") { editingFolder = folder; title = folder.title; showsEditor = true }.tint(.blue)
+                            }
+                        }
+                        if page.folders.isEmpty && viewModel.sectionStates[.folders] == .loaded { Text("暂无收藏夹，点击右上角新建").foregroundStyle(.secondary) }
+                    }
+                    .disabled(viewModel.isManagingFolder)
+                    .overlay { if viewModel.isManagingFolder { ProgressView("正在保存…") } }
+                    .refreshable { await viewModel.refresh() }
+                } else {
+                    switch viewModel.state {
+                    case .idle, .loading: ProgressView("加载收藏夹…")
+                    case let .failed(message): FocusStateView(title: "收藏夹暂不可用", message: message, buttonTitle: "重试", action: viewModel.reload)
+                    case .loginRequired: FocusStateView(title: "需要登录", message: "登录后管理你的收藏夹。", buttonTitle: "去登录", action: onOpenLogin)
+                    case .loaded: EmptyView()
                     }
                 }
-                .disabled(isRemoving)
             }
-            .frame(width: 220)
+            .navigationTitle("我的收藏").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("完成") { dismiss() } }
+                ToolbarItem(placement: .primaryAction) {
+                    Button("新建", systemImage: "plus") { editingFolder = nil; title = ""; isPrivate = false; showsEditor = true }
+                        .disabled(viewModel.isManagingFolder || !canManage)
+                }
+            }
+            .sheet(isPresented: $showsEditor) {
+                NavigationStack {
+                    Form {
+                        TextField("收藏夹名称", text: $title)
+                        if editingFolder == nil { Toggle("私密收藏夹", isOn: $isPrivate) }
+                    }
+                    .navigationTitle(editingFolder == nil ? "新建收藏夹" : "重命名收藏夹")
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) { Button("取消") { showsEditor = false } }
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("保存") { viewModel.saveFolder(editingFolder, title: title, isPrivate: isPrivate); showsEditor = false }
+                                .disabled(title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !canManage)
+                        }
+                    }
+                }
+            }
+            .alert("删除收藏夹？", isPresented: Binding(get: { deletingFolder != nil }, set: { if !$0 { deletingFolder = nil } })) {
+                Button("取消", role: .cancel) { deletingFolder = nil }
+                Button("删除", role: .destructive) { if let folder = deletingFolder { viewModel.deleteFolder(folder) }; deletingFolder = nil }
+            } message: { Text("将从 B 站账号删除“\(deletingFolder?.title ?? "")”及其中的收藏记录，此操作无法撤销。") }
         }
-        .accessibilityElement(children: .contain)
     }
+}
 
-    private func durationText(_ seconds: Int64) -> String {
-        let clamped = max(seconds, 0)
-        let hours = clamped / 3_600
-        let minutes = (clamped % 3_600) / 60
-        let remainingSeconds = clamped % 60
-        if hours > 0 {
-            return String(format: "%lld:%02lld:%02lld", hours, minutes, remainingSeconds)
+private struct FocusMyFollowingView: View {
+    @StateObject private var viewModel: FocusDynamicAuthorSettingsViewModel
+    @Environment(\.dismiss) private var dismiss
+    let onOpenUser: (Int64) -> Void
+    init(service: FocusFollowingAuthorsService, onOpenUser: @escaping (Int64) -> Void) {
+        _viewModel = StateObject(wrappedValue: FocusDynamicAuthorSettingsViewModel(service: service))
+        self.onOpenUser = onOpenUser
+    }
+    var body: some View {
+        NavigationStack {
+            Group {
+                switch viewModel.state {
+                case .idle, .loading: ProgressView("加载关注列表…")
+                case let .failed(message): FocusStateView(title: "关注列表加载失败", message: message, buttonTitle: "重试", action: viewModel.reload)
+                case let .loaded(authors):
+                    List(authors, id: \.filterIdentity) { author in
+                        Button { onOpenUser(author.mid) } label: { Label(author.name, systemImage: "person.crop.circle") }
+                    }.overlay { if authors.isEmpty { Text("暂无关注").foregroundStyle(.secondary) } }
+                }
+            }
+            .navigationTitle("我的关注").navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } } }
+            .task { viewModel.loadIfNeeded() }
         }
-        return String(format: "%02lld:%02lld", minutes, remainingSeconds)
     }
 }
 
 private struct FocusMyProfileCard: View {
     let profile: FocusMyProfile
+    let hasRelation: Bool
+    let onOpenProfile: () -> Void
+    let onOpenFollowing: () -> Void
 
     var body: some View {
-        VStack(spacing: 14) {
+        HStack(spacing: 14) {
             FocusRemoteImage(url: profile.avatarURL, referer: "https://space.bilibili.com/\(profile.mid)") { phase in
                 switch phase {
                 case let .success(image):
@@ -4089,27 +4243,28 @@ private struct FocusMyProfileCard: View {
                         .overlay(ProgressView())
                 }
             }
-            .frame(width: 78, height: 78)
+            .frame(width: 58, height: 58)
             .clipShape(Circle())
+            .onTapGesture(perform: onOpenProfile)
 
-            VStack(spacing: 6) {
-                Text(profile.name)
-                    .font(.title3.weight(.bold))
-                    .foregroundStyle(.primary)
-
-                Text("LV\(profile.level)")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(FocusDesign.primary)
+            VStack(alignment: .leading, spacing: 8) {
+                Button(action: onOpenProfile) {
+                    HStack(spacing: 8) {
+                        Text(profile.name).font(.title3.weight(.bold)).foregroundStyle(.primary).lineLimit(1)
+                        Text("LV\(profile.level)").font(.caption.weight(.semibold)).foregroundStyle(FocusDesign.primary)
+                    }
+                }.buttonStyle(.plain)
+                HStack(spacing: 16) {
+                    Button(action: onOpenFollowing) { Text("\(hasRelation ? formatCount(profile.following) : "—") 关注") }.buttonStyle(.plain)
+                    Text("\(hasRelation ? formatCount(profile.followers) : "—") 粉丝")
+                }.font(.caption).foregroundStyle(.secondary)
             }
-
-            HStack(spacing: 24) {
-                FocusMyStat(value: formatCount(profile.following), label: "关注")
-                FocusMyStat(value: formatCount(profile.followers), label: "粉丝")
-            }
+            Spacer(minLength: 0)
+            Button(action: onOpenProfile) { HStack(spacing: 3) { Text("个人空间"); Image(systemName: "chevron.right") }.font(.caption).foregroundStyle(.secondary) }
         }
         .frame(maxWidth: .infinity)
         .padding(.horizontal, 20)
-        .padding(.vertical, 22)
+        .padding(.vertical, 18)
         .background(
             RoundedRectangle(cornerRadius: 22, style: .continuous)
                 .fill(Color(uiColor: .secondarySystemGroupedBackground))
@@ -4128,143 +4283,11 @@ private struct FocusMyProfileCard: View {
     }
 }
 
-private struct FocusMyStat: View {
-    let value: String
-    let label: String
-
-    var body: some View {
-        VStack(spacing: 4) {
-            Text(value)
-                .font(.headline.weight(.bold))
-                .foregroundStyle(.primary)
-            Text(label)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-    }
-}
-
-private struct FocusMyHistoryCard: View {
-    let item: FocusMyHistoryItem
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            ZStack(alignment: .bottomTrailing) {
-                FocusRemoteImage(url: item.coverURL, referer: item.videoURL?.absoluteString ?? "https://www.bilibili.com/") { phase in
-                    switch phase {
-                    case let .success(image):
-                        image
-                            .resizable()
-                            .scaledToFill()
-                    case .failure:
-                        RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .fill(Color(uiColor: .tertiarySystemFill))
-                    case .empty:
-                        RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .fill(Color(uiColor: .tertiarySystemFill))
-                            .overlay(ProgressView())
-                    }
-                }
-                .frame(width: 176, height: 102)
-                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-
-                if item.duration > 0 {
-                    Text(FocusHistoryCardFormatter.durationText(progress: item.progress, duration: item.duration))
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 5)
-                        .background(Color.black.opacity(0.62))
-                        .clipShape(Capsule())
-                        .padding(8)
-                }
-            }
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text(item.title)
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.primary)
-                    .lineLimit(2)
-                    .multilineTextAlignment(.leading)
-
-                Text(item.authorName)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-        }
-        .frame(width: 176, alignment: .leading)
-    }
-}
-
-private struct FocusMyFolderSection: View {
-    let folder: FocusMyFolder
-    let onOpenFolder: () -> Void
-    let onOpenVideo: (URL) -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 12) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(folder.title)
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.primary)
-                        .lineLimit(2)
-
-                    Text("\(folder.mediaCount) 个内容")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                Spacer(minLength: 0)
-
-                Button("更多") {
-                    onOpenFolder()
-                }
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(FocusDesign.primary)
-            }
-
-            if !folder.previews.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 12) {
-                        ForEach(folder.previews) { item in
-                            Button {
-                                guard let url = item.videoURL else {
-                                    return
-                                }
-                                onOpenVideo(url)
-                            } label: {
-                                FocusMyFavoriteCard(item: item)
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                    .padding(.vertical, 2)
-                }
-            }
-        }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(Color(uiColor: .secondarySystemGroupedBackground))
-        )
-    }
-}
-
-private struct FocusMyFavoriteCard: View {
-    let item: FocusMyFavoriteItem
-
-    var body: some View {
-        FocusTwoColumnVideoCard(content: .init(favorite: item))
-            .frame(width: 176)
-    }
-}
-
 struct FocusHistoryView: View {
     @ObservedObject var viewModel: FocusHistoryViewModel
     let onOpenVideo: (URL) -> Void
+    @State private var pendingDelete: FocusMyHistoryItem?
+    @State private var confirmsClear = false
 
     private let columns = [
         GridItem(.flexible(), spacing: 10),
@@ -4273,6 +4296,27 @@ struct FocusHistoryView: View {
 
     var body: some View {
         content
+            .searchable(text: $viewModel.query, prompt: "搜索播放历史")
+            .submitLabel(.search)
+            .onSubmit(of: .search, viewModel.submitSearch)
+            .onChange(of: viewModel.query) { _ in viewModel.clearSearchIfNeeded() }
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("清空", role: .destructive) { confirmsClear = true }.disabled(viewModel.isMutating)
+                }
+            }
+            .confirmationDialog(confirmsClear ? "清空全部播放历史？" : "删除这条播放历史？", isPresented: Binding(get: { confirmsClear || pendingDelete != nil }, set: { if !$0 { confirmsClear = false; pendingDelete = nil } }), titleVisibility: .visible) {
+                Button(confirmsClear ? "清空全部" : "删除", role: .destructive) {
+                    if confirmsClear { viewModel.clear() } else if let item = pendingDelete { viewModel.delete(item) }
+                    confirmsClear = false; pendingDelete = nil
+                }
+            } message: {
+                Text(confirmsClear ? "将删除 B 站账号全部播放历史，不仅是当前搜索结果，无法撤销。" : "这条记录将从 B 站账号的播放历史中移除。")
+            }
+            .alert("操作失败", isPresented: Binding(get: { viewModel.actionError != nil }, set: { if !$0 { viewModel.actionError = nil } })) {
+                Button("知道了", role: .cancel) { viewModel.actionError = nil }
+            } message: { Text(viewModel.actionError ?? "") }
+            .overlay { if viewModel.isMutating { ProgressView("正在更新历史…") } }
             .task {
                 viewModel.loadIfNeeded()
             }
@@ -4304,15 +4348,15 @@ struct FocusHistoryView: View {
         case let .loaded(items):
             if items.isEmpty {
                 FocusStateView(
-                    title: "暂无播放历史",
-                    message: "开始播放视频后，这里会显示最近看过的内容。",
+                    title: viewModel.isSearchingHistory ? "未找到相关历史" : "暂无播放历史",
+                    message: viewModel.isSearchingHistory ? "换个关键词再试试。" : "开始播放视频后，这里会显示最近看过的内容。",
                     buttonTitle: "刷新",
                     action: viewModel.reload
                 )
             } else {
                 ScrollView {
                     LazyVGrid(columns: columns, spacing: 10) {
-                        ForEach(items) { item in
+                        ForEach(viewModel.visibleItems) { item in
                             Button {
                                 guard let url = item.videoURL else {
                                     return
@@ -4322,6 +4366,9 @@ struct FocusHistoryView: View {
                                 FocusHistoryGridCard(item: item)
                             }
                             .buttonStyle(.plain)
+                            .contextMenu {
+                                if !item.historyKey.isEmpty { Button("删除记录", systemImage: "trash", role: .destructive) { pendingDelete = item } }
+                            }
                             .onAppear {
                                 viewModel.loadMoreIfNeeded(currentItemID: item.id)
                             }
@@ -4332,6 +4379,13 @@ struct FocusHistoryView: View {
                                 .frame(maxWidth: .infinity)
                                 .padding(.top, 6)
                                 .gridCellColumns(columns.count)
+                        }
+                        if let message = viewModel.loadMoreError {
+                            Text(message).font(.footnote).foregroundStyle(.secondary).gridCellColumns(columns.count)
+                        }
+                        if viewModel.canLoadMore {
+                            Button(viewModel.loadMoreError == nil ? "加载更多记录" : "重试", action: viewModel.loadMore)
+                                .disabled(viewModel.isLoadingMore || viewModel.isMutating).gridCellColumns(columns.count)
                         }
                     }
                     .padding(.horizontal, 16)
@@ -4369,6 +4423,9 @@ private struct FocusHistoryGridCard: View {
 struct FocusFavoriteFolderView: View {
     @ObservedObject var viewModel: FocusFavoriteFolderViewModel
     let onOpenVideo: (URL) -> Void
+    @State private var pendingRemove: FocusMyFavoriteItem?
+    @State private var transferItem: FocusMyFavoriteItem?
+    @State private var copiesItem = false
 
     private let columns = [
         GridItem(.flexible(), spacing: 10),
@@ -4377,6 +4434,25 @@ struct FocusFavoriteFolderView: View {
 
     var body: some View {
         content
+            .overlay { if viewModel.isMutating { ProgressView("正在更新收藏…") } }
+            .confirmationDialog("移除这条收藏？", isPresented: Binding(get: { pendingRemove != nil }, set: { if !$0 { pendingRemove = nil } }), titleVisibility: .visible) {
+                Button("取消", role: .cancel) { pendingRemove = nil }
+                Button("移除", role: .destructive) { if let item = pendingRemove { viewModel.remove(item) }; pendingRemove = nil }
+            }
+            .alert("操作失败", isPresented: Binding(get: { viewModel.actionError != nil }, set: { if !$0 { viewModel.actionError = nil } })) {
+                Button("知道了", role: .cancel) { viewModel.actionError = nil }
+            } message: { Text(viewModel.actionError ?? "") }
+            .sheet(item: $transferItem) { item in
+                NavigationStack {
+                    List(viewModel.transferTargets) { target in
+                        Button(target.title) { viewModel.transfer(item, to: target, copy: copiesItem); transferItem = nil }
+                    }
+                    .overlay { if viewModel.transferTargets.isEmpty && !viewModel.isMutating { Text("暂无其他收藏夹").foregroundStyle(.secondary) } }
+                    .overlay { if viewModel.isMutating { ProgressView() } }
+                    .navigationTitle(copiesItem ? "复制到收藏夹" : "移动到收藏夹")
+                    .toolbar { ToolbarItem(placement: .cancellationAction) { Button("取消") { transferItem = nil } } }
+                }
+            }
     }
 
     @ViewBuilder
@@ -4415,6 +4491,13 @@ struct FocusFavoriteFolderView: View {
                             FocusTwoColumnVideoCard(content: .init(favorite: item))
                         }
                         .buttonStyle(.plain)
+                        .contextMenu {
+                            if item.aid > 0 {
+                                Button("移动到…", systemImage: "folder") { copiesItem = false; transferItem = item; viewModel.loadTransferTargets() }
+                                Button("复制到…", systemImage: "doc.on.doc") { copiesItem = true; transferItem = item; viewModel.loadTransferTargets() }
+                                Button("移除收藏", systemImage: "trash", role: .destructive) { pendingRemove = item }
+                            }
+                        }
                         .onAppear {
                             viewModel.loadMoreIfNeeded(currentItemID: item.id)
                         }

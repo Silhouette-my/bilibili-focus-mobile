@@ -10,6 +10,60 @@ import XCTest
 
 @MainActor
 final class FocusFirstFramePresentationTests: XCTestCase {
+    private func makeIdleProgressModel() -> FocusNativeVideoViewModel {
+        let cookies = PlayerControlsTestCookies()
+        return FocusNativeVideoViewModel(
+            detailService: FocusVideoDetailService(cookieProvider: cookies, requestLoader: PlayerControlsTestAPI.response),
+            actionService: FocusVideoActionService(cookieProvider: cookies, requestLoader: PlayerControlsTestAPI.response),
+            playbackProgressStore: FocusPlaybackProgressStore(persistence: PlayerControlsTestPersistence()),
+            nativeDanmakuEnabled: false, nativeSubtitleEnabled: false
+        )
+    }
+
+    func testPureProgressTicksDoNotInvalidateDetailAndCommentSubscribers() {
+        let model = makeIdleProgressModel()
+        var modelChanges = 0
+        var progressChanges = 0
+        var positions: [Int64] = []
+        let modelSubscription = model.objectWillChange.sink { modelChanges += 1 }
+        let progressSubscription = model.playbackProgress.objectWillChange.sink { progressChanges += 1 }
+        let valuesSubscription = model.playbackProgress.$positionMilliseconds.dropFirst().sink { positions.append($0) }
+        defer { modelSubscription.cancel(); progressSubscription.cancel(); valuesSubscription.cancel() }
+        for position: Int64 in [1_000, 2_000, 4_500] {
+            model.publishFixturePlaybackPosition(position)
+        }
+        XCTAssertEqual(modelChanges, 0)
+        XCTAssertEqual(progressChanges, 3)
+        XCTAssertEqual(positions, [1_000, 2_000, 4_500])
+        XCTAssertEqual(model.playbackPositionMilliseconds, 4_500)
+        model.isFullscreen = true
+        XCTAssertEqual(modelChanges, 1, "business changes must still invalidate detail/comment observers")
+    }
+
+    func testControlsAndPausedSubtitleOverlayStillReceiveProgressTicks() async throws {
+        let model = makeIdleProgressModel()
+        var controlPositions: [Int64] = []
+        var subtitlePositions: [Int64] = []
+        var controls = FocusNativePlaybackControls(viewModel: model, isFullscreen: false)
+        controls.onFixtureProgressRender = { controlPositions.append($0) }
+        var subtitle = FocusNativeSubtitleOverlay(viewModel: model, isFullscreen: false, bottomInset: 0)
+        subtitle.onFixtureProgressRender = { subtitlePositions.append($0) }
+        let host = UIHostingController(rootView: ZStack { controls; subtitle })
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 393, height: 222))
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        window.layoutIfNeeded()
+        defer { window.isHidden = true; window.rootViewController = nil }
+        try await Task.sleep(nanoseconds: 100_000_000)
+        for position: Int64 in [1_000, 4_500] {
+            model.publishFixturePlaybackPosition(position)
+            try await Task.sleep(nanoseconds: 100_000_000)
+            host.view.layoutIfNeeded()
+            XCTAssertTrue(controlPositions.contains(position), "controls missed position \(position)")
+            XCTAssertTrue(subtitlePositions.contains(position), "paused subtitles missed progress invalidation \(position)")
+        }
+    }
+
     func testControlTimeLabelsAndRenderedLayouts() async throws {
         XCTAssertEqual(FocusNativePlaybackControls.timestamp(0), "00:00")
         XCTAssertEqual(FocusNativePlaybackControls.timestamp(125_000), "02:05")
@@ -95,8 +149,9 @@ final class FocusFirstFramePresentationTests: XCTestCase {
             let rateObservation = model.$playbackRate.sink { events.append("rate=\($0)") }
             let playObservation = model.$isPlaying.sink { events.append("playing=\($0)") }
             let qualityObservation = model.$selectedQuality.sink { events.append("quality=\($0)") }
+            let progressObservation = model.playbackProgress.$positionMilliseconds.sink { events.append("position=\($0)") }
             defer {
-                rateObservation.cancel(); playObservation.cancel(); qualityObservation.cancel()
+                rateObservation.cancel(); playObservation.cancel(); qualityObservation.cancel(); progressObservation.cancel()
                 let trace = XCTAttachment(string: events.joined(separator: "\n"))
                 trace.name = "interactive-player-state-events"
                 trace.lifetime = .keepAlways
@@ -222,6 +277,53 @@ final class FocusFirstFramePresentationTests: XCTestCase {
         coordinator.change(slider)
         XCTAssertEqual(position, Double(slider.value))
         XCTAssertEqual(phases, [true, false, true, false])
+    }
+
+    func testTimelineTrackPressDragAndCancellationUseNativeControlEvents() async throws {
+        var position: Double = 20
+        var phases: [Bool] = []
+        let control = FocusPlaybackSeekSlider(value: Binding(get: { position }, set: { position = $0 }),
+                                             maximum: 100, tint: .pink,
+                                             onEditingChanged: { phases.append($0) })
+        let host = UIHostingController(rootView: control.frame(width: 300, height: 44))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 320, height: 180))
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        window.layoutIfNeeded()
+        defer { window.isHidden = true; window.rootViewController = nil }
+        await Task.yield()
+        host.view.layoutIfNeeded()
+        let slider = try XCTUnwrap(Self.seekSlider(in: host.view))
+        XCTAssertEqual(slider.bounds.height, 44, accuracy: 1)
+        for verticalOffset: CGFloat in [-18, 0, 18] {
+            let point = CGPoint(x: slider.bounds.midX, y: slider.bounds.midY + verticalOffset)
+            let hit = window.hitTest(slider.convert(point, to: window), with: nil)
+            XCTAssertTrue(hit === slider || hit?.isDescendant(of: slider) == true,
+                          "The full 44pt timeline, not just its 10pt thumb, must receive touches")
+        }
+
+        XCTAssertTrue(slider.beginScrubbing(at: slider.bounds.midX))
+        XCTAssertEqual(position, 50, accuracy: 1)
+        slider.sendActions(for: .touchDown) // UIKit may emit the touch phase too.
+        slider.moveThumb(to: slider.bounds.maxX + 50)
+        XCTAssertEqual(position, 100)
+        XCTAssertEqual(phases, [true], "Moving the thumb must not commit a seek")
+        slider.endTracking(nil, with: nil)
+        slider.sendActions(for: .touchUpInside)
+        XCTAssertEqual(phases, [true, false], "Release commits once")
+
+        XCTAssertTrue(slider.beginScrubbing(at: -50))
+        XCTAssertEqual(position, 0)
+        slider.cancelTracking(with: nil)
+        XCTAssertEqual(phases, [true, false, true, false])
+        slider.isEnabled = false
+        XCTAssertFalse(slider.beginScrubbing(at: slider.bounds.midX))
+        XCTAssertEqual(phases.count, 4)
+    }
+
+    private static func seekSlider(in view: UIView) -> FocusVideoSeekSlider? {
+        if let slider = view as? FocusVideoSeekSlider { return slider }
+        return view.subviews.lazy.compactMap { seekSlider(in: $0) }.first
     }
 
     func testReadyEventArrivingBeforeItemEventIsNotLost() async {

@@ -3,6 +3,7 @@ package org.bilibilifocus.core.service
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import org.bilibilifocus.core.cookie.CookieProvider
+import org.bilibilifocus.core.cookie.CookieRequestPolicy
 import org.bilibilifocus.core.model.HistoryItem
 import org.bilibilifocus.core.model.HistoryPage
 
@@ -35,7 +36,23 @@ class HistoryService(
             if (viewAt > 0) append("&view_at=$viewAt")
         }
         val url = BiliApiContractCatalog.require("user.info.history_new").url + "?$params"
+        val data = requestData(url)
+        return HistoryPage(
+            items = decodeItems(data),
+            nextMax = data.longValueAt("cursor", "max") ?: 0L,
+            nextViewAt = data.longValueAt("cursor", "view_at") ?: 0L,
+            nextBusiness = data.stringValueAt("cursor", "business") ?: "",
+        )
+    }
 
+    suspend fun searchHistory(keyword: String, page: Int = 1): List<HistoryItem> {
+        require(keyword.isNotBlank() && page > 0)
+        val url = BiliApiContractCatalog.require("history.info.search").url +
+            "?keyword=${rfc3986Encode(keyword)}&pn=$page&business=all"
+        return decodeItems(requestData(url))
+    }
+
+    private suspend fun requestData(url: String): JsonObject {
         val response = httpClient.get(url, buildHeaders(url))
         if (response.statusCode !in 200..299) throw ServiceError.InvalidResponse
 
@@ -45,9 +62,12 @@ class HistoryService(
         if (code == -101) throw ServiceError.LoginRequired
         if (code != 0) throw ServiceError.Api(code, payload.stringValueAt("message") ?: "未知错误")
 
-        val data = payload.dictionaryValueAt("data") ?: throw ServiceError.InvalidResponse
-        val list = payload.arrayValueAt("data", "list") ?: emptyList()
-        val items = list.mapNotNull { element ->
+        return payload.dictionaryValueAt("data") ?: throw ServiceError.InvalidResponse
+    }
+
+    private fun decodeItems(data: JsonObject): List<HistoryItem> {
+        val list = data.arrayValueAt("list") ?: emptyList()
+        return list.mapNotNull { element ->
             val dict = element as? JsonObject ?: return@mapNotNull null
             val history = dict.dictionaryValueAt("history")
             val cover = dict.stringValueAt("cover")?.takeIf { it.isNotEmpty() }
@@ -63,15 +83,44 @@ class HistoryService(
                 viewAt = dict.longValueAt("view_at") ?: 0L,
                 progress = dict.longValueAt("progress") ?: 0L,
                 duration = dict.longValueAt("duration") ?: 0L,
+                historyKey = if (history?.stringValueAt("business") == "archive") {
+                    dict.stringValueAt("kid")?.takeIf { Regex("archive_[0-9]+").matches(it) }
+                        ?: (dict.longValueAt("kid") ?: history.longValueAt("oid"))?.takeIf { it > 0 }?.let { "archive_$it" }.orEmpty()
+                } else "",
             )
         }
 
-        return HistoryPage(
-            items = items,
-            nextMax = data.longValueAt("cursor", "max") ?: 0L,
-            nextViewAt = data.longValueAt("cursor", "view_at") ?: 0L,
-            nextBusiness = data.stringValueAt("cursor", "business") ?: "",
-        )
+    }
+
+    suspend fun authenticatedMID(): Long {
+        val url = BiliApiContractCatalog.require("user.info.history_new").url
+        return CookieRequestPolicy.matchingCookies(cookieProvider.loadCookies(), url)
+            .firstOrNull { it.name == "DedeUserID" }?.value?.toLongOrNull() ?: throw ServiceError.LoginRequired
+    }
+
+    suspend fun deleteHistory(key: String, expectedMID: Long) {
+        require(Regex("archive_[0-9]+").matches(key)) { "这条记录暂不支持删除" }
+        mutate("history.operate.delete", mapOf("kid" to key), expectedMID)
+    }
+
+    suspend fun clearHistory(expectedMID: Long) = mutate("history.operate.clear", emptyMap(), expectedMID)
+
+    private suspend fun mutate(key: String, fields: Map<String, String>, expectedMID: Long) {
+        val url = BiliApiContractCatalog.require(key).url
+        val cookies = CookieRequestPolicy.matchingCookies(cookieProvider.loadCookies(), url)
+        if (cookies.firstOrNull { it.name == "DedeUserID" }?.value?.toLongOrNull() != expectedMID ||
+            cookies.none { it.name == "SESSDATA" && it.value.isNotBlank() }) throw ServiceError.LoginRequired
+        val csrf = cookies.firstOrNull { it.name == "bili_jct" }?.value?.takeIf { it.isNotBlank() } ?: throw ServiceError.LoginRequired
+        val body = (fields + ("csrf" to csrf)).entries.sortedBy { it.key }.joinToString("&") { "${rfc3986Encode(it.key)}=${rfc3986Encode(it.value)}" }
+        val response = httpClient.post(url, body, cookieProvider.attachCookies(mapOf(
+            "User-Agent" to userAgent, "Referer" to "https://www.bilibili.com/", "Origin" to "https://www.bilibili.com",
+            "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
+        ), cookies, url))
+        if (response.statusCode !in 200..299) throw ServiceError.InvalidResponse
+        val payload = json.parseToJsonElement(response.body) as? JsonObject ?: throw ServiceError.InvalidResponse
+        val code = payload.intValueAt("code") ?: -1
+        if (code == -101) throw ServiceError.LoginRequired
+        if (code != 0) throw ServiceError.Api(code, payload.stringValueAt("message") ?: "操作失败")
     }
 
     private suspend fun buildHeaders(targetUrl: String): Map<String, String> {

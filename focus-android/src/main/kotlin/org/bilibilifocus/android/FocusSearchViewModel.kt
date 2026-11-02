@@ -44,7 +44,7 @@ class FocusSearchViewModel internal constructor(
     private var loadMoreJob: Job? = null
 
     private var currentQuery: SearchQuery? = null
-    private var nextVideoPage: Int? = null
+    private var nextPage: Int? = null
     private var requestGeneration: Long = 0
     var selectedFilter: SearchResultFilter = SearchResultFilter.ALL
         private set
@@ -56,6 +56,8 @@ class FocusSearchViewModel internal constructor(
 
     private val _isLoadingMore = MutableStateFlow(false)
     val isLoadingMore: StateFlow<Boolean> = _isLoadingMore.asStateFlow()
+    private val _loadMoreError = MutableStateFlow<String?>(null)
+    val loadMoreError: StateFlow<String?> = _loadMoreError.asStateFlow()
 
     fun search(keyword: String) {
         val trimmed = keyword.trim()
@@ -86,48 +88,62 @@ class FocusSearchViewModel internal constructor(
 
     fun loadMoreIfNeeded(currentItemID: String) {
         val sections = (_state.value as? SearchUiState.Loaded)?.sections ?: return
-        if (_isLoadingMore.value) return
+        if (_isLoadingMore.value || _loadMoreError.value != null) return
 
-        val videoSection = sections.find { it.filter == SearchResultFilter.VIDEO } ?: return
-        val index = videoSection.items.indexOfLast { it.id == currentItemID }
-        if (index < 0 || index < videoSection.items.size - 4) return
+        val filter = if (selectedFilter == SearchResultFilter.ALL) SearchResultFilter.VIDEO else selectedFilter
+        val section = sections.find { it.filter == filter } ?: return
+        val index = section.items.indexOfLast { it.id == currentItemID }
+        if (index < 0 || index < section.items.size - 4) return
 
         val query = currentQuery ?: return
-        val page = nextVideoPage ?: return
-        val sort = selectedVideoSort
+        val page = nextPage ?: return
+        val sort = if (selectedFilter == SearchResultFilter.VIDEO) selectedVideoSort else SearchVideoSortOption.DEFAULT
         val generation = requestGeneration
 
         _isLoadingMore.value = true
         loadMoreJob?.cancel()
         loadMoreJob = scope.launch {
             try {
-                val newPage = pageFetcher.fetchPage(query, SearchResultFilter.VIDEO, page, sort)
+                val newPage = pageFetcher.fetchPage(query, filter, page, sort)
                 if (generation != requestGeneration) return@launch
-                nextVideoPage = newPage.nextPage
-                val incomingVideoItems = newPage.sections
-                    .firstOrNull { it.filter == SearchResultFilter.VIDEO }
+                val incomingItems = newPage.sections
+                    .firstOrNull { it.filter == filter }
                     ?.items
                     .orEmpty()
-                    .filter { it.kind == SearchResultItem.Kind.VIDEO }
-                val mergedVideoItems = (videoSection.items + incomingVideoItems)
+                val mergedItems = (section.items + incomingItems)
                     .distinctBy { it.id }
+                nextPage = newPage.nextPage?.takeIf { it > page && mergedItems.size > section.items.size }
                 val mergedSection = SearchResultSection(
-                    filter = SearchResultFilter.VIDEO,
-                    items = mergedVideoItems,
+                    filter = filter,
+                    items = mergedItems,
                 )
                 val mergedSections = sections.map {
-                    if (it.filter == SearchResultFilter.VIDEO) mergedSection else it
+                    if (it.filter == filter) mergedSection else it
                 }
                 _state.value = SearchUiState.Loaded(mergedSections)
             } catch (e: CancellationException) {
                 throw e
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                if (generation == requestGeneration) _loadMoreError.value = e.message ?: "加载更多失败"
             } finally {
                 if (generation == requestGeneration) {
                     _isLoadingMore.value = false
                 }
             }
         }
+    }
+
+    fun retryLoadMore() {
+        val sections = (_state.value as? SearchUiState.Loaded)?.sections ?: return
+        val filter = if (selectedFilter == SearchResultFilter.ALL) SearchResultFilter.VIDEO else selectedFilter
+        val lastItem = sections.firstOrNull { it.filter == filter }?.items?.lastOrNull() ?: return
+        _loadMoreError.value = null
+        loadMoreIfNeeded(lastItem.id)
+    }
+
+    fun reload() {
+        val query = currentQuery ?: return
+        loadFirstPage(query, selectedFilter, selectedVideoSort)
     }
 
     private fun loadFirstPage(
@@ -140,17 +156,15 @@ class FocusSearchViewModel internal constructor(
         searchJob?.cancel()
         loadMoreJob?.cancel()
         _isLoadingMore.value = false
-        nextVideoPage = null
+        _loadMoreError.value = null
+        nextPage = null
 
         searchJob = scope.launch {
             _state.value = SearchUiState.Loading
             try {
                 val page = pageFetcher.fetchPage(query, filter, 1, videoSort)
                 if (generation != requestGeneration) return@launch
-                nextVideoPage = when (filter) {
-                    SearchResultFilter.ALL, SearchResultFilter.VIDEO -> page.nextPage
-                    else -> null
-                }
+                nextPage = page.nextPage
                 _state.value = if (page.sections.isEmpty()) {
                     SearchUiState.Empty
                 } else {

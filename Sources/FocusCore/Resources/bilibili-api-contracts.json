@@ -3,7 +3,12 @@
   "source": {
     "repository": "https://github.com/Nemo2011/bilibili-api",
     "validatedCommit": "87110fe2db7af77425057e163f064700087a3c35",
-    "strategy": "Independently maintained facts-only subset; validated against the sibling repository without redistributing its API catalog."
+    "strategy": "Independently maintained facts-only subset. Core endpoints are checked against the sibling repository; supplemental endpoints have separately recorded documentation and are not reported as sibling-validated.",
+    "supplementalEndpoints": {
+      "history.info.search": "https://github.com/yearzen1/bilibili-pure-apk/blob/master/app/src/main/java/com/bilibili/pure/data/api/BilibiliApi.kt#L87-L93",
+      "history.operate.delete": "https://github.com/BACNext/bilibili-API-collect-backup/blob/master/docs/historytoview/history.md#删除历史记录",
+      "history.operate.clear": "https://github.com/BACNext/bilibili-API-collect-backup/blob/master/docs/historytoview/history.md#清空历史记录"
+    }
   },
   "endpoints": {
     "article.info.detail": {
@@ -11,6 +16,20 @@
       "method": "GET",
       "verify": false,
       "wbi": false,
+      "noCsrf": false
+    },
+    "common.comment.del": {
+      "url": "https://api.bilibili.com/x/v2/reply/del",
+      "method": "POST",
+      "verify": true,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "common.comment.send": {
+      "url": "https://api.bilibili.com/x/v2/reply/add",
+      "method": "POST",
+      "verify": true,
+      "wbi": true,
       "noCsrf": false
     },
     "common.comment.like": {
@@ -76,6 +95,69 @@
       "wbi": false,
       "noCsrf": false
     },
+    "favorite-list.operate.new": {
+      "url": "https://api.bilibili.com/x/v3/fav/folder/add",
+      "method": "POST",
+      "verify": true,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "favorite-list.operate.modify": {
+      "url": "https://api.bilibili.com/x/v3/fav/folder/edit",
+      "method": "POST",
+      "verify": true,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "favorite-list.operate.delete": {
+      "url": "https://api.bilibili.com/x/v3/fav/folder/del",
+      "method": "POST",
+      "verify": true,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "favorite-list.operate.content_copy": {
+      "url": "https://api.bilibili.com/x/v3/fav/resource/copy",
+      "method": "POST",
+      "verify": true,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "favorite-list.operate.content_move": {
+      "url": "https://api.bilibili.com/x/v3/fav/resource/move",
+      "method": "POST",
+      "verify": true,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "favorite-list.operate.content_rm": {
+      "url": "https://api.bilibili.com/x/v3/fav/resource/batch-del",
+      "method": "POST",
+      "verify": true,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "history.info.search": {
+      "url": "https://api.bilibili.com/x/web-interface/history/search",
+      "method": "GET",
+      "verify": true,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "history.operate.delete": {
+      "url": "https://api.bilibili.com/x/v2/history/delete",
+      "method": "POST",
+      "verify": true,
+      "wbi": false,
+      "noCsrf": false
+    },
+    "history.operate.clear": {
+      "url": "https://api.bilibili.com/x/v2/history/clear",
+      "method": "POST",
+      "verify": true,
+      "wbi": false,
+      "noCsrf": false
+    },
     "homepage.info.videos": {
       "url": "https://api.bilibili.com/x/web-interface/wbi/index/top/feed/rcmd",
       "method": "GET",
@@ -123,34 +205,6 @@
       "method": "GET",
       "verify": false,
       "wbi": true,
-      "noCsrf": false
-    },
-    "toview.info.list": {
-      "url": "https://api.bilibili.com/x/v2/history/toview",
-      "method": "GET",
-      "verify": true,
-      "wbi": false,
-      "noCsrf": false
-    },
-    "toview.operate.add": {
-      "url": "https://api.bilibili.com/x/v2/history/toview/add",
-      "method": "POST",
-      "verify": true,
-      "wbi": false,
-      "noCsrf": false
-    },
-    "toview.operate.clear": {
-      "url": "https://api.bilibili.com/x/v2/history/toview/clear",
-      "method": "POST",
-      "verify": true,
-      "wbi": false,
-      "noCsrf": false
-    },
-    "toview.operate.del": {
-      "url": "https://api.bilibili.com/x/v2/history/toview/del",
-      "method": "POST",
-      "verify": true,
-      "wbi": false,
       "noCsrf": false
     },
     "user.info.all_followings": {

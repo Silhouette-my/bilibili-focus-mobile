@@ -1,17 +1,97 @@
 package org.bilibilifocus.android
 
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.test.runCurrent
 import org.bilibilifocus.core.model.HistoryItem
 import org.bilibilifocus.core.model.HistoryPage
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertTrue
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class FocusHistoryViewModelTests {
+    @Test
+    fun `remote search waits for submit paginates by pn and clearing restores cursor history`() = runTest {
+        var historyRequests = 0
+        val searches = mutableListOf<Pair<String, Int>>()
+        val viewModel = FocusHistoryViewModel(
+            pageFetcher = HistoryPageFetcher { _, _, _ -> historyRequests++; historyPage(listOf(historyItem("normal", 1))) },
+            dispatcher = StandardTestDispatcher(testScheduler),
+            searchFetcher = HistorySearchFetcher { keyword, page ->
+                searches += keyword to page
+                if (page <= 2) listOf(historyItem("remote$page", page.toLong())) else emptyList()
+            },
+        )
+        try {
+            viewModel.setQuery("  remote keyword  ")
+            advanceUntilIdle()
+            assertTrue(searches.isEmpty())
+            viewModel.submitSearch(); advanceUntilIdle()
+            assertEquals(listOf("remote1"), viewModel.loadedBvids())
+            viewModel.loadMore(); advanceUntilIdle()
+            assertEquals(listOf("remote1", "remote2"), viewModel.loadedBvids())
+            viewModel.loadMore(); advanceUntilIdle()
+            assertFalse((viewModel.state.value as HistoryUiState.Loaded).hasMore)
+            assertEquals(listOf("remote keyword" to 1, "remote keyword" to 2, "remote keyword" to 3), searches)
+            viewModel.setQuery(""); advanceUntilIdle()
+            assertEquals(listOf("normal"), viewModel.loadedBvids())
+            assertEquals(1, historyRequests)
+            assertFalse(viewModel.isSearchingHistory)
+        } finally { viewModel.onCleared() }
+    }
+
+    @Test
+    fun `remote search append error retains page then duplicate-only retry terminates`() = runTest {
+        var pageTwoAttempts = 0
+        val requests = mutableListOf<Int>()
+        val viewModel = FocusHistoryViewModel(
+            pageFetcher = HistoryPageFetcher { _, _, _ -> error("Search must not use cursor endpoint") },
+            dispatcher = StandardTestDispatcher(testScheduler),
+            searchFetcher = HistorySearchFetcher { _, page ->
+                requests += page
+                if (page == 2 && pageTwoAttempts++ == 0) error("temporary search failure")
+                listOf(historyItem("duplicate", 100))
+            },
+        )
+        try {
+            viewModel.setQuery("duplicate"); viewModel.submitSearch(); advanceUntilIdle()
+            viewModel.loadMore(); advanceUntilIdle()
+            assertEquals("temporary search failure", (viewModel.state.value as HistoryUiState.Loaded).appendError)
+            assertEquals(listOf("duplicate"), viewModel.loadedBvids())
+            viewModel.loadMore(); advanceUntilIdle()
+            assertFalse((viewModel.state.value as HistoryUiState.Loaded).hasMore)
+            viewModel.loadMore(); advanceUntilIdle()
+            assertEquals(listOf(1, 2, 2), requests)
+        } finally { viewModel.onCleared() }
+    }
+
+    @Test
+    fun `late cancelled search cannot replace a newer query`() = runTest {
+        val releaseOld = CompletableDeferred<Unit>()
+        val viewModel = FocusHistoryViewModel(
+            pageFetcher = HistoryPageFetcher { _, _, _ -> historyPage(emptyList()) },
+            dispatcher = StandardTestDispatcher(testScheduler),
+            searchFetcher = HistorySearchFetcher { keyword, _ ->
+                if (keyword == "old") withContext(NonCancellable) { releaseOld.await() }
+                listOf(historyItem(keyword, 100))
+            },
+        )
+        try {
+            viewModel.setQuery("old"); viewModel.submitSearch(); runCurrent()
+            viewModel.setQuery("new"); viewModel.submitSearch(); advanceUntilIdle()
+            assertEquals(listOf("new"), viewModel.loadedBvids())
+            releaseOld.complete(Unit); advanceUntilIdle()
+            assertEquals(listOf("new"), viewModel.loadedBvids())
+        } finally { releaseOld.complete(Unit); viewModel.onCleared() }
+    }
+
     @Test
     fun `pager forwards history cursor deduplicates and stops a repeated cursor`() = runTest {
         val requests = mutableListOf<HistoryRequest>()

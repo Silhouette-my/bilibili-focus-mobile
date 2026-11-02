@@ -29,6 +29,9 @@ struct FocusNativeVideoDetailView: View {
             .fullScreenCover(item: $commentGalleryRequest) { request in
                 FocusImageGalleryView(request: request)
             }
+            .sheet(isPresented: $viewModel.showsCommentComposer) {
+                FocusNativeCommentComposer(viewModel: viewModel)
+            }
             .alert(
                 "操作未完成",
                 isPresented: Binding(
@@ -181,6 +184,7 @@ struct FocusNativeVideoDetailView: View {
             if !viewModel.isFullscreen {
                 FocusNativePlaybackControls(viewModel: viewModel, isFullscreen: false, title: detail.title,
                                             accentColor: accentColor,
+                                            onShowSystemControls: viewModel.requestSystemPlaybackControls,
                                             onBottomOcclusionChange: { controlsBottomInset = $0 })
                 FocusNativeSubtitleOverlay(viewModel: viewModel, isFullscreen: false, bottomInset: controlsBottomInset)
                     .allowsHitTesting(false)
@@ -208,6 +212,13 @@ struct FocusNativeVideoDetailView: View {
                 .padding(20)
                 .background(.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
                 .padding(24)
+            } else if let message = viewModel.playbackRecoveryMessage {
+                Text(message)
+                    .font(.footnote.weight(.medium))
+                    .foregroundStyle(.white)
+                    .padding(10)
+                    .background(.black.opacity(0.7), in: Capsule())
+                    .allowsHitTesting(false)
             }
         }
         .frame(maxWidth: .infinity)
@@ -481,10 +492,23 @@ struct FocusNativeVideoDetailView: View {
 
     @ViewBuilder
     private var commentsSection: some View {
-        if !viewModel.comments.isEmpty || viewModel.commentsErrorMessage != nil {
+        if viewModel.detail != nil {
             Group {
-                Text("评论 · \(viewModel.displayedCommentCount)")
-                    .font(.headline)
+                HStack {
+                    Text("评论 · \(viewModel.displayedCommentCount)").font(.headline)
+                    Spacer()
+                    Button { viewModel.composeComment() } label: {
+                        Label("写评论", systemImage: "square.and.pencil")
+                    }
+                    .disabled(!viewModel.canComposeComment)
+                }
+                if viewModel.comments.isEmpty, viewModel.commentsErrorMessage == nil {
+                    if viewModel.hasLoadedComments {
+                        Text("还没有评论，来聊聊吧").font(.subheadline).foregroundStyle(.secondary)
+                    } else {
+                        ProgressView("正在加载评论…").font(.subheadline)
+                    }
+                }
                 ForEach(viewModel.comments) { comment in
                     FocusNativeVideoCommentRow(
                         viewModel: viewModel,
@@ -601,6 +625,7 @@ private struct FocusNativeVideoCommentRow: View {
     let comment: FocusVideoComment
     let onOpenURL: (URL) -> Void
     let onOpenImages: ([URL], Int) -> Void
+    @State private var confirmsDeletion = false
 
     var body: some View {
         let thread = viewModel.commentThreadState(for: comment.id)
@@ -649,6 +674,7 @@ private struct FocusNativeVideoCommentRow: View {
                             FocusNativeVideoReplyRow(
                                 viewModel: viewModel,
                                 reply: reply,
+                                rootCommentID: comment.id,
                                 onOpenURL: onOpenURL,
                                 onOpenImages: onOpenImages
                             )
@@ -702,7 +728,12 @@ private struct FocusNativeVideoCommentRow: View {
                         viewModel: viewModel,
                         comment: comment
                     )
-                    if comment.replies > 0 {
+                    Button("回复") { viewModel.composeComment(replyingTo: comment) }
+                    if viewModel.canDeleteComment(comment) {
+                        Button("删除", role: .destructive) { confirmsDeletion = true }
+                            .disabled(viewModel.commentDeletesInFlight.contains(comment.id))
+                    }
+                    if (thread?.totalCount ?? comment.replies) > 0 {
                         Button {
                             viewModel.toggleCommentReplies(comment)
                         } label: {
@@ -720,7 +751,7 @@ private struct FocusNativeVideoCommentRow: View {
                                 Text(
                                     isExpanded
                                         ? "收起回复"
-                                        : "\(FocusNativeVideoFormatting.count(comment.replies)) 回复"
+                                        : "\(FocusNativeVideoFormatting.count(thread?.totalCount ?? comment.replies)) 回复"
                                 )
                             }
                         }
@@ -733,14 +764,19 @@ private struct FocusNativeVideoCommentRow: View {
         }
         .padding(12)
         .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .confirmationDialog("删除这条评论？", isPresented: $confirmsDeletion, titleVisibility: .visible) {
+            Button("删除评论", role: .destructive) { viewModel.deleteComment(comment) }
+        }
     }
 }
 
 private struct FocusNativeVideoReplyRow: View {
     @ObservedObject var viewModel: FocusNativeVideoViewModel
     let reply: FocusVideoComment
+    let rootCommentID: Int64
     let onOpenURL: (URL) -> Void
     let onOpenImages: ([URL], Int) -> Void
+    @State private var confirmsDeletion = false
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
@@ -788,7 +824,62 @@ private struct FocusNativeVideoReplyRow: View {
                     referer: "https://www.bilibili.com/",
                     onSelect: { onOpenImages(reply.imageURLs, $0) }
                 )
+                HStack(spacing: 16) {
+                    Button("回复") { viewModel.composeComment(replyingTo: reply, rootID: rootCommentID) }
+                    if viewModel.canDeleteComment(reply) {
+                        Button("删除", role: .destructive) { confirmsDeletion = true }
+                            .disabled(viewModel.commentDeletesInFlight.contains(reply.id))
+                    }
+                }
+                .font(.caption)
             }
+        }
+        .confirmationDialog("删除这条回复？", isPresented: $confirmsDeletion, titleVisibility: .visible) {
+            Button("删除回复", role: .destructive) { viewModel.deleteComment(reply) }
+        }
+    }
+}
+
+private struct FocusNativeCommentComposer: View {
+    @ObservedObject var viewModel: FocusNativeVideoViewModel
+    @Environment(\.dismiss) private var dismiss
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 12) {
+                if let target = viewModel.commentReplyTarget {
+                    Text("回复 @\(target.authorName)").font(.subheadline).foregroundStyle(.secondary)
+                }
+                TextEditor(text: $viewModel.commentDraft)
+                    .focused($isFocused)
+                    .accessibilityLabel("评论内容")
+                    .disabled(viewModel.isSendingComment)
+                HStack {
+                    if let error = viewModel.commentComposeError {
+                        Text(error).foregroundStyle(.red)
+                    }
+                    Spacer()
+                    Text("\(viewModel.commentDraft.count)/1000").foregroundStyle(.secondary)
+                }
+                .font(.footnote)
+            }
+            .padding()
+            .navigationTitle(viewModel.commentReplyTarget == nil ? "写评论" : "回复评论")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消") { dismiss() }.disabled(viewModel.isSendingComment)
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(action: viewModel.sendComment) {
+                        if viewModel.isSendingComment { ProgressView() } else { Text("发送") }
+                    }
+                    .disabled(viewModel.isSendingComment || viewModel.commentDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || viewModel.commentDraft.count > 1_000)
+                }
+            }
+            .interactiveDismissDisabled(viewModel.isSendingComment)
+            .onAppear { isFocused = true }
         }
     }
 }
@@ -830,12 +921,26 @@ private struct FocusNativeCommentLikeButton: View {
     }
 }
 
-private struct FocusNativeSubtitleOverlay: View {
+struct FocusNativeSubtitleOverlay: View {
     @ObservedObject var viewModel: FocusNativeVideoViewModel
+    @ObservedObject private var playbackProgress: FocusNativePlaybackProgress
     let isFullscreen: Bool
     let bottomInset: CGFloat
+    #if DEBUG
+    var onFixtureProgressRender: ((Int64) -> Void)?
+    #endif
+
+    init(viewModel: FocusNativeVideoViewModel, isFullscreen: Bool, bottomInset: CGFloat) {
+        self.viewModel = viewModel
+        self.playbackProgress = viewModel.playbackProgress
+        self.isFullscreen = isFullscreen
+        self.bottomInset = bottomInset
+    }
 
     var body: some View {
+        #if DEBUG
+        let _ = onFixtureProgressRender?(playbackProgress.positionMilliseconds)
+        #endif
         TimelineView(
             .animation(
                 minimumInterval: 0.1,
@@ -845,7 +950,9 @@ private struct FocusNativeSubtitleOverlay: View {
             let content = viewModel.subtitleText(
                 at: viewModel.subtitlePlaybackPositionMilliseconds
             )
-            FocusNativeSubtitleCaption(content: content, isFullscreen: isFullscreen, bottomInset: bottomInset)
+            FocusNativeSubtitleCaption(content: content, isFullscreen: isFullscreen, bottomInset: bottomInset,
+                                       fontScale: viewModel.playbackPreferences.subtitleFontScale,
+                                       backgroundOpacity: viewModel.playbackPreferences.subtitleBackgroundOpacity)
         }
         .accessibilityHidden(true)
     }
@@ -855,6 +962,8 @@ struct FocusNativeSubtitleCaption: View {
     let content: String
     let isFullscreen: Bool
     let bottomInset: CGFloat
+    var fontScale: Double = 1
+    var backgroundOpacity: Double = 0.72
 
     var body: some View {
             VStack {
@@ -863,7 +972,7 @@ struct FocusNativeSubtitleCaption: View {
                     Text(content)
                         .font(
                             .system(
-                                size: isFullscreen ? 22 : 17,
+                                size: (isFullscreen ? 22 : 17) * fontScale,
                                 weight: .semibold
                             )
                         )
@@ -873,7 +982,7 @@ struct FocusNativeSubtitleCaption: View {
                         .padding(.horizontal, 12)
                         .padding(.vertical, 7)
                         .background(
-                            .black.opacity(0.72),
+                            .black.opacity(backgroundOpacity),
                             in: RoundedRectangle(
                                 cornerRadius: 8,
                                 style: .continuous
@@ -891,15 +1000,26 @@ struct FocusNativeSubtitleCaption: View {
 
 struct FocusNativeDanmakuOverlay: View {
     @ObservedObject var viewModel: FocusNativeVideoViewModel
-    @State private var placements: [FocusNativeDanmakuLayout.Placement] = []
+    @ObservedObject private var playbackProgress: FocusNativePlaybackProgress
+    @State private var layoutCache = FocusNativeDanmakuLayout.SegmentCache()
+
+    init(viewModel: FocusNativeVideoViewModel) {
+        self.viewModel = viewModel
+        self.playbackProgress = viewModel.playbackProgress
+    }
     #if DEBUG
     var onFixtureFrame: ((CFTimeInterval, Int64) -> Void)?
+
+    init(viewModel: FocusNativeVideoViewModel, onFixtureFrame: @escaping (CFTimeInterval, Int64) -> Void) {
+        self.init(viewModel: viewModel)
+        self.onFixtureFrame = onFixtureFrame
+    }
     #endif
 
     var body: some View {
         GeometryReader { geometry in
-            let laneHeight: CGFloat = 32
-            let usableHeight = geometry.size.height * 0.75
+            let laneHeight: CGFloat = 32 * viewModel.playbackPreferences.danmakuFontScale
+            let usableHeight = geometry.size.height * min(viewModel.playbackPreferences.danmakuArea, 0.75)
             let laneCount = max(Int(usableHeight / laneHeight), 1)
             // Let SwiftUI follow the display cadence, including ProMotion.
             // A 30 Hz ceiling makes the travel steps especially visible at 3x.
@@ -910,53 +1030,56 @@ struct FocusNativeDanmakuOverlay: View {
                     #if DEBUG
                     onFixtureFrame?(CACurrentMediaTime(), playbackMilliseconds)
                     #endif
-                    for placement in FocusNativeDanmakuLayout.activePlacements(
-                        in: placements, at: playbackMilliseconds
-                    ) {
-                        let elapsed = playbackMilliseconds - placement.danmaku.progressMilliseconds
+                    for segment in layoutCache.segments {
+                        for placement in FocusNativeDanmakuLayout.activePlacements(
+                            in: segment.placements, at: playbackMilliseconds
+                        ) {
+                            let elapsed = playbackMilliseconds - placement.danmaku.progressMilliseconds
 
-                        let color = FocusNativeDanmakuLayout.color(placement.danmaku.colorRGB)
-                        let fontScale = min(max(CGFloat(placement.danmaku.fontSize) / 25, 0.72), 1.44)
-                        let text = Text(placement.danmaku.content)
-                            .font(.system(size: 18 * fontScale, weight: .semibold))
-                            .foregroundColor(color.opacity(0.94))
-                        let resolvedText = context.resolve(text)
-                        let textSize = resolvedText.measure(
-                            in: CGSize(width: .greatestFiniteMagnitude, height: laneHeight)
-                        )
-                        let x = FocusNativeDanmakuLayout.horizontalPosition(
-                            mode: placement.danmaku.mode, elapsedMilliseconds: elapsed,
-                            viewportWidth: size.width, textWidth: textSize.width
-                        )
-                        let y: CGFloat
-                        switch placement.danmaku.mode {
-                        case .bottom:
-                            y = usableHeight - CGFloat(placement.lane + 1) * laneHeight
-                        case .scrolling, .top:
-                            y = CGFloat(placement.lane) * laneHeight
-                        }
-                        let shadowColor: Color = FocusNativeDanmakuLayout.isDark(color) ? .white : .black
-                        context.drawLayer { layer in
-                            layer.addFilter(
-                                .shadow(
-                                    color: shadowColor.opacity(0.95),
-                                    radius: 2,
-                                    x: 1,
-                                    y: 1
+                            let color = FocusNativeDanmakuLayout.color(placement.danmaku.colorRGB)
+                            let fontScale = min(max(CGFloat(placement.danmaku.fontSize) / 25, 0.72), 1.44)
+                            let text = Text(placement.danmaku.content)
+                                .font(.system(size: 18 * fontScale * viewModel.playbackPreferences.danmakuFontScale, weight: .semibold))
+                                .foregroundColor(color.opacity(viewModel.playbackPreferences.danmakuOpacity))
+                            let resolvedText = context.resolve(text)
+                            let textSize = resolvedText.measure(
+                                in: CGSize(width: .greatestFiniteMagnitude, height: laneHeight)
+                            )
+                            let x = FocusNativeDanmakuLayout.horizontalPosition(
+                                mode: placement.danmaku.mode, elapsedMilliseconds: elapsed,
+                                viewportWidth: size.width, textWidth: textSize.width
+                            )
+                            let y: CGFloat
+                            switch placement.danmaku.mode {
+                            case .bottom:
+                                y = usableHeight - CGFloat(placement.lane + 1) * laneHeight
+                            case .scrolling, .top:
+                                y = CGFloat(placement.lane) * laneHeight
+                            }
+                            let shadowColor: Color = FocusNativeDanmakuLayout.isDark(color) ? .white : .black
+                            context.drawLayer { layer in
+                                layer.addFilter(
+                                    .shadow(
+                                        color: shadowColor.opacity(0.95),
+                                        radius: 2,
+                                        x: 1,
+                                        y: 1
+                                    )
                                 )
-                            )
-                            layer.draw(
-                                resolvedText,
-                                at: CGPoint(x: x, y: max(y, 0)),
-                                anchor: .topLeading
-                            )
+                                layer.draw(
+                                    resolvedText,
+                                    at: CGPoint(x: x, y: max(y, 0)),
+                                    anchor: .topLeading
+                                )
+                            }
                         }
                     }
                 }
             }
             .onAppear { rebuildPlacements(laneCount: laneCount) }
             .onChange(of: laneCount) { rebuildPlacements(laneCount: $0) }
-            .onChange(of: viewModel.danmakus) { _ in rebuildPlacements(laneCount: laneCount) }
+            .onChange(of: viewModel.danmakuSegments.map(\.id)) { _ in rebuildPlacements(laneCount: laneCount) }
+            .onChange(of: viewModel.playbackPreferences.danmakuDensity) { _ in rebuildPlacements(laneCount: laneCount) }
         }
         .opacity(viewModel.isDanmakuEnabled ? 1 : 0)
         .clipped()
@@ -964,9 +1087,7 @@ struct FocusNativeDanmakuOverlay: View {
     }
 
     private func rebuildPlacements(laneCount: Int) {
-        // Player progress publishes several times a second. Only new comments
-        // or a different viewport need to scan and assign the complete timeline.
-        placements = FocusNativeDanmakuLayout.placements(for: viewModel.danmakus, laneCount: laneCount)
+        layoutCache.update(viewModel.danmakuSegments, laneCount: laneCount, density: viewModel.playbackPreferences.danmakuDensity)
     }
 }
 
@@ -1018,10 +1139,49 @@ enum FocusNativeDanmakuLayout {
         let lane: Int
     }
 
+    /// Keep layout work proportional to new segments. Cached lane state also
+    /// makes out-of-order prefetch completion equivalent to chronological load.
+    struct SegmentCache {
+        struct PreparedSegment {
+            let id: UUID
+            let incoming: [FocusVideoDanmakuMode: [Int64]]
+            let outgoing: [FocusVideoDanmakuMode: [Int64]]
+            let placements: [Placement]
+        }
+        private(set) var segments: [PreparedSegment] = []
+        private(set) var processedCommentCount = 0
+        private var laneCount = 0
+        private var density: Double = 1
+
+        mutating func update(_ source: [FocusNativeDanmakuSegment], laneCount: Int, density: Double = 1) {
+            let previous = self.laneCount == laneCount && self.density == density
+                ? Dictionary(uniqueKeysWithValues: segments.map { ($0.id, $0) }) : [:]
+            self.laneCount = laneCount
+            self.density = density
+            let sampling = FocusPlaybackPreferences(danmakuDensity: density)
+            var lanes = FocusNativeDanmakuLayout.emptyLanes(laneCount: laneCount)
+            segments = source.map { segment in
+                if let cached = previous[segment.id], cached.incoming == lanes {
+                    lanes = cached.outgoing
+                    return cached
+                }
+                let incoming = lanes
+                let comments = segment.danmakus.filter { sampling.includesDanmaku(id: $0.id) }
+                let placements = FocusNativeDanmakuLayout.assign(comments, availableAt: &lanes)
+                processedCommentCount += comments.count
+                return PreparedSegment(id: segment.id, incoming: incoming, outgoing: lanes, placements: placements)
+            }
+        }
+    }
+
     /// Placements preserve the view model's ascending progress order. Binary
     /// bounds keep every frame proportional to visible comments, including seeks.
     static func activePlacements(in placements: [Placement], at position: Int64) -> ArraySlice<Placement> {
-        guard position >= 0 else { return placements[0..<0] }
+        guard position >= 0,
+              let first = placements.first, let last = placements.last,
+              first.danmaku.progressMilliseconds <= position,
+              last.danmaku.progressMilliseconds > position - displayMilliseconds
+        else { return placements[0..<0] }
         func upperBound(_ timestamp: Int64) -> Int {
             var lower = 0
             var upper = placements.count
@@ -1045,11 +1205,20 @@ enum FocusNativeDanmakuLayout {
         guard laneCount > 0 else {
             return []
         }
-        var availableAt = Dictionary(
+        var availableAt = emptyLanes(laneCount: laneCount)
+        return assign(danmakus, availableAt: &availableAt)
+    }
+
+    private static func emptyLanes(laneCount: Int) -> [FocusVideoDanmakuMode: [Int64]] {
+        Dictionary(
             uniqueKeysWithValues: FocusVideoDanmakuMode.allCases.map {
                 ($0, Array(repeating: Int64(0), count: laneCount))
             }
         )
+    }
+
+    private static func assign(_ danmakus: [FocusVideoDanmaku],
+                               availableAt: inout [FocusVideoDanmakuMode: [Int64]]) -> [Placement] {
         var result: [Placement] = []
         for danmaku in danmakus {
             guard var lanes = availableAt[danmaku.mode],
@@ -1378,6 +1547,10 @@ struct FocusNativeVideoFullscreenView: View {
                     .padding(20)
                     .background(.black.opacity(0.75), in: RoundedRectangle(cornerRadius: 12))
                     .padding(48)
+                } else if let message = viewModel.playbackRecoveryMessage {
+                    Text(message).font(.footnote).foregroundStyle(.white)
+                        .padding(10).background(.black.opacity(0.7), in: Capsule())
+                        .allowsHitTesting(false)
                 }
             }
             .frame(width: viewport.size.width + viewport.safeAreaInsets.leading + viewport.safeAreaInsets.trailing,
@@ -1385,6 +1558,10 @@ struct FocusNativeVideoFullscreenView: View {
             .offset(x: -viewport.safeAreaInsets.leading, y: -viewport.safeAreaInsets.top)
         }
         .statusBarHidden(true)
+        .onAppear {
+            usesSystemControls = viewModel.requestsSystemPlaybackControls
+            viewModel.requestsSystemPlaybackControls = false
+        }
         .onDisappear {
             FocusNativeVideoOrientation.update(to: .portrait)
         }

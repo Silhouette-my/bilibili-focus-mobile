@@ -1,4 +1,5 @@
 #if canImport(UIKit)
+import AVKit
 import FocusCore
 import Foundation
 import SwiftUI
@@ -8,6 +9,7 @@ import UIKit
 /// Visibility never changes the size of the video or the surrounding feed.
 struct FocusNativePlaybackControls: View {
     @ObservedObject var viewModel: FocusNativeVideoViewModel
+    @ObservedObject private var playbackProgress: FocusNativePlaybackProgress
     let isFullscreen: Bool
     var title: String = ""
     var accentColor: Color = FocusSharedDesign.primary
@@ -20,14 +22,34 @@ struct FocusNativePlaybackControls: View {
     @State private var isScrubbing = false
     @State private var scrubPosition: Double = 0
     @State private var hideTask: Task<Void, Never>?
+    @State private var showsPlaybackSettings = false
+    @State private var horizontalSeekStart: Double?
+    @State private var canvasWidth: CGFloat = 1
     @GestureState private var isHolding = false
+    #if DEBUG
+    var onFixtureProgressRender: ((Int64) -> Void)?
+    #endif
+
+    init(viewModel: FocusNativeVideoViewModel, isFullscreen: Bool, title: String = "",
+         accentColor: Color = FocusSharedDesign.primary, safeAreaInsets: EdgeInsets = EdgeInsets(),
+         onShowSystemControls: (() -> Void)? = nil,
+         onBottomOcclusionChange: @escaping (CGFloat) -> Void = { _ in }) {
+        self.viewModel = viewModel
+        self.playbackProgress = viewModel.playbackProgress
+        self.isFullscreen = isFullscreen
+        self.title = title
+        self.accentColor = accentColor
+        self.safeAreaInsets = safeAreaInsets
+        self.onShowSystemControls = onShowSystemControls
+        self.onBottomOcclusionChange = onBottomOcclusionChange
+    }
 
     private var canControl: Bool {
         viewModel.hasPreparedPlayer && !viewModel.isLoadingPlayback && !viewModel.hasPlaybackEnded
     }
     private var duration: Double { Double(viewModel.playbackDurationMilliseconds) }
     private var position: Double {
-        isScrubbing ? scrubPosition : Double(viewModel.playbackPositionMilliseconds)
+        isScrubbing ? scrubPosition : Double(playbackProgress.positionMilliseconds)
     }
     private var contentInsets: EdgeInsets {
         Self.contentInsets(isFullscreen: isFullscreen, safeArea: safeAreaInsets)
@@ -42,6 +64,9 @@ struct FocusNativePlaybackControls: View {
     }
 
     var body: some View {
+        #if DEBUG
+        let _ = onFixtureProgressRender?(playbackProgress.positionMilliseconds)
+        #endif
         ZStack {
             Color.clear
                 .contentShape(Rectangle())
@@ -61,6 +86,26 @@ struct FocusNativePlaybackControls: View {
                         .sequenced(before: DragGesture(minimumDistance: 0))
                         .updating($isHolding) { value, state, _ in
                             if case .second(true, _) = value { state = true }
+                        }
+                )
+                .simultaneousGesture(
+                    DragGesture(minimumDistance: 24)
+                        .onChanged { value in
+                            guard isFullscreen, !isLocked, !isHolding, canControl,
+                                  abs(value.translation.width) > abs(value.translation.height) * 1.5 else { return }
+                            if horizontalSeekStart == nil {
+                                horizontalSeekStart = Double(playbackProgress.positionMilliseconds)
+                                isScrubbing = true
+                                hideTask?.cancel()
+                            }
+                            scrubPosition = min(max((horizontalSeekStart ?? 0) + Double(value.translation.width / max(canvasWidth, 1)) * 90_000, 0), duration)
+                        }
+                        .onEnded { _ in
+                            guard horizontalSeekStart != nil else { return }
+                            viewModel.seek(toMilliseconds: Int64(scrubPosition))
+                            horizontalSeekStart = nil
+                            isScrubbing = false
+                            showControls()
                         }
                 )
                 .accessibilityLabel("视频画面")
@@ -108,7 +153,18 @@ struct FocusNativePlaybackControls: View {
                 .padding(.top, isFullscreen ? contentInsets.top + 44 : 12)
                 .allowsHitTesting(false)
             }
+            if horizontalSeekStart != nil {
+                Text(Self.timestamp(scrubPosition))
+                    .font(.title2.monospacedDigit().weight(.semibold))
+                    .padding(16)
+                    .background(.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 12))
+                    .allowsHitTesting(false)
+            }
         }
+        .background(GeometryReader { geometry in
+            Color.clear.onAppear { canvasWidth = geometry.size.width }
+                .onChange(of: geometry.size.width) { canvasWidth = $0 }
+        })
         .foregroundStyle(.white)
         .onPreferenceChange(PlaybackControlsOcclusionKey.self, perform: onBottomOcclusionChange)
         .tint(accentColor)
@@ -116,6 +172,9 @@ struct FocusNativePlaybackControls: View {
         .onDisappear {
             hideTask?.cancel()
             viewModel.endTemporaryPlaybackRate()
+        }
+        .sheet(isPresented: $showsPlaybackSettings) {
+            FocusPlaybackSettingsPanel(viewModel: viewModel)
         }
         .onChange(of: isHolding) { holding in
             if holding && !isLocked && canControl && viewModel.isPlaying {
@@ -147,11 +206,16 @@ struct FocusNativePlaybackControls: View {
                     hideTask?.cancel()
                     isLocked = true
                 }
-                if let onShowSystemControls {
-                    iconButton("ellipsis", label: "系统播放控件，画中画与 AirPlay", action: onShowSystemControls)
-                }
             } else {
                 Spacer()
+            }
+            if let onShowSystemControls {
+                iconButton("pip.enter", label: "画中画与系统播放控件", action: onShowSystemControls)
+            }
+            FocusAirPlayPicker().frame(width: 44, height: 44)
+            iconButton("slider.horizontal.3", label: "播放、弹幕与字幕设置") {
+                hideTask?.cancel()
+                showsPlaybackSettings = true
             }
             subtitleMenu
         }
@@ -176,7 +240,7 @@ struct FocusNativePlaybackControls: View {
                         scheduleAutoHide()
                     }
                 })
-                .frame(height: 28)
+                .frame(height: 44)
                 .disabled(!canControl || duration <= 0)
                 .accessibilityLabel("播放进度")
                 .accessibilityValue("\(Self.timestamp(position))，总时长 \(Self.timestamp(duration))")
@@ -186,12 +250,12 @@ struct FocusNativePlaybackControls: View {
             .font(.system(size: isFullscreen ? 13 : 11, weight: .medium, design: .monospaced))
 
             HStack(spacing: isFullscreen ? 16 : 4) {
-                iconButton(viewModel.hasPlaybackEnded ? "arrow.counterclockwise" : (viewModel.isPlaying ? "pause.fill" : "play.fill"),
-                           label: viewModel.hasPlaybackEnded ? "重新播放" : (viewModel.isPlaying ? "暂停视频" : "播放视频")) {
+                iconButton(viewModel.hasPlaybackEnded ? "arrow.counterclockwise" : (viewModel.isPlaybackRequestedByUser ? "pause.fill" : "play.fill"),
+                           label: viewModel.hasPlaybackEnded ? "重新播放" : (viewModel.isPlaybackRequestedByUser ? "暂停视频" : "播放视频")) {
                     viewModel.togglePlayback()
                     showControls()
                 }
-                .disabled(!viewModel.hasPreparedPlayer || viewModel.isLoadingPlayback)
+                .disabled((!viewModel.hasPreparedPlayer || viewModel.isLoadingPlayback) && viewModel.playbackRecoveryMessage == nil)
                 .accessibilityIdentifier("playback-toggle")
                 Spacer(minLength: 0)
                 iconButton(viewModel.isDanmakuEnabled ? "text.bubble.fill" : "text.bubble",
@@ -201,7 +265,7 @@ struct FocusNativePlaybackControls: View {
                 }
                 .foregroundStyle(viewModel.isDanmakuEnabled ? accentColor : .white)
                 rateMenu
-                if !viewModel.availableQualities.isEmpty { qualityMenu }
+                qualityMenu
                 iconButton(isFullscreen ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right",
                            label: isFullscreen ? "退出全屏" : "进入全屏") {
                     if isFullscreen { viewModel.exitFullscreen() } else { viewModel.requestFullscreen() }
@@ -237,12 +301,22 @@ struct FocusNativePlaybackControls: View {
 
     private var qualityMenu: some View {
         Menu {
+            Button {
+                viewModel.selectAutomaticQuality()
+                scheduleAutoHide()
+            } label: {
+                if viewModel.isAutomaticQuality {
+                    Label("自动", systemImage: "checkmark")
+                } else {
+                    Text("自动")
+                }
+            }
             ForEach(viewModel.availableQualities, id: \.id) { quality in
                 Button {
                     viewModel.selectQuality(quality)
                     scheduleAutoHide()
                 } label: {
-                    if viewModel.selectedQuality == quality.id {
+                    if viewModel.isQualitySelected(quality) {
                         Label(quality.title, systemImage: "checkmark")
                     } else {
                         Text(quality.title)
@@ -250,13 +324,14 @@ struct FocusNativePlaybackControls: View {
                 }
             }
         } label: {
-            Text(viewModel.qualityDescription)
+            Text(viewModel.isAutomaticQuality ? "自动" : viewModel.qualityDescription)
                 .font(.system(size: 12, weight: .semibold))
                 .lineLimit(1)
                 .frame(minWidth: 44, minHeight: 44)
         }
         .disabled(!canControl)
         .accessibilityLabel("视频清晰度")
+        .accessibilityValue(viewModel.isAutomaticQuality ? "自动，当前\(viewModel.qualityDescription)" : viewModel.qualityDescription)
         .accessibilityIdentifier("playback-quality-menu")
         .simultaneousGesture(TapGesture().onEnded { hideTask?.cancel() })
     }
@@ -334,6 +409,75 @@ private struct PlaybackControlsOcclusionKey: PreferenceKey {
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
 }
 
+private struct FocusAirPlayPicker: UIViewRepresentable {
+    func makeUIView(context: Context) -> AVRoutePickerView {
+        let picker = AVRoutePickerView()
+        picker.tintColor = .white
+        picker.activeTintColor = .systemPink
+        picker.prioritizesVideoDevices = true
+        picker.accessibilityLabel = "AirPlay 播放设备"
+        return picker
+    }
+    func updateUIView(_ uiView: AVRoutePickerView, context: Context) {}
+}
+
+struct FocusPlaybackSettingsPanel: View {
+    @ObservedObject var viewModel: FocusNativeVideoViewModel
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("播放") {
+                    Toggle("自动播放下一 P", isOn: binding(\.autoPlayNextPart))
+                    Menu {
+                        Button("关闭定时", action: { viewModel.setSleepTimer(minutes: nil) })
+                        ForEach([15, 30, 45, 60, 90], id: \.self) { minutes in
+                            Button("\(minutes) 分钟后暂停") { viewModel.setSleepTimer(minutes: minutes) }
+                        }
+                    } label: {
+                        LabeledContent("睡眠定时", value: viewModel.sleepTimerMinutes.map { "\($0) 分钟定时" } ?? "关闭")
+                    }
+                }
+                Section("弹幕") {
+                    slider("不透明度", keyPath: \.danmakuOpacity, range: 0.1...1)
+                    slider("字号", keyPath: \.danmakuFontScale, range: 0.75...1.5)
+                    Picker("显示区域", selection: binding(\.danmakuArea)) {
+                        Text("默认区域").tag(1.0)
+                        Text("上半屏").tag(0.5)
+                        Text("顶部四分之一").tag(0.25)
+                    }
+                    Picker("密度", selection: binding(\.danmakuDensity)) {
+                        Text("完整").tag(1.0)
+                        Text("适中").tag(0.5)
+                        Text("稀疏").tag(0.25)
+                    }
+                }
+                Section("字幕") {
+                    slider("字号", keyPath: \.subtitleFontScale, range: 0.75...1.5)
+                    slider("背景不透明度", keyPath: \.subtitleBackgroundOpacity, range: 0...1)
+                }
+            }
+            .navigationTitle("播放设置")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } } }
+        }
+    }
+
+    private func binding<Value>(_ keyPath: WritableKeyPath<FocusPlaybackPreferences, Value>) -> Binding<Value> {
+        Binding(get: { viewModel.playbackPreferences[keyPath: keyPath] }, set: { value in
+            viewModel.updatePlaybackPreferences { $0[keyPath: keyPath] = value }
+        })
+    }
+
+    private func slider(_ title: String, keyPath: WritableKeyPath<FocusPlaybackPreferences, Double>, range: ClosedRange<Double>) -> some View {
+        VStack(alignment: .leading) {
+            LabeledContent(title, value: "\(Int(viewModel.playbackPreferences[keyPath: keyPath] * 100))%")
+            Slider(value: binding(keyPath), in: range, step: 0.05).accessibilityLabel(title)
+        }
+    }
+}
+
 /// A small video scrubber with UIKit's native accessibility and touch tracking.
 struct FocusPlaybackSeekSlider: UIViewRepresentable {
     @Binding var value: Double
@@ -376,6 +520,7 @@ struct FocusPlaybackSeekSlider: UIViewRepresentable {
         var isEditing = false
         init(_ parent: FocusPlaybackSeekSlider) { self.parent = parent }
         @objc func begin(_ slider: UISlider) {
+            guard !isEditing else { return }
             isEditing = true
             parent.onEditingChanged(true)
         }
@@ -396,9 +541,55 @@ struct FocusPlaybackSeekSlider: UIViewRepresentable {
 }
 
 final class FocusVideoSeekSlider: UISlider {
+    override var intrinsicContentSize: CGSize {
+        // A custom 10pt thumb also shrinks UISlider's intrinsic touch view.
+        // SwiftUI's outer frame alone does not enlarge that UIKit hit area.
+        CGSize(width: super.intrinsicContentSize.width, height: 44)
+    }
+
+    // UISlider's default touch tracking is thumb-oriented. A video timeline
+    // must also accept a press or drag starting anywhere along the track.
+    override func beginTracking(_ touch: UITouch, with event: UIEvent?) -> Bool {
+        beginScrubbing(at: touch.location(in: self).x)
+    }
+
+    func beginScrubbing(at x: CGFloat) -> Bool {
+        guard isEnabled else { return false }
+        isHighlighted = true
+        sendActions(for: .touchDown)
+        moveThumb(to: x)
+        return true
+    }
+
+    override func continueTracking(_ touch: UITouch, with event: UIEvent?) -> Bool {
+        moveThumb(to: touch.location(in: self).x)
+        return true
+    }
+
+    override func endTracking(_ touch: UITouch?, with event: UIEvent?) {
+        if let touch { moveThumb(to: touch.location(in: self).x) }
+        isHighlighted = false
+        sendActions(for: .touchUpInside)
+    }
+
+    override func cancelTracking(with event: UIEvent?) {
+        isHighlighted = false
+        sendActions(for: .touchCancel)
+    }
+
+    func moveThumb(to x: CGFloat) {
+        let track = trackRect(forBounds: bounds)
+        let left = thumbRect(forBounds: bounds, trackRect: track, value: minimumValue).midX
+        let right = thumbRect(forBounds: bounds, trackRect: track, value: maximumValue).midX
+        let fraction = min(max((x - left) / max(right - left, 1), 0), 1)
+        value = minimumValue + Float(fraction) * (maximumValue - minimumValue)
+        sendActions(for: .valueChanged)
+    }
+
     override func trackRect(forBounds bounds: CGRect) -> CGRect {
         let track = super.trackRect(forBounds: bounds)
         return CGRect(x: track.minX, y: bounds.midY - 1.5, width: track.width, height: 3)
     }
 }
+
 #endif

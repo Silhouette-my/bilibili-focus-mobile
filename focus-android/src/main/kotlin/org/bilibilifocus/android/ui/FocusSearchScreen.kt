@@ -39,6 +39,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.SearchBar
 import androidx.compose.material3.SearchBarDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -64,6 +65,7 @@ import org.bilibilifocus.android.SearchUiState
 import org.bilibilifocus.core.model.SearchResultFilter
 import org.bilibilifocus.core.model.SearchResultItem
 import org.bilibilifocus.core.model.SearchResultSection
+import org.bilibilifocus.core.model.SearchVideoSortOption
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -79,6 +81,7 @@ fun FocusSearchScreen(
     var searchQuery by remember { mutableStateOf("") }
     val state by viewModel.state.collectAsState()
     val isLoadingMore by viewModel.isLoadingMore.collectAsState()
+    val loadMoreError by viewModel.loadMoreError.collectAsState()
     val resolvedResultColumns = resultColumns.coerceAtLeast(1)
 
     // 从动态页搜索框带入的查询：自动填入并搜索一次
@@ -124,6 +127,14 @@ fun FocusSearchScreen(
             onSelect = { viewModel.selectFilter(it) },
             modifier = Modifier.padding(horizontal = 16.dp),
         )
+        if (viewModel.selectedFilter == SearchResultFilter.VIDEO) {
+            Row(Modifier.padding(horizontal = 16.dp).horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                SearchVideoSortOption.entries.forEach { sort ->
+                    FilterChip(selected = viewModel.selectedVideoSort == sort,
+                        onClick = { viewModel.selectVideoSort(sort) }, label = { Text(sort.title) })
+                }
+            }
+        }
 
         Spacer(modifier = Modifier.height(12.dp))
 
@@ -158,7 +169,7 @@ fun FocusSearchScreen(
                     Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(16.dp)) {
                         Text("搜索加载失败", style = MaterialTheme.typography.headlineSmall)
                         Text(s.message, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        Button(onClick = { viewModel.search(searchQuery) }) { Text("重试") }
+                        Button(onClick = viewModel::reload) { Text("重试") }
                     }
                 }
             }
@@ -174,20 +185,22 @@ fun FocusSearchScreen(
 
             is SearchUiState.Loaded -> {
                 val listState = rememberLazyListState()
-                val videoSection = s.sections.firstOrNull { it.filter == SearchResultFilter.VIDEO }
-                val lastVideoRowKey = videoSection?.items?.takeIf { it.isNotEmpty() }?.let { items ->
-                    val firstInLastRow = ((items.size - 1) / resolvedResultColumns) * resolvedResultColumns
-                    "${videoSection.id}:row:${items[firstInLastRow].id}"
+                val pagingFilter = if (viewModel.selectedFilter == SearchResultFilter.ALL) SearchResultFilter.VIDEO else viewModel.selectedFilter
+                val pagingSection = s.sections.firstOrNull { it.filter == pagingFilter }
+                val pagingColumns = if (pagingFilter == SearchResultFilter.USERS) 1 else resolvedResultColumns
+                val lastRowKey = pagingSection?.items?.takeIf { it.isNotEmpty() }?.let { items ->
+                    val firstInLastRow = ((items.size - 1) / pagingColumns) * pagingColumns
+                    "${pagingSection.id}:row:${items[firstInLastRow].id}"
                 }
                 val loadMoreThreshold = with(LocalDensity.current) { 240.dp.roundToPx() }
 
-                LaunchedEffect(listState, lastVideoRowKey) {
-                    val currentSection = videoSection ?: return@LaunchedEffect
+                LaunchedEffect(listState, lastRowKey) {
+                    val currentSection = pagingSection ?: return@LaunchedEffect
                     val lastItemID = currentSection.items.lastOrNull()?.id ?: return@LaunchedEffect
                     snapshotFlow {
                         val layoutInfo = listState.layoutInfo
                         val visibleSection = layoutInfo.visibleItemsInfo
-                            .firstOrNull { it.key == lastVideoRowKey }
+                            .firstOrNull { it.key == lastRowKey }
                         visibleSection != null &&
                             visibleSection.offset + visibleSection.size <=
                             layoutInfo.viewportEndOffset + loadMoreThreshold
@@ -212,16 +225,17 @@ fun FocusSearchScreen(
                     verticalArrangement = Arrangement.spacedBy(16.dp),
                 ) {
                     s.sections.forEach { section ->
-                        if (section.filter == SearchResultFilter.VIDEO || section.filter == SearchResultFilter.LIVE) {
-                            item(key = section.id) { SearchSectionTitle(section.title) }
-                            // Rows, not an entire paginated section, are lazy items.
-                            items(gridRows(section.items, resolvedResultColumns), key = { row -> "${section.id}:row:${row.first().id}" }) { row ->
-                                SearchVideoRow(row, resolvedResultColumns, onOpenItem)
+                        item(key = "${section.id}:title") {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                SearchSectionTitle(section.title)
+                                Spacer(Modifier.weight(1f))
+                                if (viewModel.selectedFilter == SearchResultFilter.ALL) {
+                                    TextButton(onClick = { viewModel.selectFilter(section.filter) }) { Text("查看全部") }
+                                }
                             }
-                            if (isLoadingMore && section.filter == SearchResultFilter.VIDEO) {
-                                item(key = "${section.id}:loading") { SearchLoadingMore() }
-                            }
-                        } else {
+                        }
+                        if (viewModel.selectedFilter == SearchResultFilter.ALL &&
+                            (section.filter == SearchResultFilter.BANGUMI || section.filter == SearchResultFilter.FILM)) {
                             item(key = section.id) {
                                 FocusSearchSection(
                                     section = section,
@@ -229,6 +243,26 @@ fun FocusSearchScreen(
                                     onOpenPreview = onOpenItem,
                                     resultColumns = resolvedResultColumns,
                                 )
+                            }
+                        } else {
+                            val columns = if (section.filter == SearchResultFilter.USERS) 1 else resolvedResultColumns
+                            items(gridRows(section.items, columns), key = { row -> "${section.id}:row:${row.first().id}" }) { row ->
+                                when (section.filter) {
+                                    SearchResultFilter.USERS -> FocusSearchUserCard(row.first(), onOpenItem, onOpenItem)
+                                    SearchResultFilter.BANGUMI, SearchResultFilter.FILM -> SearchMediaRow(row, columns, onOpenItem)
+                                    else -> SearchVideoRow(row, columns, onOpenItem)
+                                }
+                            }
+                        }
+                        if (section.filter == pagingFilter) {
+                            if (isLoadingMore) item(key = "${section.id}:loading") { SearchLoadingMore() }
+                            loadMoreError?.let { message ->
+                                item(key = "${section.id}:error") {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(message, Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
+                                        TextButton(onClick = viewModel::retryLoadMore) { Text("重试") }
+                                    }
+                                }
                             }
                         }
                     }
@@ -285,7 +319,6 @@ private fun FocusSearchSection(
     resultColumns: Int,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        SearchSectionTitle(section.title)
 
         when (section.filter) {
             SearchResultFilter.USERS -> {
@@ -363,6 +396,18 @@ private fun FocusSearchSection(
             else -> {}
         }
 
+    }
+}
+
+@Composable
+private fun SearchMediaRow(row: List<SearchResultItem>, columns: Int, onOpenItem: (SearchResultItem) -> Unit) {
+    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        row.forEach { item ->
+            ElevatedCard(onClick = { onOpenItem(item) }, modifier = Modifier.weight(1f), shape = RoundedCornerShape(16.dp)) {
+                FocusSearchMediaCard(item)
+            }
+        }
+        repeat(columns - row.size) { Spacer(Modifier.weight(1f)) }
     }
 }
 
