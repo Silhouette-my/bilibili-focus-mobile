@@ -1,6 +1,5 @@
 # Gradle
 .gradle/
-.gradle-home/
 build/
 */build/
 !gradle-wrapper.jar
@@ -30,7 +29,6 @@ Build/
 .tmp-home/
 .swift-cache/
 .swift-home/
-.codex-clang-cache/
 *.xcuserstate
 *.xcarchive
 *.ipa
@@ -41,7 +39,3 @@ BilibiliFocus.xcodeproj/project.xcworkspace/xcuserdata/
 
 # Logs
 *.log
-
-# Local reverse-engineering and archival work
-.reverse/
-localonly/

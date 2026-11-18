@@ -649,6 +649,10 @@ final class FocusAppViewModel: ObservableObject {
     }
 
     func openOpusRelatedURL(_ url: URL) {
+        if let host = url.host?.lowercased(), host == "t.bilibili.com" {
+            openOpus(url)
+            return
+        }
         if Self.isUserSpaceURL(url) {
             openUserSpace(url)
             return
@@ -661,7 +665,11 @@ final class FocusAppViewModel: ObservableObject {
             openOpus(url)
             return
         }
-        openVideo(url)
+        if Self.isVideoURL(url) {
+            openVideo(url)
+            return
+        }
+        openBrowser(url, context: .dynamic)
     }
 
     func openUserCollection(_ collection: FocusUserSpaceCollection) {

@@ -20,7 +20,6 @@
 		F20000000000000000000001 /* FocusDynamicScrollRestorationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000001 /* FocusDynamicScrollRestorationTests.swift */; };
 		F20000000000000000000002 /* FocusRealPlaybackTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000002 /* FocusRealPlaybackTests.swift */; };
 		F20000000000000000000003 /* FocusCommentImagePresentationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000003 /* FocusCommentImagePresentationTests.swift */; };
-		C51F4A120000000000000002 /* FocusFirstFramePresentationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C51F4A120000000000000001 /* FocusFirstFramePresentationTests.swift */; };
 		000000000000000000000203 /* BilibiliFocusApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000301 /* BilibiliFocusApp.swift */; };
 		000000000000000000000204 /* FocusBrowserView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000302 /* FocusBrowserView.swift */; };
 		000000000000000000000205 /* FocusBrowserViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000303 /* FocusBrowserViewModel.swift */; };
@@ -44,17 +43,6 @@
 		000000000000000000000223 /* DynamicCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000323 /* DynamicCard.swift */; };
 		000000000000000000000224 /* DynamicFeedService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000324 /* DynamicFeedService.swift */; };
 		C51F4A170000000000000002 /* DynamicFeedSnapshotStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C51F4A170000000000000001 /* DynamicFeedSnapshotStore.swift */; };
-		000000000000000000000226 /* AppIcon20x20@2x.png in Resources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000326 /* AppIcon20x20@2x.png */; };
-		000000000000000000000227 /* AppIcon20x20@3x.png in Resources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000327 /* AppIcon20x20@3x.png */; };
-		000000000000000000000228 /* AppIcon29x29@2x.png in Resources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000328 /* AppIcon29x29@2x.png */; };
-		000000000000000000000229 /* AppIcon29x29@3x.png in Resources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000329 /* AppIcon29x29@3x.png */; };
-		000000000000000000000230 /* AppIcon40x40@2x.png in Resources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000330 /* AppIcon40x40@2x.png */; };
-		000000000000000000000231 /* AppIcon40x40@3x.png in Resources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000331 /* AppIcon40x40@3x.png */; };
-		000000000000000000000232 /* AppIcon60x60@2x.png in Resources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000332 /* AppIcon60x60@2x.png */; };
-		000000000000000000000233 /* AppIcon60x60@3x.png in Resources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000333 /* AppIcon60x60@3x.png */; };
-		000000000000000000000234 /* AppIcon76x76.png in Resources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000334 /* AppIcon76x76.png */; };
-		000000000000000000000235 /* AppIcon76x76@2x.png in Resources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000335 /* AppIcon76x76@2x.png */; };
-		000000000000000000000236 /* AppIcon83.5x83.5@2x.png in Resources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000336 /* AppIcon83.5x83.5@2x.png */; };
 		000000000000000000000337 /* FocusWebAppearance.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000339 /* FocusWebAppearance.swift */; };
 		000000000000000000000348 /* FocusSharedUI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000349 /* FocusSharedUI.swift */; };
 		000000000000000000000354 /* FocusNativeVideo.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000350 /* FocusNativeVideo.swift */; };
@@ -87,7 +75,6 @@
 		FA2000000000000000000001 /* PerformanceMyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA1000000000000000000001 /* PerformanceMyTests.swift */; };
 		FA2000000000000000000002 /* PerformanceImageTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA1000000000000000000002 /* PerformanceImageTests.swift */; };
 		FA2000000000000000000003 /* PerformanceDynamicTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA1000000000000000000003 /* PerformanceDynamicTests.swift */; };
-		FB2000000000000000000001 /* FocusDynamicReturnHostTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB1000000000000000000001 /* FocusDynamicReturnHostTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -154,17 +141,6 @@
 		000000000000000000000324 /* DynamicFeedService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DynamicFeedService.swift; sourceTree = "<group>"; };
 		C51F4A170000000000000001 /* DynamicFeedSnapshotStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DynamicFeedSnapshotStore.swift; sourceTree = "<group>"; };
 		000000000000000000000325 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
-		000000000000000000000326 /* AppIcon20x20@2x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "AppIcon20x20@2x.png"; sourceTree = "<group>"; };
-		000000000000000000000327 /* AppIcon20x20@3x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "AppIcon20x20@3x.png"; sourceTree = "<group>"; };
-		000000000000000000000328 /* AppIcon29x29@2x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "AppIcon29x29@2x.png"; sourceTree = "<group>"; };
-		000000000000000000000329 /* AppIcon29x29@3x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "AppIcon29x29@3x.png"; sourceTree = "<group>"; };
-		000000000000000000000330 /* AppIcon40x40@2x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "AppIcon40x40@2x.png"; sourceTree = "<group>"; };
-		000000000000000000000331 /* AppIcon40x40@3x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "AppIcon40x40@3x.png"; sourceTree = "<group>"; };
-		000000000000000000000332 /* AppIcon60x60@2x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "AppIcon60x60@2x.png"; sourceTree = "<group>"; };
-		000000000000000000000333 /* AppIcon60x60@3x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "AppIcon60x60@3x.png"; sourceTree = "<group>"; };
-		000000000000000000000334 /* AppIcon76x76.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = AppIcon76x76.png; sourceTree = "<group>"; };
-		000000000000000000000335 /* AppIcon76x76@2x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "AppIcon76x76@2x.png"; sourceTree = "<group>"; };
-		000000000000000000000336 /* AppIcon83.5x83.5@2x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "AppIcon83.5x83.5@2x.png"; sourceTree = "<group>"; };
 		000000000000000000000338 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		000000000000000000000339 /* FocusWebAppearance.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusWebAppearance.swift; sourceTree = "<group>"; };
 		000000000000000000000349 /* FocusSharedUI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusSharedUI.swift; sourceTree = "<group>"; };
@@ -177,7 +153,6 @@
 		F10000000000000000000001 /* FocusDynamicScrollRestorationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusDynamicScrollRestorationTests.swift; sourceTree = "<group>"; };
 		F10000000000000000000002 /* FocusRealPlaybackTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusRealPlaybackTests.swift; sourceTree = "<group>"; };
 		F10000000000000000000003 /* FocusCommentImagePresentationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusCommentImagePresentationTests.swift; sourceTree = "<group>"; };
-		C51F4A120000000000000001 /* FocusFirstFramePresentationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusFirstFramePresentationTests.swift; sourceTree = "<group>"; };
 		000000000000000000000704 /* BilibiliFocusTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = BilibiliFocusTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		000000000000000000000811 /* AsyncExpiringCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AsyncExpiringCache.swift; sourceTree = "<group>"; };
 		000000000000000000000812 /* BiliAPIContract.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BiliAPIContract.swift; sourceTree = "<group>"; };
@@ -205,7 +180,6 @@
 		FA1000000000000000000001 /* PerformanceMyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PerformanceMyTests.swift; sourceTree = "<group>"; };
 		FA1000000000000000000002 /* PerformanceImageTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PerformanceImageTests.swift; sourceTree = "<group>"; };
 		FA1000000000000000000003 /* PerformanceDynamicTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PerformanceDynamicTests.swift; sourceTree = "<group>"; };
-		FB1000000000000000000001 /* FocusDynamicReturnHostTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusDynamicReturnHostTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -262,18 +236,8 @@
 			children = (
 				000000000000000000000325 /* Assets.xcassets */,
 				000000000000000000000338 /* Info.plist */,
-				000000000000000000000404 /* Icons */,
 				A30000000000000000000000 /* Features */,
 				000000000000000000000301 /* BilibiliFocusApp.swift */,
-				A10000000000000000000010 /* FocusHistoryBackgroundScheduler.swift */,
-				000000000000000000000302 /* FocusBrowserView.swift */,
-				000000000000000000000303 /* FocusBrowserViewModel.swift */,
-				000000000000000000000350 /* FocusNativeVideo.swift */,
-				000000000000000000000349 /* FocusSharedUI.swift */,
-				000000000000000000000304 /* FocusSettingsStore.swift */,
-				000000000000000000000319 /* FocusUserAgent.swift */,
-				000000000000000000000339 /* FocusWebAppearance.swift */,
-				000000000000000000000305 /* FocusWebView.swift */,
 			);
 			path = App/BilibiliFocus;
 			sourceTree = "<group>";
@@ -323,24 +287,6 @@
 			path = Resources;
 			sourceTree = "<group>";
 		};
-		000000000000000000000404 /* Icons */ = {
-			isa = PBXGroup;
-			children = (
-				000000000000000000000326 /* AppIcon20x20@2x.png */,
-				000000000000000000000327 /* AppIcon20x20@3x.png */,
-				000000000000000000000328 /* AppIcon29x29@2x.png */,
-				000000000000000000000329 /* AppIcon29x29@3x.png */,
-				000000000000000000000330 /* AppIcon40x40@2x.png */,
-				000000000000000000000331 /* AppIcon40x40@3x.png */,
-				000000000000000000000332 /* AppIcon60x60@2x.png */,
-				000000000000000000000333 /* AppIcon60x60@3x.png */,
-				000000000000000000000334 /* AppIcon76x76.png */,
-				000000000000000000000335 /* AppIcon76x76@2x.png */,
-				000000000000000000000336 /* AppIcon83.5x83.5@2x.png */,
-			);
-			path = Icons;
-			sourceTree = "<group>";
-		};
 		000000000000000000000713 /* Tests/BilibiliFocusTests */ = {
 			isa = PBXGroup;
 			children = (
@@ -352,12 +298,10 @@
 				FA1000000000000000000001 /* PerformanceMyTests.swift */,
 				FA1000000000000000000002 /* PerformanceImageTests.swift */,
 				FA1000000000000000000003 /* PerformanceDynamicTests.swift */,
-				FB1000000000000000000001 /* FocusDynamicReturnHostTests.swift */,
 				E10000000000000000000003 /* FocusKMPRouterAdapterTests.swift */,
 				F10000000000000000000001 /* FocusDynamicScrollRestorationTests.swift */,
 				F10000000000000000000002 /* FocusRealPlaybackTests.swift */,
 				F10000000000000000000003 /* FocusCommentImagePresentationTests.swift */,
-				C51F4A120000000000000001 /* FocusFirstFramePresentationTests.swift */,
 			);
 			path = Tests/BilibiliFocusTests;
 			sourceTree = "<group>";
@@ -402,6 +346,7 @@
 		A30000000000000000000004 /* Player */ = {
 			isa = PBXGroup;
 			children = (
+				000000000000000000000350 /* FocusNativeVideo.swift */,
 				A10000000000000000000004 /* FocusNativeVideoViews.swift */,
 				C61025000000000000000001 /* FocusNativePlaybackControls.swift */,
 			);
@@ -411,8 +356,13 @@
 		A30000000000000000000005 /* WebBridge */ = {
 			isa = PBXGroup;
 			children = (
+				000000000000000000000302 /* FocusBrowserView.swift */,
+				000000000000000000000303 /* FocusBrowserViewModel.swift */,
 				A10000000000000000000005 /* FocusBrowserSupport.swift */,
 				A10000000000000000000006 /* FocusNativePageAugmentService.swift */,
+				000000000000000000000319 /* FocusUserAgent.swift */,
+				000000000000000000000339 /* FocusWebAppearance.swift */,
+				000000000000000000000305 /* FocusWebView.swift */,
 			);
 			path = WebBridge;
 			sourceTree = "<group>";
@@ -423,8 +373,11 @@
 				A10000000000000000000007 /* FocusAppGraph.swift */,
 				A10000000000000000000008 /* FocusAppViewModel.swift */,
 				A10000000000000000000013 /* FocusDiagnosticsView.swift */,
+				A10000000000000000000010 /* FocusHistoryBackgroundScheduler.swift */,
 				E10000000000000000000002 /* FocusKMPRouterAdapter.swift */,
+				000000000000000000000304 /* FocusSettingsStore.swift */,
 				A10000000000000000000009 /* FocusSettingsViews.swift */,
+				000000000000000000000349 /* FocusSharedUI.swift */,
 			);
 			path = Shared;
 			sourceTree = "<group>";
@@ -543,17 +496,6 @@
 			buildActionMask = 2147483647;
 			files = (
 				000000000000000000000357 /* Assets.xcassets in Resources */,
-				000000000000000000000226 /* AppIcon20x20@2x.png in Resources */,
-				000000000000000000000227 /* AppIcon20x20@3x.png in Resources */,
-				000000000000000000000228 /* AppIcon29x29@2x.png in Resources */,
-				000000000000000000000229 /* AppIcon29x29@3x.png in Resources */,
-				000000000000000000000230 /* AppIcon40x40@2x.png in Resources */,
-				000000000000000000000231 /* AppIcon40x40@3x.png in Resources */,
-				000000000000000000000232 /* AppIcon60x60@2x.png in Resources */,
-				000000000000000000000233 /* AppIcon60x60@3x.png in Resources */,
-				000000000000000000000234 /* AppIcon76x76.png in Resources */,
-				000000000000000000000235 /* AppIcon76x76@2x.png in Resources */,
-				000000000000000000000236 /* AppIcon83.5x83.5@2x.png in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -675,12 +617,10 @@
 				FA2000000000000000000001 /* PerformanceMyTests.swift in Sources */,
 				FA2000000000000000000002 /* PerformanceImageTests.swift in Sources */,
 				FA2000000000000000000003 /* PerformanceDynamicTests.swift in Sources */,
-				FB2000000000000000000001 /* FocusDynamicReturnHostTests.swift in Sources */,
 				E20000000000000000000003 /* FocusKMPRouterAdapterTests.swift in Sources */,
 				F20000000000000000000001 /* FocusDynamicScrollRestorationTests.swift in Sources */,
 				F20000000000000000000002 /* FocusRealPlaybackTests.swift in Sources */,
 				F20000000000000000000003 /* FocusCommentImagePresentationTests.swift in Sources */,
-				C51F4A120000000000000002 /* FocusFirstFramePresentationTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -745,6 +685,7 @@
 		000000000000000000000603 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = NO;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 6;
@@ -774,6 +715,7 @@
 		000000000000000000000604 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = NO;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 6;

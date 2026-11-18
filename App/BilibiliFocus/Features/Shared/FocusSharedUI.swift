@@ -203,42 +203,355 @@ struct FocusInlineRichText: View {
     var font: Font = .body
     var foreground: Color = .primary
     var onOpenURL: (URL) -> Void = { _ in }
+    var selectable: Bool = false
     @Environment(\.displayScale) private var displayScale
 
     var body: some View {
-        FocusInlineFlowLayout(spacing: 1) {
-            ForEach(Array(runs.enumerated()), id: \.offset) { _, run in
-                switch run {
-                case let .text(value, bold, italic, underline, strikethrough, color, linkURL):
-                    Text(value)
-                        .font(font)
-                        .fontWeight(bold ? .semibold : .regular)
-                        .italic(italic)
-                        .underline(underline)
-                        .strikethrough(strikethrough)
-                        .foregroundStyle(linkURL == nil ? (focusRichTextColor(color) ?? foreground) : FocusSharedDesign.primary)
-                        .onTapGesture {
-                            if let linkURL { onOpenURL(linkURL) }
+        Group {
+            if selectable, !runs.isEmpty {
+                FocusSelectableInlineRichText(
+                    runs: runs,
+                    font: font,
+                    foreground: foreground,
+                    onOpenURL: onOpenURL
+                )
+            } else {
+                FocusInlineFlowLayout(spacing: 1) {
+                    ForEach(Array(runs.enumerated()), id: \.offset) { _, run in
+                        switch run {
+                        case let .text(value, bold, italic, underline, strikethrough, color, linkURL):
+                            Text(value)
+                                .font(font)
+                                .fontWeight(bold ? .semibold : .regular)
+                                .italic(italic)
+                                .underline(underline)
+                                .strikethrough(strikethrough)
+                                .foregroundStyle(linkURL == nil ? (focusRichTextColor(color) ?? foreground) : FocusSharedDesign.primary)
+                                .onTapGesture {
+                                    if let linkURL { onOpenURL(linkURL) }
+                                }
+                        case let .emote(alt, url, _, _, _):
+                            FocusAnimatedRemoteImage(
+                                url: url,
+                                alt: alt,
+                                pixelSize: FocusImagePixelSize.bucket(for: CGSize(width: 24, height: 24), scale: displayScale)
+                            )
+                                .frame(width: 24, height: 24)
+                                .accessibilityLabel(alt)
+                        case let .resource(label, url):
+                            Text(label)
+                                .font(font)
+                                .foregroundStyle(FocusSharedDesign.primary)
+                                .underline()
+                                .onTapGesture { onOpenURL(url) }
                         }
-                case let .emote(alt, url, _, _, _):
-                    FocusAnimatedRemoteImage(
-                        url: url,
-                        alt: alt,
-                        pixelSize: FocusImagePixelSize.bucket(for: CGSize(width: 24, height: 24), scale: displayScale)
-                    )
-                        .frame(width: 24, height: 24)
-                        .accessibilityLabel(alt)
-                case let .resource(label, url):
-                    Text(label)
-                        .font(font)
-                        .foregroundStyle(FocusSharedDesign.primary)
-                        .underline()
-                        .onTapGesture { onOpenURL(url) }
+                    }
                 }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .combine)
+    }
+}
+
+private final class FocusEmoteTextAttachment: NSTextAttachment {
+    let emoteAlt: String
+    let emoteURL: URL
+
+    init(emoteAlt: String, emoteURL: URL) {
+        self.emoteAlt = emoteAlt
+        self.emoteURL = emoteURL
+        super.init(data: nil, ofType: nil)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+}
+
+@MainActor
+final class FocusCopyableRichTextView: UITextView {
+    private var configuredRuns: [FocusRichTextRun]?
+    private var configuredStyle: UIFont.TextStyle?
+    private var configuredCategory: UIContentSizeCategory?
+    private var emoteTasks: [Task<Void, Never>] = []
+    private var configurationGeneration = UUID()
+    var onOpenURL: (URL) -> Void = { _ in }
+
+    override init(frame: CGRect, textContainer: NSTextContainer?) {
+        super.init(frame: frame, textContainer: textContainer)
+        isEditable = false
+        isSelectable = true
+        isScrollEnabled = false
+        backgroundColor = .clear
+        textContainerInset = .zero
+        self.textContainer.lineFragmentPadding = 0
+        dataDetectorTypes = []
+        setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        setContentCompressionResistancePriority(.required, for: .vertical)
+        setContentHuggingPriority(.required, for: .vertical)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    deinit {
+        for task in emoteTasks {
+            task.cancel()
+        }
+    }
+
+    func configure(
+        runs: [FocusRichTextRun],
+        textStyle: UIFont.TextStyle,
+        baseColor: UIColor,
+        linkColor: UIColor,
+        scale: CGFloat,
+        onOpenURL: @escaping (URL) -> Void
+    ) {
+        self.onOpenURL = onOpenURL
+        tintColor = linkColor
+        linkTextAttributes = [.foregroundColor: linkColor]
+
+        let category = traitCollection.preferredContentSizeCategory
+        if configuredRuns == runs, configuredStyle == textStyle, configuredCategory == category {
+            return
+        }
+        configuredRuns = runs
+        configuredStyle = textStyle
+        configuredCategory = category
+
+        for task in emoteTasks {
+            task.cancel()
+        }
+        emoteTasks.removeAll()
+        configurationGeneration = UUID()
+        let currentGeneration = configurationGeneration
+
+        let baseFont = UIFont.preferredFont(forTextStyle: textStyle, compatibleWith: traitCollection)
+        let emoteSide = max(round(baseFont.lineHeight * 1.15), 20)
+        let attributed = NSMutableAttributedString()
+        var pendingEmotes: [(attachment: FocusEmoteTextAttachment, range: NSRange, url: URL)] = []
+
+        for run in runs {
+            switch run {
+            case let .text(value, bold, italic, underline, strikethrough, color, linkURL):
+                var traits = baseFont.fontDescriptor.symbolicTraits
+                if bold { traits.insert(.traitBold) }
+                if italic { traits.insert(.traitItalic) }
+                let resolvedFont: UIFont
+                if (bold || italic), let descriptor = baseFont.fontDescriptor.withSymbolicTraits(traits) {
+                    resolvedFont = UIFont(descriptor: descriptor, size: baseFont.pointSize)
+                } else {
+                    resolvedFont = baseFont
+                }
+                let resolvedColor: UIColor
+                if linkURL != nil {
+                    resolvedColor = linkColor
+                } else if let custom = focusRichTextColor(color) {
+                    resolvedColor = UIColor(custom)
+                } else {
+                    resolvedColor = baseColor
+                }
+                var attributes: [NSAttributedString.Key: Any] = [
+                    .font: resolvedFont,
+                    .foregroundColor: resolvedColor,
+                ]
+                if underline {
+                    attributes[.underlineStyle] = NSUnderlineStyle.single.rawValue
+                }
+                if strikethrough {
+                    attributes[.strikethroughStyle] = NSUnderlineStyle.single.rawValue
+                }
+                if let linkURL {
+                    attributes[.link] = linkURL
+                }
+                attributed.append(NSAttributedString(string: value, attributes: attributes))
+
+            case let .emote(alt, url, _, _, _):
+                let attachment = FocusEmoteTextAttachment(
+                    emoteAlt: alt.isEmpty ? "[表情]" : alt,
+                    emoteURL: url
+                )
+                let yOffset = (baseFont.capHeight - emoteSide) / 2
+                attachment.bounds = CGRect(x: 0, y: yOffset, width: emoteSide, height: emoteSide)
+                let start = attributed.length
+                attributed.append(NSAttributedString(attachment: attachment))
+                pendingEmotes.append((attachment, NSRange(location: start, length: 1), url))
+
+            case let .resource(label, url):
+                let attributes: [NSAttributedString.Key: Any] = [
+                    .font: baseFont,
+                    .foregroundColor: linkColor,
+                    .underlineStyle: NSUnderlineStyle.single.rawValue,
+                    .link: url,
+                ]
+                attributed.append(NSAttributedString(string: label, attributes: attributes))
+            }
+        }
+
+        attributedText = attributed
+        accessibilityLabel = plainText(in: NSRange(location: 0, length: attributed.length))
+        invalidateIntrinsicContentSize()
+
+        let pixelSize = FocusImagePixelSize.bucket(
+            for: CGSize(width: emoteSide, height: emoteSide),
+            scale: max(scale, 1)
+        )
+        for item in pendingEmotes {
+            let task = Task { @MainActor [weak self, weak attachment = item.attachment] in
+                guard
+                    let image = try? await FocusImageRepository.shared.image(
+                        for: item.url,
+                        preferredReferer: "https://www.bilibili.com/",
+                        quality: .emote,
+                        pixelSize: pixelSize,
+                        animated: !UIAccessibility.isReduceMotionEnabled
+                    ),
+                    !Task.isCancelled,
+                    let self,
+                    let attachment,
+                    self.configurationGeneration == currentGeneration
+                else { return }
+                attachment.image = image
+                if item.range.location + item.range.length <= self.textStorage.length {
+                    self.textStorage.beginEditing()
+                    self.textStorage.edited(.editedAttributes, range: item.range, changeInLength: 0)
+                    self.textStorage.endEditing()
+                }
+                self.setNeedsDisplay()
+            }
+            emoteTasks.append(task)
+        }
+    }
+
+    func plainText(in range: NSRange) -> String {
+        let full = attributedText ?? NSAttributedString()
+        let clamped = NSIntersectionRange(range, NSRange(location: 0, length: full.length))
+        guard clamped.length > 0 else { return "" }
+        let sub = full.attributedSubstring(from: clamped)
+        let raw = sub.string as NSString
+        var result = ""
+        var cursor = 0
+        sub.enumerateAttribute(.attachment, in: NSRange(location: 0, length: sub.length)) { value, attrRange, _ in
+            if attrRange.location > cursor {
+                result += raw.substring(with: NSRange(location: cursor, length: attrRange.location - cursor))
+            }
+            if let emote = value as? FocusEmoteTextAttachment {
+                result += emote.emoteAlt
+            } else {
+                result += raw.substring(with: attrRange)
+            }
+            cursor = attrRange.location + attrRange.length
+        }
+        if cursor < sub.length {
+            result += raw.substring(with: NSRange(location: cursor, length: sub.length - cursor))
+        }
+        return result
+    }
+
+    override func copy(_ sender: Any?) {
+        let text = plainText(in: selectedRange)
+        guard !text.isEmpty else {
+            super.copy(sender)
+            return
+        }
+        UIPasteboard.general.string = text
+    }
+
+    func cancelPendingLoads() {
+        configurationGeneration = UUID()
+        for task in emoteTasks {
+            task.cancel()
+        }
+        emoteTasks.removeAll()
+    }
+}
+
+private struct FocusSelectableInlineRichText: UIViewRepresentable {
+    let runs: [FocusRichTextRun]
+    let font: Font
+    let foreground: Color
+    let onOpenURL: (URL) -> Void
+    @Environment(\.displayScale) private var displayScale
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onOpenURL: onOpenURL)
+    }
+
+    func makeUIView(context: Context) -> FocusCopyableRichTextView {
+        let view = FocusCopyableRichTextView()
+        view.delegate = context.coordinator
+        updateView(view, context: context)
+        return view
+    }
+
+    func updateUIView(_ uiView: FocusCopyableRichTextView, context: Context) {
+        context.coordinator.onOpenURL = onOpenURL
+        updateView(uiView, context: context)
+    }
+
+    static func dismantleUIView(_ uiView: FocusCopyableRichTextView, coordinator _: Coordinator) {
+        uiView.cancelPendingLoads()
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: FocusCopyableRichTextView, context _: Context) -> CGSize? {
+        guard let width = proposal.width, width.isFinite, width > 0 else {
+            return nil
+        }
+        let measured = uiView.sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude))
+        return CGSize(width: width, height: ceil(measured.height))
+    }
+
+    private func updateView(_ view: FocusCopyableRichTextView, context _: Context) {
+        view.configure(
+            runs: runs,
+            textStyle: Self.uiTextStyle(for: font),
+            baseColor: UIColor(foreground),
+            linkColor: UIColor(FocusSharedDesign.primary),
+            scale: displayScale,
+            onOpenURL: onOpenURL
+        )
+    }
+
+    private static func uiTextStyle(for font: Font) -> UIFont.TextStyle {
+        switch font {
+        case .caption, .caption2: return .caption1
+        case .footnote: return .footnote
+        case .subheadline: return .subheadline
+        case .headline: return .headline
+        default: return .body
+        }
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, UITextViewDelegate {
+        var onOpenURL: (URL) -> Void
+
+        init(onOpenURL: @escaping (URL) -> Void) {
+            self.onOpenURL = onOpenURL
+        }
+
+        @available(iOS 17.0, *)
+        func textView(_ textView: UITextView, primaryActionFor textItem: UITextItem, defaultAction: UIAction) -> UIAction? {
+            if case let .link(url) = textItem.content {
+                return UIAction { [weak self] _ in
+                    self?.onOpenURL(url)
+                }
+            }
+            return defaultAction
+        }
+
+        func textView(_ textView: UITextView, shouldInteractWith URL: URL, in characterRange: NSRange, interaction: UITextItemInteraction) -> Bool {
+            if interaction == .invokeDefaultAction {
+                onOpenURL(URL)
+                return false
+            }
+            return true
+        }
     }
 }
 

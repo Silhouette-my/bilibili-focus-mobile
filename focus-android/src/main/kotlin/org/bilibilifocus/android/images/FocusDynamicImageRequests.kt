@@ -47,12 +47,32 @@ internal data class FocusDynamicImageLayout(
         )
     }
 
+    fun quotedCover(quoted: DynamicCard.QuotedCard, source: String): FocusDynamicImageRequest {
+        val innerWidth = (contentWidth - imageGap * 3).coerceAtLeast(1)
+        val single = quoted.coverURLs.size == 1
+        val width = if (single) innerWidth else ((innerWidth - imageGap) / 2).coerceAtLeast(1)
+        val aspectRatio = when {
+            !single -> 1f
+            quoted.kind == DynamicCard.Kind.IMAGE -> 4f / 3f
+            else -> 16f / 9f
+        }
+        return FocusDynamicImageRequest(
+            FocusImageCDNRequest.canonicalURL(source),
+            width,
+            (width / aspectRatio).roundToInt().coerceAtLeast(1),
+            if (single && quoted.kind == DynamicCard.Kind.IMAGE) Scale.FIT else Scale.FILL,
+        )
+    }
+
     fun prefetchRequests(cards: List<DynamicCard>, firstVisibleCardID: String?): List<FocusDynamicImageRequest> {
         val start = firstVisibleCardID?.let { id -> cards.indexOfFirst { it.id == id }.takeIf { it >= 0 } } ?: 0
         return cards.asSequence().drop(start).take(8).flatMap { card ->
             sequence {
                 avatar(card.author.avatarURL)?.let { yield(it) }
                 card.coverURLs.take(2).forEach { yield(cover(card, it)) }
+                card.quotedCard?.let { quoted ->
+                    quoted.coverURLs.take(2).forEach { yield(quotedCover(quoted, it)) }
+                }
             }
         }.distinct().toList()
     }

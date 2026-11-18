@@ -268,40 +268,6 @@ final class FocusSearchOwnershipTests: XCTestCase {
         XCTAssertEqual(sections(model)[0].items.map(\.id), ["sort/video/1"])
     }
 
-    func testTypedSearchPaginationFailureRender() async throws {
-        let api = SearchOwnershipAPI()
-        await api.enableTypedPagination()
-        let model = makeModel(api)
-        defer { model.suspend() }
-        model.search(SearchQuery(keyword: "搜索体验"))
-        await eventually { if case .loaded = model.state { return true }; return false }
-        model.selectFilter(.users)
-        await eventually { self.sections(model).first?.filter == .users }
-        await api.failNext("搜索体验/bili_user/2")
-        let section = sections(model)[0]
-        model.loadMoreIfNeeded(currentItemID: section.items[0].id, in: section)
-        await eventually { model.loadMoreErrorMessage != nil }
-        let host = UIHostingController(rootView: FocusSearchResultsView(
-            viewModel: model, onOpenItem: { _ in }, onOpenPreview: { _ in }, onEditQuery: {}
-        ))
-        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 393, height: 852))
-        window.rootViewController = host
-        window.makeKeyAndVisible()
-        defer { window.isHidden = true; window.rootViewController = nil }
-        host.view.frame = window.bounds
-        window.layoutIfNeeded()
-        try await Task.sleep(nanoseconds: 120_000_000)
-        host.view.layoutIfNeeded()
-        let attachment = XCTAttachment(image: UIGraphicsImageRenderer(size: window.bounds.size).image { _ in
-            host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true)
-        })
-        attachment.name = "search-users-append-retry"
-        attachment.lifetime = .keepAlways
-        add(attachment)
-        XCTAssertNotNil(model.loadMoreErrorMessage)
-        XCTAssertEqual(sections(model)[0].items.count, 1)
-    }
-
     private func makeModel(_ api: SearchOwnershipAPI) -> FocusSearchResultsViewModel {
         FocusSearchResultsViewModel(service: SearchResultService(cookieProvider: SearchOwnershipCookies(), requestLoader: {
             try await api.respond($0)

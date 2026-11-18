@@ -16,15 +16,8 @@ public struct BiliAPIContract: Codable, Equatable, Sendable {
     }
 }
 
-public struct BiliAPIContractSource: Codable, Equatable, Sendable {
-    public let repository: URL
-    public let validatedCommit: String
-    public let strategy: String
-}
-
 public struct BiliAPIContractSnapshot: Codable, Equatable, Sendable {
     public let schemaVersion: Int
-    public let source: BiliAPIContractSource
     public let endpoints: [String: BiliAPIContract]
 }
 

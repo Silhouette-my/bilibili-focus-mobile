@@ -15,16 +15,8 @@ data class BiliApiContract(
 )
 
 @Serializable
-data class BiliApiContractSource(
-    val repository: String,
-    val validatedCommit: String,
-    val strategy: String,
-)
-
-@Serializable
 data class BiliApiContractSnapshot(
     val schemaVersion: Int,
-    val source: BiliApiContractSource,
     val endpoints: Map<String, BiliApiContract>,
 )
 

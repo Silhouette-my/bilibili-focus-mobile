@@ -26,9 +26,6 @@ struct FocusNativePlaybackControls: View {
     @State private var horizontalSeekStart: Double?
     @State private var canvasWidth: CGFloat = 1
     @GestureState private var isHolding = false
-    #if DEBUG
-    var onFixtureProgressRender: ((Int64) -> Void)?
-    #endif
 
     init(viewModel: FocusNativeVideoViewModel, isFullscreen: Bool, title: String = "",
          accentColor: Color = FocusSharedDesign.primary, safeAreaInsets: EdgeInsets = EdgeInsets(),
@@ -64,9 +61,6 @@ struct FocusNativePlaybackControls: View {
     }
 
     var body: some View {
-        #if DEBUG
-        let _ = onFixtureProgressRender?(playbackProgress.positionMilliseconds)
-        #endif
         ZStack {
             Color.clear
                 .contentShape(Rectangle())

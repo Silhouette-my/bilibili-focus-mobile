@@ -4,6 +4,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -47,6 +48,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
@@ -59,6 +62,7 @@ import org.bilibilifocus.android.ui.video.commentImageGalleryRequest
 import org.bilibilifocus.core.model.OpusBlock
 import org.bilibilifocus.core.model.OpusDetail
 import org.bilibilifocus.core.model.OpusImage
+import org.bilibilifocus.core.model.OpusReference
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -125,7 +129,11 @@ fun FocusOpusScreen(
                 is OpusUiState.Loaded -> {
                     val allImages = s.detail.paragraphs.flatMap { paragraph ->
                         paragraph.blocks.flatMap { block ->
-                            (block as? OpusBlock.Image)?.pics.orEmpty()
+                            when (block) {
+                                is OpusBlock.Image -> block.pics
+                                is OpusBlock.Reference -> if (block.reference.hasGalleryPhotos()) block.reference.images else emptyList()
+                                else -> emptyList()
+                            }
                         }
                     }
                     val validImages = allImages.filter { it.url.isNotBlank() }
@@ -159,6 +167,7 @@ fun FocusOpusScreen(
                                             )
                                         },
                                         onOpenURL = onOpenURL,
+                                        onOpenUser = onOpenUser,
                                     )
                                 }
                             }
@@ -261,6 +270,7 @@ private fun OpusParagraphView(
     modifier: Modifier = Modifier,
     onOpenImage: (OpusImage) -> Unit = {},
     onOpenURL: (String) -> Unit = {},
+    onOpenUser: (Long) -> Unit = {},
 ) {
     Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(8.dp)) {
         paragraph.blocks.forEach { block ->
@@ -268,10 +278,168 @@ private fun OpusParagraphView(
                 is OpusBlock.Text -> FocusRichText(runs = block.nodes, onOpenURL = onOpenURL)
                 is OpusBlock.Image -> OpusImageGrid(images = block.pics, referer = referer, onOpenImage = onOpenImage)
                 is OpusBlock.Code -> OpusCodeBlock(lang = block.lang, content = block.content)
+                is OpusBlock.Quote -> OpusQuoteBlock(nodes = block.nodes, onOpenURL = onOpenURL)
+                is OpusBlock.Reference -> OpusReferenceCard(
+                    reference = block.reference,
+                    referer = referer,
+                    onOpenUser = onOpenUser,
+                    onOpenImage = onOpenImage,
+                    onOpenURL = onOpenURL,
+                )
             }
         }
     }
 }
+
+@Composable
+private fun OpusQuoteBlock(
+    nodes: List<org.bilibilifocus.core.model.RichTextRun>,
+    onOpenURL: (String) -> Unit,
+) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f))
+            .padding(12.dp),
+    ) {
+        FocusRichText(
+            runs = nodes,
+            style = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurfaceVariant),
+            onOpenURL = onOpenURL,
+        )
+    }
+}
+
+@Composable
+private fun OpusReferenceCard(
+    reference: OpusReference,
+    referer: String,
+    onOpenUser: (Long) -> Unit,
+    onOpenImage: (OpusImage) -> Unit,
+    onOpenURL: (String) -> Unit,
+) {
+    val shape = RoundedCornerShape(12.dp)
+    val targetURL = reference.targetURL?.takeIf { it.isNotBlank() }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(shape)
+            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f))
+            .border(
+                width = 0.5.dp,
+                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f),
+                shape = shape,
+            )
+            .then(
+                if (reference.unavailableTip == null && targetURL != null) {
+                    Modifier.clickable { onOpenURL(targetURL) }
+                } else {
+                    Modifier
+                },
+            )
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        val unavailableTip = reference.unavailableTip
+        if (!unavailableTip.isNullOrBlank()) {
+            Text(
+                text = unavailableTip,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            return
+        }
+
+        if (reference.authorName.isNotBlank() || reference.publishTime.isNotBlank() || reference.badgeText.isNotBlank()) {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                if (reference.authorName.isNotBlank()) {
+                    Text(
+                        text = "@${reference.authorName}",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.primary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier
+                            .weight(1f, fill = false)
+                            .then(
+                                if (reference.authorMid > 0) {
+                                    Modifier.clickable { onOpenUser(reference.authorMid) }
+                                } else {
+                                    Modifier
+                                },
+                            ),
+                    )
+                }
+                if (reference.publishTime.isNotBlank()) {
+                    Text(
+                        text = reference.publishTime,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                if (reference.badgeText.isNotBlank()) {
+                    Text(
+                        text = reference.badgeText,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                        modifier = Modifier
+                            .background(MaterialTheme.colorScheme.secondaryContainer, RoundedCornerShape(4.dp))
+                            .padding(horizontal = 6.dp, vertical = 2.dp),
+                    )
+                }
+            }
+        }
+
+        if (reference.title.isNotBlank()) {
+            Text(
+                text = reference.title,
+                style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
+                maxLines = 3,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+
+        if (reference.textRuns.isNotEmpty()) {
+            FocusRichText(
+                runs = reference.textRuns,
+                style = MaterialTheme.typography.bodyMedium,
+                onOpenURL = onOpenURL,
+            )
+        }
+
+        if (reference.images.isNotEmpty()) {
+            if (reference.hasGalleryPhotos()) {
+                OpusImageGrid(
+                    images = reference.images,
+                    referer = targetURL ?: referer,
+                    onOpenImage = onOpenImage,
+                )
+            } else {
+                val cover = reference.images.first()
+                AsyncImage(
+                    model = ImageRequest.Builder(LocalContext.current)
+                        .data(FocusImageCDNRequest.canonicalURL(cover.url))
+                        .addHeader("Referer", targetURL ?: referer)
+                        .crossfade(true)
+                        .build(),
+                    contentDescription = null,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .aspectRatio(16f / 9f)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant),
+                    contentScale = ContentScale.Crop,
+                )
+            }
+        }
+    }
+}
+
+private fun OpusReference.hasGalleryPhotos(): Boolean = badgeText in setOf("图片", "动态", "")
 
 @Composable
 private fun OpusImageGrid(images: List<OpusImage>, referer: String, onOpenImage: (OpusImage) -> Unit) {

@@ -64,11 +64,6 @@ struct FocusBrowserView: View {
                     .background {
                         if !viewModel.isDynamicFeedActive {
                             Color(uiColor: .systemGroupedBackground)
-#if DEBUG
-                                .background {
-                                    if FocusTestRuntime.isRunningFixtures { FocusDetailCoverFixtureProbe() }
-                                }
-#endif
                         }
                     }
                     .allowsHitTesting(!viewModel.isDynamicFeedActive)
@@ -262,6 +257,9 @@ struct FocusBrowserView: View {
                 onOpenLogin: viewModel.openLogin,
                 onSearch: {
                     viewModel.presentSearchEntry()
+                },
+                onOpenQuotedURL: { url in
+                    viewModel.openOpusRelatedURL(url)
                 }
             ))
             // Use the same explicit proposal while active and covered. Switching
@@ -612,20 +610,6 @@ private final class FocusDynamicFeedHostingController<Content: View>: UIHostingC
         }
     }
 }
-
-#if DEBUG
-/// Lets integration tests observe when the opaque detail branch actually
-/// leaves the UIKit hierarchy, rather than timing only a model flag change.
-private struct FocusDetailCoverFixtureProbe: UIViewRepresentable {
-    func makeUIView(context: Context) -> UIView {
-        let view = UIView()
-        view.isUserInteractionEnabled = false
-        view.accessibilityIdentifier = "focus-fixture-detail-cover"
-        return view
-    }
-    func updateUIView(_ view: UIView, context: Context) {}
-}
-#endif
 
 private struct FocusEdgeSwipeBackArea: View {
     let onBack: () -> Void

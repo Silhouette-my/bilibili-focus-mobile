@@ -298,6 +298,165 @@ struct DynamicFeedServiceTests {
         #expect(card.text == "第一段[doge]\n第二段完整文本")
         #expect(card.coverURLs.count == 1)
     }
+
+    @Test
+    func decodesForwardedVideoAndOpusAndDeletedOrigAndAdditionalUGC() throws {
+        let payload = """
+        {
+          "code": 0,
+          "data": {
+            "has_more": false,
+            "offset": "",
+            "items": [
+              {
+                "id_str": "9001",
+                "type": "DYNAMIC_TYPE_FORWARD",
+                "visible": true,
+                "modules": {
+                  "module_author": { "name": "转发作者", "pub_time": "1小时前" },
+                  "module_dynamic": { "desc": { "text": "转发推荐" } }
+                },
+                "orig": {
+                  "id_str": "8001",
+                  "type": "DYNAMIC_TYPE_AV",
+                  "modules": {
+                    "module_author": { "name": "原视频作者", "pub_time": "2小时前" },
+                    "module_dynamic": {
+                      "major": {
+                        "type": "MAJOR_TYPE_ARCHIVE",
+                        "archive": {
+                          "bvid": "BV1xx411c7mD",
+                          "title": "原视频标题",
+                          "desc": "原视频简介",
+                          "cover": "https://i0.hdslb.com/bfs/archive/orig.jpg",
+                          "jump_url": "//www.bilibili.com/video/BV1xx411c7mD"
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "id_str": "9002",
+                "type": "DYNAMIC_TYPE_FORWARD",
+                "visible": true,
+                "modules": {
+                  "module_author": { "name": "转发甲", "pub_time": "刚刚" },
+                  "module_dynamic": { "desc": { "text": "看看原图文" } }
+                },
+                "orig": {
+                  "id_str": "8002",
+                  "type": "DYNAMIC_TYPE_DRAW",
+                  "modules": {
+                    "module_author": { "name": "原画师", "pub_time": "昨天" },
+                    "module_dynamic": {
+                      "major": {
+                        "type": "MAJOR_TYPE_OPUS",
+                        "opus": {
+                          "title": "原图文标题",
+                          "jump_url": "//www.bilibili.com/opus/8002",
+                          "summary": { "text": "原图文正文" },
+                          "pics": [{ "url": "https://i0.hdslb.com/bfs/new_dyn/pic1.jpg" }]
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "id_str": "9003",
+                "type": "DYNAMIC_TYPE_FORWARD",
+                "visible": true,
+                "modules": {
+                  "module_author": { "name": "转发乙", "pub_time": "刚刚" },
+                  "module_dynamic": { "desc": { "text": "已失效原动态" } }
+                },
+                "orig": {
+                  "id_str": "8003",
+                  "type": "DYNAMIC_TYPE_NONE",
+                  "modules": {
+                    "module_dynamic": {
+                      "major": {
+                        "type": "MAJOR_TYPE_NONE",
+                        "none": { "tips": "源动态已被作者删除" }
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "id_str": "9004",
+                "type": "DYNAMIC_TYPE_WORD",
+                "visible": true,
+                "modules": {
+                  "module_author": { "name": "附加作者", "pub_time": "刚刚" },
+                  "module_dynamic": {
+                    "desc": { "text": "附上相关视频" },
+                    "additional": {
+                      "type": "ADDITIONAL_TYPE_UGC",
+                      "ugc": {
+                        "head_text": "相关视频",
+                        "title": "附加视频标题",
+                        "desc_second": "10万播放",
+                        "cover": "https://i0.hdslb.com/bfs/archive/ugc.jpg",
+                        "jump_url": "//www.bilibili.com/video/BV1yy411c7ab"
+                      }
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+        """
+
+        let cards = try DynamicFeedService.decodeCards(from: Data(payload.utf8))
+        #expect(cards.count == 4)
+
+        #expect(cards[0].targetURL.absoluteString == "https://www.bilibili.com/opus/9001")
+        #expect(cards[0].videoURL == nil)
+        let videoQuoted = try #require(cards[0].quotedCard)
+        #expect(videoQuoted.id == "8001")
+        #expect(videoQuoted.author.name == "原视频作者")
+        #expect(videoQuoted.title == "原视频标题")
+        #expect(videoQuoted.videoURL?.absoluteString == "https://www.bilibili.com/video/BV1xx411c7mD/")
+        #expect(videoQuoted.coverURLs.map(\.absoluteString) == ["https://i0.hdslb.com/bfs/archive/orig.jpg"])
+
+        let opusQuoted = try #require(cards[1].quotedCard)
+        #expect(opusQuoted.author.name == "原画师")
+        #expect(opusQuoted.title == "原图文标题")
+        #expect(opusQuoted.text == "原图文正文")
+        #expect(opusQuoted.targetURL?.absoluteString == "https://www.bilibili.com/opus/8002")
+
+        let deletedQuoted = try #require(cards[2].quotedCard)
+        #expect(deletedQuoted.unavailableTip == "源动态已被作者删除")
+
+        let ugcQuoted = try #require(cards[3].quotedCard)
+        #expect(ugcQuoted.title == "附加视频标题")
+        #expect(ugcQuoted.targetURL?.absoluteString == "https://www.bilibili.com/video/BV1yy411c7ab/")
+        #expect(ugcQuoted.videoURL?.absoluteString == "https://www.bilibili.com/video/BV1yy411c7ab/")
+    }
+
+    @Test
+    func decodesLegacyDynamicCardSnapshotWithoutQuotedCardField() throws {
+        let legacyJSON = """
+        {
+          "id": "5001",
+          "kind": "text",
+          "author": { "mid": 77, "name": "旧快照作者", "avatarURL": null },
+          "publishTime": "昨天",
+          "text": "旧版本缓存动态",
+          "coverURLs": [],
+          "targetURL": "https://www.bilibili.com/opus/5001",
+          "videoURL": null
+        }
+        """
+
+        let decoded = try JSONDecoder().decode(DynamicCard.self, from: Data(legacyJSON.utf8))
+        #expect(decoded.id == "5001")
+        #expect(decoded.text == "旧版本缓存动态")
+        #expect(decoded.quotedCard == nil)
+    }
 }
 
 private struct EmptyCookieProvider: CookieSnapshotProvider {

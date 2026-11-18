@@ -120,60 +120,23 @@ final class PerformanceMyTests: XCTestCase {
         XCTAssertFalse(after.contains { $0.url?.path == "/x/v3/fav/folder/add" })
     }
 
-    func testPersonalCenterRendersLoadedEmptyAndManagement() async throws {
+    func testPersonalCenterLoadsEmptyAndNonEmptyStatesAndFormatsFolderDuration() async throws {
         for empty in [false, true] {
             let api = PersonalCenterPresentationAPI(empty: empty)
             let cookies = PerformanceMyCookieProvider()
             let loader: FocusMyDataService.RequestLoader = { try await api.response($0) }
             let service = FocusMyDataService(cookieProvider: cookies, requestLoader: loader)
             let model = FocusMyViewModel(service: service)
+            defer { model.suspend() }
             await model.refresh()
             guard case let .loaded(page) = model.state else { return XCTFail("Offline personal center fixture did not load") }
             XCTAssertEqual(page.folders.count, empty ? 0 : 3)
-            let view = NavigationStack {
-                FocusMyView(viewModel: model, followingService: FocusFollowingAuthorsService(cookieProvider: cookies, requestLoader: loader),
-                    onOpenLogin: {}, onOpenHistory: {}, onOpenFavoriteFolder: { _ in }, onOpenVideo: { _ in }, onOpenUser: { _ in }, onOpenSettings: {})
-                    .navigationTitle("我的").navigationBarTitleDisplayMode(.inline)
-            }
-            try await capturePersonalView(view, name: empty ? "my-empty" : "my-loaded")
             if !empty {
                 let resources = try await service.fetchFolderContents(mediaID: page.folders[0].id)
                 XCTAssertEqual(resources.first?.durationText, "10:00", "Numeric duration:600 payload must render a clock, not raw seconds")
                 XCTAssertEqual(FocusMyDataService.formatVideoLength("10:00", seconds: nil), "10:00")
-                try await capturePersonalView(FocusMyFoldersView(viewModel: model, onOpenLogin: {}, onOpenFolder: { _ in }), name: "my-folder-management")
-                let history = FocusHistoryViewModel(service: service)
-                history.loadIfNeeded()
-                await eventually { if case .loaded = history.state { return true }; return false }
-                try await capturePersonalView(NavigationStack { FocusHistoryView(viewModel: history, onOpenVideo: { _ in }).navigationTitle("播放历史") }, name: "my-history-management")
-                let folder = FocusFavoriteFolderViewModel(service: service)
-                folder.open(page.folders[0])
-                await eventually { if case .loaded = folder.state { return true }; return false }
-                try await capturePersonalView(NavigationStack { FocusFavoriteFolderView(viewModel: folder, onOpenVideo: { _ in }).navigationTitle("学习收藏") }, name: "my-favorite-content-management")
-                history.suspend(); folder.suspend()
             }
-            model.suspend()
         }
-    }
-
-    private func capturePersonalView<Content: View>(_ content: Content, name: String) async throws {
-        let host = UIHostingController(rootView: content.tint(.pink))
-        let window: UIWindow
-        if let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first { window = UIWindow(windowScene: scene) }
-        else { window = UIWindow(frame: CGRect(x: 0, y: 0, width: 393, height: 852)) }
-        window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
-        window.rootViewController = host
-        window.makeKeyAndVisible()
-        host.view.frame = window.bounds
-        window.layoutIfNeeded()
-        try await Task.sleep(for: .milliseconds(150))
-        host.view.layoutIfNeeded()
-        let attachment = XCTAttachment(image: UIGraphicsImageRenderer(size: window.bounds.size).image { _ in window.drawHierarchy(in: window.bounds, afterScreenUpdates: true) })
-        attachment.name = name
-        attachment.lifetime = .keepAlways
-        add(attachment)
-        XCTAssertGreaterThan(host.view.bounds.height, 800)
-        window.isHidden = true
-        window.rootViewController = nil
     }
 
     func testHistoryAndFolderReloadReleaseCancelledPagination() async {

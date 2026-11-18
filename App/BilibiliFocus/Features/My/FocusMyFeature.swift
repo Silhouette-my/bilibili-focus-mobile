@@ -251,10 +251,29 @@ struct FocusOpusImage: Identifiable {
     }
 }
 
+struct FocusOpusReference {
+    var authorName: String = ""
+    var authorMID: Int64 = 0
+    var authorAvatarURL: URL? = nil
+    var publishTime: String = ""
+    var title: String = ""
+    var textRuns: [FocusRichTextRun] = []
+    var images: [FocusOpusImage] = []
+    var targetURL: URL? = nil
+    var badgeText: String = ""
+    var unavailableTip: String? = nil
+
+    var hasGalleryPhotos: Bool {
+        ["图片", "动态", ""].contains(badgeText)
+    }
+}
+
 enum FocusOpusBlock {
     case text([FocusRichTextRun])
     case image([FocusOpusImage])
     case code(lang: String, content: String)
+    case quote([FocusRichTextRun])
+    case reference(FocusOpusReference)
 }
 
 struct FocusOpusParagraph: Identifiable {
@@ -3547,11 +3566,20 @@ final class FocusOpusDetailService: @unchecked Sendable {
         case message(String)
     }
 
-    private let cookieProvider: WebViewCookieSnapshotProvider
-    private let session: URLSession
+    typealias RequestHandler = @Sendable (URLRequest) async throws -> (Data, URLResponse)
 
-    init(cookieProvider: WebViewCookieSnapshotProvider) {
+    private let cookieProvider: any CookieSnapshotProvider
+    private let session: URLSession
+    private let requestHandler: RequestHandler?
+    private var cachedWbiKey: String?
+    private var cachedWbiExpiration = Date.distantPast
+
+    init(
+        cookieProvider: any CookieSnapshotProvider,
+        requestHandler: RequestHandler? = nil
+    ) {
         self.cookieProvider = cookieProvider
+        self.requestHandler = requestHandler
         let configuration = URLSessionConfiguration.default
         configuration.timeoutIntervalForRequest = 16
         configuration.timeoutIntervalForResource = 24
@@ -3566,27 +3594,61 @@ final class FocusOpusDetailService: @unchecked Sendable {
 
         let features = "onlyfansVote,onlyfansAssetsV2,decorationCard,htmlNewStyle,ugcDelete,editable,opusPrivateVisible"
         let detailURL = "https://api.bilibili.com/x/polymer/web-dynamic/v1/opus/detail?id=\(opusID)&timezone_offset=-480&features=\(features)"
-        let root = try await requestObject(urlString: detailURL, referer: url.absoluteString)
-        let code = root.intValue(at: "code") ?? -1
+        let root: [String: Any]? = try? await requestObject(urlString: detailURL, referer: url.absoluteString)
+        let code = root?.intValue(at: "code") ?? -1
         if code == -101 {
             throw ServiceError.loginRequired
         }
-        guard code == 0 else {
-            throw ServiceError.message(root.stringValue(at: "message") ?? "图文详情加载失败")
-        }
 
-        if let item = root.dictionaryValue(at: "data", "item") {
+        if let root, code == 0, let item = root.dictionaryValue(at: "data", "item") {
             let basic = item.dictionaryValue(at: "basic") ?? [:]
-            let modules = item.dictionaryValue(at: "modules") ?? [:]
+            let modules = normalizeModules(item: item)
             let authorModule = modules.dictionaryValue(at: "module_author") ?? [:]
-            let paragraphs = parseParagraphs(modules: modules)
+            var paragraphs = parseOpusModulesParagraphs(modules: modules)
+
+            let hasReferenceBlock = paragraphs.contains { paragraph in
+                paragraph.blocks.contains {
+                    if case .reference = $0 { return true }
+                    return false
+                }
+            }
+            if !hasReferenceBlock {
+                let dynamicModule = modules.dictionaryValue(at: "module_dynamic")
+                if let embeddedRef = resolveFallbackReference(
+                    from: item,
+                    dynamicModule: dynamicModule,
+                    basic: basic
+                ) {
+                    paragraphs.append(FocusOpusParagraph(blocks: [.reference(embeddedRef)]))
+                }
+            }
+
+            let isForwardItem = item.stringValue(at: "type") == "DYNAMIC_TYPE_FORWARD"
+            let stillMissingReference = !paragraphs.contains { paragraph in
+                paragraph.blocks.contains {
+                    if case .reference = $0 { return true }
+                    return false
+                }
+            }
+            if isForwardItem, stillMissingReference,
+               let fallback = try await fetchFromDynamicDetail(opusID: opusID),
+               fallback.paragraphs.contains(where: { p in
+                   p.blocks.contains {
+                       if case .reference = $0 { return true }
+                       return false
+                   }
+               })
+            {
+                return fallback
+            }
+
             if !paragraphs.isEmpty {
                 return FocusOpusDetailContent(
                     id: basic.stringValue(at: "comment_id_str") ?? basic.stringValue(at: "rid_str") ?? opusID,
                     author: FocusOpusAuthor(
-                        name: authorModule.stringValue(at: "name") ?? "用户",
+                        name: authorModule.stringValue(at: "name")?.nilIfBlank ?? "用户",
                         mid: authorModule.int64Value(at: "mid") ?? 0,
-                        avatarURL: URL(string: Self.normalizedURLString(authorModule.stringValue(at: "face")) ?? "")
+                        avatarURL: Self.normalizedURL(authorModule.stringValue(at: "face"))
                     ),
                     publishTime: authorModule.stringValue(at: "pub_time")
                         ?? authorModule.stringValue(at: "pub_time_text")
@@ -3600,12 +3662,28 @@ final class FocusOpusDetailService: @unchecked Sendable {
             return fallback
         }
 
+        if let root, code != 0 {
+            throw ServiceError.message(root.stringValue(at: "message") ?? "图文详情加载失败")
+        }
         throw ServiceError.message("未能解析图文内容")
     }
 
     private func fetchFromDynamicDetail(opusID: String) async throws -> FocusOpusDetailContent? {
-        let urlString = "https://api.bilibili.com/x/polymer/web-dynamic/v1/detail?id=\(opusID)&features=itemOpusStyle&timezone_offset=-480"
-        let root = try await requestObject(urlString: urlString, referer: "https://www.bilibili.com/opus/\(opusID)")
+        let baseURL = "https://api.bilibili.com/x/polymer/web-dynamic/v1/detail"
+        let referer = "https://www.bilibili.com/opus/\(opusID)"
+        let params = [
+            "id": opusID,
+            "features": "itemOpusStyle",
+            "timezone_offset": "-480",
+        ]
+        let query: String
+        if let signed = try? await signedWbiQuery(parameters: params, referer: referer) {
+            query = signed
+        } else {
+            query = "id=\(opusID)&features=itemOpusStyle&timezone_offset=-480"
+        }
+
+        let root = try await requestObject(urlString: "\(baseURL)?\(query)", referer: referer)
         let code = root.intValue(at: "code") ?? -1
         if code == -101 {
             throw ServiceError.loginRequired
@@ -3618,59 +3696,46 @@ final class FocusOpusDetailService: @unchecked Sendable {
             return nil
         }
 
-        let modules = item.dictionaryValue(at: "modules") ?? [:]
+        let modules = normalizeModules(item: item)
         let dynamic = modules.dictionaryValue(at: "module_dynamic")
-        let forwardOrigin = item.dictionaryValue(at: "orig")
-            ?? item.dictionaryValue(at: "origin")
-            ?? dynamic?.dictionaryValue(at: "major", "archive")
-        let originModules = forwardOrigin?.dictionaryValue(at: "modules")
-
-        if let originModules,
-           let forwarded = parseForwardedDetail(from: originModules, fallbackID: opusID)
-        {
-            return forwarded
-        }
-
-        guard let dynamic else {
-            return nil
-        }
-
         let author = modules.dictionaryValue(at: "module_author") ?? [:]
-        let major = dynamic.dictionaryValue(at: "major")
+        let major = dynamic?.dictionaryValue(at: "major")
+        let basic = item.dictionaryValue(at: "basic")
 
         var blocks: [FocusOpusBlock] = []
+        if let opusTitle = major?.stringValue(at: "opus", "title")?.nilIfBlank {
+            blocks.append(.text([.text(value: opusTitle, bold: true)]))
+        }
         let richTextRuns = parseOpusTextNodes(
-            dynamic.arrayValue(at: "desc", "rich_text_nodes")
-                ?? dynamic.arrayValue(at: "desc", "rich_text_nodes_v2")
+            dynamic?.arrayValue(at: "desc", "rich_text_nodes")
+                ?? dynamic?.arrayValue(at: "desc", "rich_text_nodes_v2")
+                ?? major?.arrayValue(at: "opus", "summary", "rich_text_nodes")
+                ?? major?.arrayValue(at: "opus", "summary", "rich_text_nodes_v2")
                 ?? []
         )
         if !richTextRuns.isEmpty {
             blocks.append(.text(richTextRuns))
-        } else if let text = dynamic.stringValue(at: "desc", "text") ?? major?.stringValue(at: "opus", "summary", "text"),
-           let normalizedText = text.nilIfBlank
+        } else if let text = dynamic?.stringValue(at: "desc", "text") ?? major?.stringValue(at: "opus", "summary", "text"),
+                  let normalizedText = text.nilIfBlank
         {
             blocks.append(.text([.text(value: normalizedText)]))
         }
 
         var images: [FocusOpusImage] = []
         func appendPictures(from items: [[String: Any]], keys: [String]) {
-            for item in items {
-                let rawURL = keys.compactMap { item.stringValue(at: $0) }.first
-                guard let rawURL else {
-                    continue
-                }
-                let normalized = Self.normalizedURLString(rawURL)
+            for entry in items {
+                let rawURL = keys.compactMap { entry.stringValue(at: $0) }.first
+                guard let url = Self.normalizedURL(rawURL) else { continue }
                 images.append(
                     FocusOpusImage(
-                        id: normalized ?? UUID().uuidString,
-                        url: normalized.flatMap(URL.init(string:)),
-                        width: item.intValue(at: "width") ?? 0,
-                        height: item.intValue(at: "height") ?? 0
+                        id: url.absoluteString,
+                        url: url,
+                        width: entry.intValue(at: "width") ?? 0,
+                        height: entry.intValue(at: "height") ?? 0
                     )
                 )
             }
         }
-
         if let pics = major?.arrayValue(at: "opus", "pics") {
             appendPictures(from: pics, keys: ["url", "src"])
         }
@@ -3681,89 +3746,120 @@ final class FocusOpusDetailService: @unchecked Sendable {
             blocks.append(.image(images))
         }
 
-        guard !blocks.isEmpty else {
+        var paragraphs: [FocusOpusParagraph] = []
+        if !blocks.isEmpty {
+            paragraphs.append(FocusOpusParagraph(blocks: blocks))
+        } else {
+            paragraphs.append(contentsOf: parseOpusModulesParagraphs(modules: modules))
+        }
+
+        let hasReference = paragraphs.contains { paragraph in
+            paragraph.blocks.contains {
+                if case .reference = $0 { return true }
+                return false
+            }
+        }
+        if !hasReference {
+            if let quotedRef = resolveFallbackReference(
+                from: item,
+                dynamicModule: dynamic,
+                basic: basic
+            ) {
+                paragraphs.append(FocusOpusParagraph(blocks: [.reference(quotedRef)]))
+            }
+        }
+
+        guard !paragraphs.isEmpty else {
             return nil
         }
 
         return FocusOpusDetailContent(
-            id: opusID,
+            id: basic?.stringValue(at: "comment_id_str") ?? basic?.stringValue(at: "rid_str") ?? opusID,
             author: FocusOpusAuthor(
-                name: author.stringValue(at: "name") ?? "用户",
+                name: author.stringValue(at: "name")?.nilIfBlank ?? "用户",
                 mid: author.int64Value(at: "mid") ?? 0,
-                avatarURL: URL(string: Self.normalizedURLString(author.stringValue(at: "face")) ?? "")
+                avatarURL: Self.normalizedURL(author.stringValue(at: "face"))
             ),
             publishTime: author.stringValue(at: "pub_time")
                 ?? author.stringValue(at: "pub_time_text")
                 ?? "",
-            paragraphs: [FocusOpusParagraph(blocks: blocks)]
+            paragraphs: paragraphs
         )
     }
 
-    private func parseForwardedDetail(from modules: [String: Any], fallbackID: String) -> FocusOpusDetailContent? {
-        let author = modules.dictionaryValue(at: "module_author") ?? [:]
-        let dynamic = modules.dictionaryValue(at: "module_dynamic") ?? [:]
-        let major = dynamic.dictionaryValue(at: "major")
-
-        var blocks: [FocusOpusBlock] = []
-        let richTextRuns = parseOpusTextNodes(
-            dynamic.arrayValue(at: "desc", "rich_text_nodes")
-                ?? dynamic.arrayValue(at: "desc", "rich_text_nodes_v2")
-                ?? []
-        )
-        if !richTextRuns.isEmpty {
-            blocks.append(.text(richTextRuns))
-        } else if let text = dynamic.stringValue(at: "desc", "text") ?? major?.stringValue(at: "opus", "summary", "text"),
-           let normalizedText = text.nilIfBlank
-        {
-            blocks.append(.text([.text(value: normalizedText)]))
+    private func resolveFallbackReference(
+        from item: [String: Any],
+        dynamicModule: [String: Any]?,
+        basic: [String: Any]?
+    ) -> FocusOpusReference? {
+        let origItem = item.dictionaryValue(at: "orig")
+            ?? item.dictionaryValue(at: "origin")
+            ?? dynamicModule?.dictionaryValue(at: "forward")
+            ?? dynamicModule?.dictionaryValue(at: "orig")
+        if let origItem, let origRef = parseDynamicItemReference(from: origItem) {
+            return origRef
         }
+        if let additional = dynamicModule?.dictionaryValue(at: "additional"),
+           let additionalRef = parseAdditionalReference(from: additional) {
+            return additionalRef
+        }
+        if let major = dynamicModule?.dictionaryValue(at: "major"),
+           let majorRef = parseMajorReference(from: major, basic: basic) {
+            return majorRef
+        }
+        return nil
+    }
 
-        var images: [FocusOpusImage] = []
-        func appendPictures(from items: [[String: Any]], keys: [String]) {
-            for item in items {
-                let rawURL = keys.compactMap { item.stringValue(at: $0) }.first
-                guard let rawURL, let normalized = Self.normalizedURLString(rawURL) else {
-                    continue
-                }
-                images.append(
-                    FocusOpusImage(
-                        id: normalized,
-                        url: URL(string: normalized),
-                        width: item.intValue(at: "width") ?? 0,
-                        height: item.intValue(at: "height") ?? 0
-                    )
-                )
+    private func normalizeModules(item: [String: Any]) -> [String: Any] {
+        if let dict = item.dictionaryValue(at: "modules") {
+            return dict
+        }
+        guard let array = item["modules"] as? [[String: Any]] else {
+            return [:]
+        }
+        var merged: [String: Any] = [:]
+        for entry in array {
+            let mappedKey: String? = switch entry.stringValue(at: "module_type") {
+            case "MODULE_TYPE_AUTHOR": "module_author"
+            case "MODULE_TYPE_CONTENT": "module_content"
+            case "MODULE_TYPE_TITLE": "module_title"
+            case "MODULE_TYPE_TOP": "module_top"
+            case "MODULE_TYPE_DYNAMIC": "module_dynamic"
+            default: nil
+            }
+            if let mappedKey, let value = entry[mappedKey] {
+                merged[mappedKey] = value
+            }
+            for (key, value) in entry where key != "module_type" && merged[key] == nil {
+                merged[key] = value
             }
         }
+        return merged
+    }
 
-        if let pics = major?.arrayValue(at: "opus", "pics") {
-            appendPictures(from: pics, keys: ["url", "src"])
+    private func parseOpusModulesParagraphs(modules: [String: Any]) -> [FocusOpusParagraph] {
+        var result: [FocusOpusParagraph] = []
+        if let title = modules.stringValue(at: "module_title", "text")?.nilIfBlank {
+            result.append(FocusOpusParagraph(blocks: [.text([.text(value: title, bold: true)])]))
         }
-        if let drawItems = major?.arrayValue(at: "draw", "items") {
-            appendPictures(from: drawItems, keys: ["src", "url"])
+        if let pics = modules.dictionaryValue(at: "module_top", "display", "album")?.arrayValue(at: "pics") {
+            let topImages = pics.compactMap { pic -> FocusOpusImage? in
+                guard let url = Self.normalizedURL(pic.stringValue(at: "url") ?? pic.stringValue(at: "src")) else {
+                    return nil
+                }
+                return FocusOpusImage(
+                    id: url.absoluteString,
+                    url: url,
+                    width: pic.intValue(at: "width") ?? 0,
+                    height: pic.intValue(at: "height") ?? 0
+                )
+            }
+            if !topImages.isEmpty {
+                result.append(FocusOpusParagraph(blocks: [.image(topImages)]))
+            }
         }
-        if !images.isEmpty {
-            blocks.append(.image(images))
-        }
-
-        let paragraphs = parseParagraphs(modules: modules)
-        let resolvedParagraphs = paragraphs.isEmpty ? (blocks.isEmpty ? [] : [FocusOpusParagraph(blocks: blocks)]) : paragraphs
-        guard !resolvedParagraphs.isEmpty else {
-            return nil
-        }
-
-        return FocusOpusDetailContent(
-            id: dynamic.stringValue(at: "id_str") ?? fallbackID,
-            author: FocusOpusAuthor(
-                name: author.stringValue(at: "name") ?? "用户",
-                mid: author.int64Value(at: "mid") ?? 0,
-                avatarURL: URL(string: Self.normalizedURLString(author.stringValue(at: "face")) ?? "")
-            ),
-            publishTime: author.stringValue(at: "pub_time")
-                ?? author.stringValue(at: "pub_time_text")
-                ?? "",
-            paragraphs: resolvedParagraphs
-        )
+        result.append(contentsOf: parseParagraphs(modules: modules))
+        return result
     }
 
     private func parseParagraphs(modules: [String: Any]) -> [FocusOpusParagraph] {
@@ -3805,17 +3901,62 @@ final class FocusOpusDetailService: @unchecked Sendable {
                 ?? []
             let images = pictures.compactMap { picture -> FocusOpusImage? in
                 let rawURL = picture.stringValue(at: "url") ?? picture.stringValue(at: "src")
-                guard let normalized = Self.normalizedURLString(rawURL) else {
+                guard let url = Self.normalizedURL(rawURL) else {
                     return nil
                 }
                 return FocusOpusImage(
-                    id: normalized,
-                    url: URL(string: normalized),
+                    id: url.absoluteString,
+                    url: url,
                     width: picture.intValue(at: "width") ?? 0,
                     height: picture.intValue(at: "height") ?? 0
                 )
             }
             return images.isEmpty ? [] : [.image(images)]
+
+        case 4:
+            let children = paragraph.arrayValue(at: "blockquote", "children")
+            let runs: [FocusRichTextRun]
+            if let children, !children.isEmpty {
+                var collected: [FocusRichTextRun] = []
+                for child in children {
+                    let rawNodes = child.arrayValue(at: "text", "nodes") ?? child.arrayValue(at: "nodes") ?? []
+                    let parsed = parseOpusTextNodes(rawNodes)
+                    if !parsed.isEmpty {
+                        if !collected.isEmpty { collected.append(.text(value: "\n")) }
+                        collected.append(contentsOf: parsed)
+                    }
+                }
+                runs = collected
+            } else {
+                let rawNodes = paragraph.arrayValue(at: "text", "nodes") ?? paragraph.arrayValue(at: "nodes") ?? []
+                runs = parseOpusTextNodes(rawNodes)
+            }
+            return runs.isEmpty ? [] : [.quote(runs)]
+
+        case 5:
+            let listObj = paragraph.dictionaryValue(at: "list") ?? paragraph
+            let ordered = listObj.intValue(at: "style") == 1
+            let items = listObj.arrayValue(at: "items") ?? []
+            var collected: [FocusRichTextRun] = []
+            for (index, item) in items.enumerated() {
+                let rawNodes = item.arrayValue(at: "nodes") ?? item.arrayValue(at: "text", "nodes") ?? []
+                let parsed = parseOpusTextNodes(rawNodes)
+                if !parsed.isEmpty {
+                    if !collected.isEmpty { collected.append(.text(value: "\n")) }
+                    collected.append(.text(value: ordered ? "\(index + 1). " : "• "))
+                    collected.append(contentsOf: parsed)
+                }
+            }
+            return collected.isEmpty ? [] : [.text(collected)]
+
+        case 6:
+            let card = paragraph.dictionaryValue(at: "link_card", "card")
+                ?? paragraph.dictionaryValue(at: "link_card")
+                ?? [:]
+            guard let ref = parseLinkCardReference(from: card) else {
+                return []
+            }
+            return [.reference(ref)]
 
         case 7:
             let content = paragraph.stringValue(at: "code", "content")
@@ -3831,6 +3972,509 @@ final class FocusOpusDetailService: @unchecked Sendable {
         }
     }
 
+    private func parseLinkCardReference(from card: [String: Any]) -> FocusOpusReference? {
+        let cardType = card.stringValue(at: "type") ?? ""
+        let oid = card.stringValue(at: "oid")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let cardJumpURL = Self.normalizedURL(card.stringValue(at: "jump_url"))
+
+        if cardType == "LINK_CARD_TYPE_ITEM_NULL" || card.dictionaryValue(at: "item_null") != nil {
+            let itemNull = card.dictionaryValue(at: "item_null")
+            let tip = itemNull?.stringValue(at: "text")?.nilIfBlank
+                ?? card.stringValue(at: "tips")?.nilIfBlank
+                ?? "引用内容已失效"
+            return FocusOpusReference(unavailableTip: tip)
+        }
+
+        if cardType == "LINK_CARD_TYPE_FORWARD"
+            || card.dictionaryValue(at: "forward") != nil
+            || card.dictionaryValue(at: "dynamic") != nil
+            || card.dictionaryValue(at: "orig") != nil
+        {
+            if let dynamicItem = card.dictionaryValue(at: "forward")
+                ?? card.dictionaryValue(at: "dynamic")
+                ?? card.dictionaryValue(at: "orig"),
+               let ref = parseDynamicItemReference(from: dynamicItem)
+            {
+                return ref
+            }
+        }
+
+        if cardType == "LINK_CARD_TYPE_OPUS" || card.dictionaryValue(at: "opus") != nil,
+           let opus = card.dictionaryValue(at: "opus")
+        {
+            let author = opus.dictionaryValue(at: "author")
+            let title = opus.stringValue(at: "title")?.nilIfBlank ?? ""
+            let richNodes = parseOpusTextNodes(
+                opus.arrayValue(at: "summary", "rich_text_nodes")
+                    ?? opus.arrayValue(at: "content", "rich_text_nodes")
+                    ?? []
+            )
+            let plainSummary = (
+                (opus["content"] as? String)
+                    ?? opus.dictionaryValue(at: "summary")?.stringValue(at: "text")
+                    ?? (opus["summary"] as? String)
+                    ?? (opus["desc"] as? String)
+            )?.nilIfBlank ?? ""
+            let textRuns: [FocusRichTextRun] = if !richNodes.isEmpty {
+                richNodes
+            } else if !plainSummary.isEmpty, plainSummary != title {
+                [.text(value: plainSummary)]
+            } else {
+                []
+            }
+            let images = collectOpusImages(
+                singleURLs: [opus.stringValue(at: "cover"), card.stringValue(at: "cover")].compactMap { $0 },
+                arrays: [opus["pics"] as? [Any]].compactMap { $0 }
+            )
+            let jumpURL = Self.normalizedURL(opus.stringValue(at: "jump_url"))
+                ?? cardJumpURL
+                ?? (!oid.isEmpty && oid.allSatisfy(\.isNumber) ? URL(string: "https://www.bilibili.com/opus/\(oid)") : nil)
+            if title.isEmpty, textRuns.isEmpty, images.isEmpty, jumpURL == nil { return nil }
+            return FocusOpusReference(
+                authorName: author?.stringValue(at: "name")?.nilIfBlank ?? "",
+                authorMID: author?.int64Value(at: "mid") ?? 0,
+                authorAvatarURL: Self.normalizedURL(author?.stringValue(at: "face")),
+                title: title,
+                textRuns: textRuns,
+                images: images,
+                targetURL: jumpURL,
+                badgeText: "动态"
+            )
+        }
+
+        if cardType == "LINK_CARD_TYPE_UGC" || card.dictionaryValue(at: "ugc") != nil,
+           let ugc = card.dictionaryValue(at: "ugc")
+        {
+            let title = ugc.stringValue(at: "title")?.nilIfBlank ?? ""
+            let desc = [ugc.stringValue(at: "desc_second"), ugc.stringValue(at: "duration")]
+                .compactMap { $0?.nilIfBlank }
+                .joined(separator: " · ")
+            let cover = Self.normalizedURL(ugc.stringValue(at: "cover"))
+            let bvid = ugc.stringValue(at: "bvid")?.nilIfBlank
+                ?? (oid.uppercased().hasPrefix("BV") ? oid : nil)
+            let jumpURL = Self.normalizedURL(ugc.stringValue(at: "jump_url"))
+                ?? cardJumpURL
+                ?? bvid.flatMap { URL(string: "https://www.bilibili.com/video/\($0)/") }
+            if title.isEmpty, desc.isEmpty, cover == nil, jumpURL == nil { return nil }
+            return FocusOpusReference(
+                title: title,
+                textRuns: desc.isEmpty ? [] : [.text(value: desc)],
+                images: cover.map { [FocusOpusImage(id: $0.absoluteString, url: $0, width: 0, height: 0)] } ?? [],
+                targetURL: jumpURL,
+                badgeText: "视频"
+            )
+        }
+
+        if cardType == "LINK_CARD_TYPE_ARTICLE" || card.dictionaryValue(at: "article") != nil,
+           let article = card.dictionaryValue(at: "article")
+        {
+            let title = article.stringValue(at: "title")?.nilIfBlank ?? ""
+            let desc = (article.stringValue(at: "desc") ?? (article["summary"] as? String))?.nilIfBlank ?? ""
+            let images = collectOpusImages(
+                singleURLs: [article.stringValue(at: "cover")].compactMap { $0 },
+                arrays: [article["covers"] as? [Any]].compactMap { $0 }
+            )
+            let cvid = article.stringValue(at: "id").flatMap { Int64($0) }
+                ?? article.int64Value(at: "id")
+                ?? Int64(oid)
+            let jumpURL = Self.normalizedURL(article.stringValue(at: "jump_url"))
+                ?? cardJumpURL
+                ?? cvid.flatMap { URL(string: "https://www.bilibili.com/read/cv\($0)") }
+            if title.isEmpty, desc.isEmpty, images.isEmpty, jumpURL == nil { return nil }
+            return FocusOpusReference(
+                title: title,
+                textRuns: desc.isEmpty ? [] : [.text(value: desc)],
+                images: images,
+                targetURL: jumpURL,
+                badgeText: "专栏"
+            )
+        }
+
+        if cardType == "LINK_CARD_TYPE_LIVE" || card.dictionaryValue(at: "live") != nil,
+           let live = card.dictionaryValue(at: "live")
+        {
+            let title = live.stringValue(at: "title")?.nilIfBlank ?? ""
+            let desc = [live.stringValue(at: "desc_first"), live.stringValue(at: "desc_second")]
+                .compactMap { $0?.nilIfBlank }
+                .joined(separator: " · ")
+            let cover = Self.normalizedURL(live.stringValue(at: "cover"))
+            let jumpURL = Self.normalizedURL(live.stringValue(at: "jump_url")) ?? cardJumpURL
+            if title.isEmpty, desc.isEmpty, cover == nil, jumpURL == nil { return nil }
+            return FocusOpusReference(
+                title: title,
+                textRuns: desc.isEmpty ? [] : [.text(value: desc)],
+                images: cover.map { [FocusOpusImage(id: $0.absoluteString, url: $0, width: 0, height: 0)] } ?? [],
+                targetURL: jumpURL,
+                badgeText: "直播"
+            )
+        }
+
+        if cardType == "LINK_CARD_TYPE_PGC" || card.dictionaryValue(at: "pgc") != nil,
+           let pgc = card.dictionaryValue(at: "pgc")
+        {
+            let title = pgc.stringValue(at: "title")?.nilIfBlank ?? ""
+            let desc = (pgc.stringValue(at: "desc") ?? pgc.stringValue(at: "sub_title"))?.nilIfBlank ?? ""
+            let cover = Self.normalizedURL(pgc.stringValue(at: "cover") ?? pgc.stringValue(at: "ep_cover"))
+            let jumpURL = Self.normalizedURL(pgc.stringValue(at: "jump_url")) ?? cardJumpURL
+            if title.isEmpty, desc.isEmpty, cover == nil, jumpURL == nil { return nil }
+            return FocusOpusReference(
+                title: title,
+                textRuns: desc.isEmpty ? [] : [.text(value: desc)],
+                images: cover.map { [FocusOpusImage(id: $0.absoluteString, url: $0, width: 0, height: 0)] } ?? [],
+                targetURL: jumpURL,
+                badgeText: "番剧"
+            )
+        }
+
+        if cardType == "LINK_CARD_TYPE_MUSIC" || card.dictionaryValue(at: "music") != nil,
+           let music = card.dictionaryValue(at: "music")
+        {
+            let title = music.stringValue(at: "title")?.nilIfBlank ?? ""
+            let desc = (music.stringValue(at: "label") ?? music.stringValue(at: "singer"))?.nilIfBlank ?? ""
+            let cover = Self.normalizedURL(music.stringValue(at: "cover"))
+            let jumpURL = Self.normalizedURL(music.stringValue(at: "jump_url")) ?? cardJumpURL
+            if title.isEmpty, desc.isEmpty, cover == nil, jumpURL == nil { return nil }
+            return FocusOpusReference(
+                title: title,
+                textRuns: desc.isEmpty ? [] : [.text(value: desc)],
+                images: cover.map { [FocusOpusImage(id: $0.absoluteString, url: $0, width: 0, height: 0)] } ?? [],
+                targetURL: jumpURL,
+                badgeText: "音频"
+            )
+        }
+
+        if cardType == "LINK_CARD_TYPE_GOODS" || card.dictionaryValue(at: "goods") != nil,
+           let goods = card.dictionaryValue(at: "goods")
+        {
+            let item = goods.arrayValue(at: "items")?.first ?? goods
+            let title = (item.stringValue(at: "name") ?? item.stringValue(at: "title"))?.nilIfBlank ?? ""
+            let desc = (item.stringValue(at: "price") ?? item.stringValue(at: "brief"))?.nilIfBlank ?? ""
+            let cover = Self.normalizedURL(item.stringValue(at: "img") ?? item.stringValue(at: "cover"))
+            let jumpURL = Self.normalizedURL(item.stringValue(at: "jump_url") ?? goods.stringValue(at: "jump_url")) ?? cardJumpURL
+            if title.isEmpty, desc.isEmpty, cover == nil, jumpURL == nil { return nil }
+            return FocusOpusReference(
+                title: title,
+                textRuns: desc.isEmpty ? [] : [.text(value: desc)],
+                images: cover.map { [FocusOpusImage(id: $0.absoluteString, url: $0, width: 0, height: 0)] } ?? [],
+                targetURL: jumpURL,
+                badgeText: "商品"
+            )
+        }
+
+        if let common = card.dictionaryValue(at: "common"),
+           cardType == "LINK_CARD_TYPE_COMMON" || !common.isEmpty
+        {
+            let title = (common.stringValue(at: "title") ?? common.stringValue(at: "head_text"))?.nilIfBlank ?? ""
+            let desc = [common.stringValue(at: "desc1"), common.stringValue(at: "desc2")]
+                .compactMap { $0?.nilIfBlank }
+                .joined(separator: "\n")
+            let cover = Self.normalizedURL(common.stringValue(at: "cover"))
+            let jumpURL = Self.normalizedURL(common.stringValue(at: "jump_url")) ?? cardJumpURL
+            if title.isEmpty, desc.isEmpty, cover == nil, jumpURL == nil { return nil }
+            return FocusOpusReference(
+                title: title,
+                textRuns: desc.isEmpty ? [] : [.text(value: desc)],
+                images: cover.map { [FocusOpusImage(id: $0.absoluteString, url: $0, width: 0, height: 0)] } ?? [],
+                targetURL: jumpURL,
+                badgeText: "链接"
+            )
+        }
+
+        return nil
+    }
+
+    private func parseDynamicItemReference(from origItem: [String: Any]) -> FocusOpusReference? {
+        let origType = origItem.stringValue(at: "type") ?? ""
+        let origModules = normalizeModules(item: origItem)
+        let origDynamic = origModules.dictionaryValue(at: "module_dynamic")
+        let origMajor = origDynamic?.dictionaryValue(at: "major")
+        let origMajorType = origMajor?.stringValue(at: "type") ?? ""
+        let origBasic = origItem.dictionaryValue(at: "basic")
+
+        if origType == "DYNAMIC_TYPE_NONE" || origMajorType == "MAJOR_TYPE_NONE" {
+            let tip = origMajor?.stringValue(at: "none", "tips")?.nilIfBlank
+                ?? origDynamic?.stringValue(at: "desc", "text")?.nilIfBlank
+                ?? "源动态已被作者删除"
+            return FocusOpusReference(unavailableTip: tip)
+        }
+
+        let author = origModules.dictionaryValue(at: "module_author")
+        let authorName = author?.stringValue(at: "name")?.nilIfBlank ?? ""
+        let authorMID = author?.int64Value(at: "mid") ?? 0
+        let authorAvatarURL = Self.normalizedURL(author?.stringValue(at: "face"))
+        let publishTime = author?.stringValue(at: "pub_time")
+            ?? author?.stringValue(at: "pub_time_text")
+            ?? author?.stringValue(at: "pub_action")
+            ?? ""
+
+        let title = [
+            origModules.stringValue(at: "module_title", "text"),
+            origMajor?.stringValue(at: "archive", "title"),
+            origMajor?.stringValue(at: "article", "title"),
+            origMajor?.stringValue(at: "pgc", "title"),
+            origMajor?.stringValue(at: "opus", "title"),
+            origMajor?.stringValue(at: "courses", "title"),
+            origMajor?.stringValue(at: "music", "title"),
+            origMajor?.stringValue(at: "medialist", "title"),
+            origMajor?.stringValue(at: "live", "title"),
+            origMajor?.stringValue(at: "common", "title"),
+            origMajor?.stringValue(at: "ugc_season", "title"),
+        ]
+        .compactMap { $0?.nilIfBlank }
+        .first ?? ""
+
+        let contentParagraphs = parseOpusModulesParagraphs(modules: origModules)
+        let descNodes = parseOpusTextNodes(
+            origDynamic?.arrayValue(at: "desc", "rich_text_nodes")
+                ?? origDynamic?.arrayValue(at: "desc", "rich_text_nodes_v2")
+                ?? origMajor?.arrayValue(at: "opus", "summary", "rich_text_nodes")
+                ?? origMajor?.arrayValue(at: "opus", "summary", "rich_text_nodes_v2")
+                ?? []
+        )
+        let descText = (
+            origDynamic?.stringValue(at: "desc", "text")
+                ?? origMajor?.stringValue(at: "opus", "summary", "text")
+        )?.nilIfBlank ?? ""
+        let majorDesc = (
+            origMajor?.stringValue(at: "archive", "desc")
+                ?? origMajor?.stringValue(at: "article", "desc")
+                ?? origMajor?.stringValue(at: "common", "desc")
+                ?? origMajor?.stringValue(at: "live", "desc_first")
+        )?.nilIfBlank ?? ""
+
+        var paragraphRuns: [FocusRichTextRun] = []
+        for paragraph in contentParagraphs {
+            for block in paragraph.blocks {
+                let nodes: [FocusRichTextRun]
+                switch block {
+                case let .text(runs): nodes = runs
+                case let .quote(runs): nodes = runs
+                default: nodes = []
+                }
+                let plain = nodes.map(\.plainText).joined().trimmingCharacters(in: .whitespacesAndNewlines)
+                if !plain.isEmpty, plain != title {
+                    if !paragraphRuns.isEmpty { paragraphRuns.append(.text(value: "\n")) }
+                    paragraphRuns.append(contentsOf: nodes)
+                }
+            }
+        }
+
+        let textRuns: [FocusRichTextRun]
+        if !descNodes.isEmpty {
+            textRuns = descNodes
+        } else if !descText.isEmpty, descText != title {
+            textRuns = [.text(value: descText)]
+        } else if !paragraphRuns.isEmpty {
+            textRuns = paragraphRuns
+        } else if !majorDesc.isEmpty, majorDesc != title {
+            textRuns = [.text(value: majorDesc)]
+        } else {
+            textRuns = []
+        }
+
+        var images: [FocusOpusImage] = []
+        var seenImageURLs = Set<String>()
+        for paragraph in contentParagraphs {
+            for block in paragraph.blocks {
+                if case let .image(pics) = block {
+                    for pic in pics {
+                        let key = pic.url?.absoluteString ?? pic.id
+                        if seenImageURLs.insert(key).inserted {
+                            images.append(pic)
+                        }
+                    }
+                }
+            }
+        }
+        let majorImages = collectOpusImages(
+            singleURLs: [
+                origMajor?.stringValue(at: "archive", "cover"),
+                origMajor?.stringValue(at: "pgc", "cover") ?? origMajor?.stringValue(at: "pgc", "ep_cover"),
+                origMajor?.stringValue(at: "courses", "cover"),
+                origMajor?.stringValue(at: "music", "cover"),
+                origMajor?.stringValue(at: "medialist", "cover"),
+                origMajor?.stringValue(at: "live", "cover") ?? origMajor?.stringValue(at: "live", "room_cover"),
+                origMajor?.stringValue(at: "common", "cover"),
+                origMajor?.stringValue(at: "ugc_season", "cover"),
+            ].compactMap { $0 },
+            arrays: [
+                origMajor?.dictionaryValue(at: "opus")?["pics"] as? [Any],
+                origMajor?.dictionaryValue(at: "draw")?["items"] as? [Any],
+                origMajor?.dictionaryValue(at: "article")?["covers"] as? [Any],
+            ].compactMap { $0 }
+        )
+        for img in majorImages {
+            let key = img.url?.absoluteString ?? img.id
+            if seenImageURLs.insert(key).inserted {
+                images.append(img)
+            }
+        }
+
+        let origID = origItem.stringValue(at: "id_str")?.nilIfBlank
+            ?? origBasic?.stringValue(at: "comment_id_str")?.nilIfBlank
+            ?? origBasic?.stringValue(at: "rid_str")?.nilIfBlank
+        let archiveBVID = origMajor?.stringValue(at: "archive", "bvid")?.nilIfBlank
+        let articleCVID: Int64? = origMajor?.stringValue(at: "article", "id").flatMap { Int64($0) }
+            ?? origMajor?.stringValue(at: "article", "id_str").flatMap { Int64($0) }
+            ?? origMajor?.int64Value(at: "article", "id")
+
+        let targetURL = [
+            Self.normalizedURL(origMajor?.stringValue(at: "archive", "jump_url")),
+            archiveBVID.flatMap { URL(string: "https://www.bilibili.com/video/\($0)/") },
+            Self.normalizedURL(origMajor?.stringValue(at: "pgc", "jump_url")),
+            Self.normalizedURL(origMajor?.stringValue(at: "article", "jump_url")),
+            articleCVID.flatMap { URL(string: "https://www.bilibili.com/read/cv\($0)") },
+            Self.normalizedURL(origMajor?.stringValue(at: "courses", "jump_url")),
+            Self.normalizedURL(origMajor?.stringValue(at: "music", "jump_url")),
+            Self.normalizedURL(origMajor?.stringValue(at: "medialist", "jump_url")),
+            Self.normalizedURL(origMajor?.stringValue(at: "live", "jump_url")),
+            Self.normalizedURL(origMajor?.stringValue(at: "ugc_season", "jump_url")),
+            Self.normalizedURL(origMajor?.stringValue(at: "opus", "jump_url")),
+            Self.normalizedURL(origMajor?.stringValue(at: "common", "jump_url")),
+            Self.normalizedURL(origBasic?.stringValue(at: "jump_url")),
+            origID.flatMap { URL(string: "https://www.bilibili.com/opus/\($0)") },
+        ]
+        .compactMap { $0 }
+        .first
+
+        let videoMajorTypes = Set(["MAJOR_TYPE_ARCHIVE", "MAJOR_TYPE_PGC", "MAJOR_TYPE_COURSES", "MAJOR_TYPE_MEDIALIST", "MAJOR_TYPE_UGC_SEASON"])
+        let badgeText: String
+        if videoMajorTypes.contains(origMajorType) || origType.contains("_AV") || archiveBVID != nil {
+            badgeText = "视频"
+        } else if origMajorType == "MAJOR_TYPE_ARTICLE" || articleCVID != nil {
+            badgeText = "专栏"
+        } else if origMajorType == "MAJOR_TYPE_LIVE" {
+            badgeText = "直播"
+        } else if !images.isEmpty {
+            badgeText = "图片"
+        } else {
+            badgeText = "动态"
+        }
+
+        if authorName.isEmpty, title.isEmpty, textRuns.isEmpty, images.isEmpty, targetURL == nil {
+            return nil
+        }
+
+        return FocusOpusReference(
+            authorName: authorName,
+            authorMID: authorMID,
+            authorAvatarURL: authorAvatarURL,
+            publishTime: publishTime,
+            title: title,
+            textRuns: textRuns,
+            images: images,
+            targetURL: targetURL,
+            badgeText: badgeText
+        )
+    }
+
+    private func parseAdditionalReference(from additional: [String: Any]) -> FocusOpusReference? {
+        let type = additional.stringValue(at: "type") ?? ""
+        if type == "ADDITIONAL_TYPE_UGC" || additional.dictionaryValue(at: "ugc") != nil,
+           let ugc = additional.dictionaryValue(at: "ugc")
+        {
+            let title = ugc.stringValue(at: "title")?.nilIfBlank ?? ""
+            let desc = ugc.stringValue(at: "desc_second")?.nilIfBlank ?? ""
+            let cover = Self.normalizedURL(ugc.stringValue(at: "cover"))
+            let jumpURL = Self.normalizedURL(ugc.stringValue(at: "jump_url"))
+            if title.isEmpty, desc.isEmpty, cover == nil, jumpURL == nil { return nil }
+            return FocusOpusReference(
+                title: title,
+                textRuns: desc.isEmpty ? [] : [.text(value: desc)],
+                images: cover.map { [FocusOpusImage(id: $0.absoluteString, url: $0, width: 0, height: 0)] } ?? [],
+                targetURL: jumpURL,
+                badgeText: "视频"
+            )
+        }
+        if type == "ADDITIONAL_TYPE_OPUS" || additional.dictionaryValue(at: "opus") != nil,
+           let opus = additional.dictionaryValue(at: "opus")
+        {
+            let title = opus.stringValue(at: "title")?.nilIfBlank ?? ""
+            let desc = (opus.dictionaryValue(at: "summary")?.stringValue(at: "text") ?? (opus["desc"] as? String))?.nilIfBlank ?? ""
+            let images = collectOpusImages(
+                singleURLs: [opus.stringValue(at: "cover")].compactMap { $0 },
+                arrays: [opus["pics"] as? [Any]].compactMap { $0 }
+            )
+            let jumpURL = Self.normalizedURL(opus.stringValue(at: "jump_url"))
+            if title.isEmpty, desc.isEmpty, images.isEmpty, jumpURL == nil { return nil }
+            return FocusOpusReference(
+                title: title,
+                textRuns: desc.isEmpty ? [] : [.text(value: desc)],
+                images: images,
+                targetURL: jumpURL,
+                badgeText: "动态"
+            )
+        }
+        if type == "ADDITIONAL_TYPE_COMMON" || additional.dictionaryValue(at: "common") != nil,
+           let common = additional.dictionaryValue(at: "common")
+        {
+            let title = (common.stringValue(at: "title") ?? common.stringValue(at: "head_text"))?.nilIfBlank ?? ""
+            let desc = [common.stringValue(at: "desc1"), common.stringValue(at: "desc2")]
+                .compactMap { $0?.nilIfBlank }
+                .joined(separator: "\n")
+            let cover = Self.normalizedURL(common.stringValue(at: "cover"))
+            let jumpURL = Self.normalizedURL(common.stringValue(at: "jump_url"))
+            if title.isEmpty, desc.isEmpty, cover == nil, jumpURL == nil { return nil }
+            return FocusOpusReference(
+                title: title,
+                textRuns: desc.isEmpty ? [] : [.text(value: desc)],
+                images: cover.map { [FocusOpusImage(id: $0.absoluteString, url: $0, width: 0, height: 0)] } ?? [],
+                targetURL: jumpURL,
+                badgeText: "链接"
+            )
+        }
+        return nil
+    }
+
+    private func parseMajorReference(from major: [String: Any], basic: [String: Any]?) -> FocusOpusReference? {
+        let majorType = major.stringValue(at: "type") ?? ""
+        guard !Set(["MAJOR_TYPE_DRAW", "MAJOR_TYPE_OPUS", "MAJOR_TYPE_NONE", ""]).contains(majorType) else {
+            return nil
+        }
+        let synthetic: [String: Any] = [
+            "basic": basic ?? [:],
+            "modules": [
+                "module_dynamic": [
+                    "major": major
+                ]
+            ]
+        ]
+        return parseDynamicItemReference(from: synthetic)
+    }
+
+    private func collectOpusImages(singleURLs: [String], arrays: [[Any]]) -> [FocusOpusImage] {
+        var result: [FocusOpusImage] = []
+        var seen = Set<String>()
+        for array in arrays {
+            for element in array {
+                if let dict = element as? [String: Any],
+                   let url = Self.normalizedURL(dict.stringValue(at: "url") ?? dict.stringValue(at: "src"))
+                {
+                    if seen.insert(url.absoluteString).inserted {
+                        result.append(
+                            FocusOpusImage(
+                                id: url.absoluteString,
+                                url: url,
+                                width: dict.intValue(at: "width") ?? 0,
+                                height: dict.intValue(at: "height") ?? 0
+                            )
+                        )
+                    }
+                } else if let raw = element as? String, let url = Self.normalizedURL(raw) {
+                    if seen.insert(url.absoluteString).inserted {
+                        result.append(FocusOpusImage(id: url.absoluteString, url: url, width: 0, height: 0))
+                    }
+                }
+            }
+        }
+        for raw in singleURLs {
+            if let url = Self.normalizedURL(raw), seen.insert(url.absoluteString).inserted {
+                result.append(FocusOpusImage(id: url.absoluteString, url: url, width: 0, height: 0))
+            }
+        }
+        return result
+    }
+
     private func parseOpusTextNodes(_ nodes: [[String: Any]]) -> [FocusRichTextRun] {
         nodes.compactMap { node -> FocusRichTextRun? in
             let text = node.stringValue(at: "word", "words")
@@ -3839,18 +4483,18 @@ final class FocusOpusDetailService: @unchecked Sendable {
                 ?? node.stringValue(at: "orig_text")
                 ?? ""
             let style = node.dictionaryValue(at: "word", "style") ?? node.dictionaryValue(at: "style") ?? [:]
-            let linkURL = URL(string: Self.normalizedURLString(
+            let linkURL = Self.normalizedURL(
                 node.stringValue(at: "rich", "jump_url")
                     ?? node.stringValue(at: "jump_url")
                     ?? node.stringValue(at: "link")
-            ) ?? "")
-            let emojiURL = URL(string: Self.normalizedURLString(
+            )
+            let emojiURL = Self.normalizedURL(
                 node.stringValue(at: "rich", "emoji", "icon_url")
                     ?? node.stringValue(at: "rich", "emoji", "url")
                     ?? node.stringValue(at: "emoji", "icon_url")
                     ?? node.stringValue(at: "emoji", "url")
                     ?? node.stringValue(at: "icon_url")
-            ) ?? "")
+            )
 
             if let emojiURL {
                 let path = emojiURL.path.lowercased()
@@ -3881,6 +4525,50 @@ final class FocusOpusDetailService: @unchecked Sendable {
         }
     }
 
+    private func signedWbiQuery(parameters: [String: String], referer: String) async throws -> String {
+        let key = try await fetchWbiKey(referer: referer)
+        var items = parameters
+        items.removeValue(forKey: "w_rid")
+        items["wts"] = String(Int64(Date().timeIntervalSince1970))
+        if items["web_location"]?.isEmpty != false {
+            items["web_location"] = "1550101"
+        }
+        let query = items.keys.sorted().map { key in
+            let sanitized = (items[key] ?? "").filter { !"!'()*".contains($0) }
+            return "\(Self.rfc3986Encode(key))=\(Self.rfc3986Encode(sanitized))"
+        }.joined(separator: "&")
+        let digest = Insecure.MD5.hash(data: Data((query + key).utf8))
+        let wrid = digest.map { String(format: "%02x", $0) }.joined()
+        return "\(query)&w_rid=\(wrid)"
+    }
+
+    private func fetchWbiKey(referer: String) async throws -> String {
+        let now = Date()
+        if let cachedWbiKey, now < cachedWbiExpiration {
+            return cachedWbiKey
+        }
+        let nav = try await requestObject(urlString: "https://api.bilibili.com/x/web-interface/nav", referer: referer)
+        guard
+            let imgURL = nav.stringValue(at: "data", "wbi_img", "img_url"),
+            let subURL = nav.stringValue(at: "data", "wbi_img", "sub_url")
+        else {
+            throw URLError(.cannotParseResponse)
+        }
+        let imgKey = imgURL.substringAfterLast("/").substringBefore(".")
+        let subKey = subURL.substringAfterLast("/").substringBefore(".")
+        let raw = Array(imgKey + subKey)
+        let mixed = Self.wbiMixinTable.compactMap { index in
+            raw.indices.contains(index) ? raw[index] : nil
+        }
+        let resolved = String(mixed.prefix(32))
+        guard resolved.count == 32 else {
+            throw URLError(.cannotParseResponse)
+        }
+        cachedWbiKey = resolved
+        cachedWbiExpiration = now.addingTimeInterval(25 * 60)
+        return resolved
+    }
+
     private func requestObject(urlString: String, referer: String) async throws -> [String: Any] {
         guard let url = URL(string: urlString) else {
             throw ServiceError.message("请求地址无效")
@@ -3904,7 +4592,11 @@ final class FocusOpusDetailService: @unchecked Sendable {
         let cookies = await cookieProvider.loadCookies()
         request = CookieRequestPolicy.attach(cookies: cookies, to: request)
 
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = if let requestHandler {
+            try await requestHandler(request)
+        } else {
+            try await session.data(for: request)
+        }
         guard let httpResponse = response as? HTTPURLResponse, (200 ... 299).contains(httpResponse.statusCode) else {
             throw ServiceError.message("网络请求失败")
         }
@@ -3930,18 +4622,63 @@ final class FocusOpusDetailService: @unchecked Sendable {
         return nil
     }
 
-    private static func normalizedURLString(_ raw: String?) -> String? {
-        guard let raw = raw?.nilIfBlank else {
+    private static func normalizedURL(_ raw: String?) -> URL? {
+        guard var value = raw?.nilIfBlank else {
             return nil
         }
-        if raw.lowercased().hasPrefix("http://") {
-            return "https://" + raw.dropFirst("http://".count)
+        if let schemeURL = URL(string: value), schemeURL.scheme?.lowercased() == "bilibili",
+           let host = schemeURL.host?.lowercased()
+        {
+            let parts = schemeURL.path.split(separator: "/").map(String.init)
+            switch host {
+            case "following", "opus":
+                if parts.count == 2, parts[0].lowercased() == "detail", !parts[1].isEmpty, parts[1].allSatisfy(\.isNumber) {
+                    return URL(string: "https://www.bilibili.com/opus/\(parts[1])")
+                }
+            case "dynamic":
+                if parts.count == 1, !parts[0].isEmpty, parts[0].allSatisfy(\.isNumber) {
+                    return URL(string: "https://www.bilibili.com/opus/\(parts[0])")
+                }
+            case "video":
+                if parts.count == 1, parts[0].uppercased().hasPrefix("BV") {
+                    return URL(string: "https://www.bilibili.com/video/\(parts[0])/")
+                }
+            default:
+                break
+            }
         }
-        if raw.hasPrefix("//") {
-            return "https:\(raw)"
+        if value.lowercased().hasPrefix("http://") {
+            value = "https://" + value.dropFirst("http://".count)
+        } else if value.hasPrefix("//") {
+            value = "https:\(value)"
+        } else if value.hasPrefix("/") {
+            value = "https://www.bilibili.com\(value)"
         }
-        return raw
+        guard let url = URL(string: value) else {
+            return nil
+        }
+        return FocusNavigationPolicy.canonicalWebURL(for: url)
     }
+
+    private static func normalizedURLString(_ raw: String?) -> String? {
+        normalizedURL(raw)?.absoluteString
+    }
+
+    private static func rfc3986Encode(_ value: String) -> String {
+        let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+        return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
+    }
+
+    private static let wbiMixinTable: [Int] = [
+        46, 47, 18, 2, 53, 8, 23, 32,
+        15, 50, 10, 31, 58, 3, 45, 35,
+        27, 43, 5, 49, 33, 9, 42, 19,
+        29, 28, 14, 39, 12, 38, 41, 13,
+        37, 48, 7, 16, 24, 55, 40, 61,
+        26, 17, 0, 1, 60, 51, 30, 4,
+        22, 25, 54, 21, 56, 59, 6, 63,
+        57, 62, 11, 36, 20, 52, 34, 44,
+    ]
 
     struct FocusOpusDetailContent {
         let id: String
@@ -5441,8 +6178,14 @@ struct FocusOpusDetailView: View {
         case let .loaded(page):
             let allImages = page.paragraphs.flatMap { paragraph in
                 paragraph.blocks.flatMap { block -> [FocusOpusImage] in
-                    guard case let .image(images) = block else { return [] }
-                    return images
+                    switch block {
+                    case let .image(images):
+                        return images
+                    case let .reference(reference):
+                        return reference.hasGalleryPhotos ? reference.images : []
+                    default:
+                        return []
+                    }
                 }
             }
             let validImages = allImages.filter { $0.url != nil }
@@ -5587,6 +6330,21 @@ private struct FocusOpusParagraphCard: View {
                         RoundedRectangle(cornerRadius: 14, style: .continuous)
                             .fill(Color(uiColor: .tertiarySystemFill))
                     )
+                case let .quote(nodes):
+                    FocusInlineRichText(runs: nodes, foreground: .secondary, onOpenURL: onOpenURL)
+                        .padding(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .fill(Color(uiColor: .tertiarySystemFill))
+                        )
+                case let .reference(reference):
+                    FocusOpusReferenceCard(
+                        reference: reference,
+                        referer: "https://www.bilibili.com/",
+                        onOpenURL: onOpenURL,
+                        onOpenImage: onOpenImage
+                    )
                 }
             }
         }
@@ -5596,6 +6354,112 @@ private struct FocusOpusParagraphCard: View {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .fill(Color(uiColor: .secondarySystemGroupedBackground))
         )
+    }
+}
+
+private struct FocusOpusReferenceCard: View {
+    let reference: FocusOpusReference
+    let referer: String
+    let onOpenURL: (URL) -> Void
+    let onOpenImage: (FocusOpusImage) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let tip = reference.unavailableTip, !tip.isEmpty {
+                Text(tip)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                if !reference.authorName.isEmpty || !reference.publishTime.isEmpty || !reference.badgeText.isEmpty {
+                    HStack(spacing: 8) {
+                        if !reference.authorName.isEmpty {
+                            Button {
+                                guard reference.authorMID > 0,
+                                      let url = URL(string: "https://space.bilibili.com/\(reference.authorMID)")
+                                else { return }
+                                onOpenURL(url)
+                            } label: {
+                                Text("@\(reference.authorName)")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(FocusDesign.primary)
+                                    .lineLimit(1)
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(reference.authorMID <= 0)
+                        }
+                        if !reference.publishTime.isEmpty {
+                            Text(reference.publishTime)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 0)
+                        if !reference.badgeText.isEmpty {
+                            Text(reference.badgeText)
+                                .font(.caption2.weight(.semibold))
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 3)
+                                .background(FocusDesign.primary.opacity(0.12))
+                                .foregroundStyle(FocusDesign.primary)
+                                .clipShape(Capsule())
+                        }
+                    }
+                }
+
+                if !reference.title.isEmpty {
+                    Text(reference.title)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(3)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                if !reference.textRuns.isEmpty {
+                    FocusInlineRichText(runs: reference.textRuns, font: .subheadline, foreground: .secondary, onOpenURL: onOpenURL)
+                }
+
+                if !reference.images.isEmpty {
+                    if reference.hasGalleryPhotos {
+                        FocusOpusImageGrid(images: reference.images, onOpenImage: onOpenImage)
+                    } else if let cover = reference.images.first {
+                        FocusRemoteImage(url: cover.url, referer: reference.targetURL?.absoluteString ?? referer) { phase in
+                            switch phase {
+                            case let .success(image):
+                                image
+                                    .resizable()
+                                    .scaledToFill()
+                            case .failure:
+                                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                    .fill(Color(uiColor: .secondarySystemFill))
+                                    .overlay(Image(systemName: "photo").foregroundStyle(.secondary))
+                            case .empty:
+                                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                    .fill(Color(uiColor: .secondarySystemFill))
+                                    .overlay(ProgressView())
+                            }
+                        }
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 164)
+                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    }
+                }
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color(uiColor: .tertiarySystemGroupedBackground))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color(uiColor: .separator).opacity(0.28), lineWidth: 0.5)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture {
+            guard reference.unavailableTip == nil, let url = reference.targetURL else { return }
+            onOpenURL(url)
+        }
     }
 }
 
@@ -5653,6 +6517,12 @@ private struct FocusOpusCommentCard: View {
     let comment: FocusNativeCommentPayload
     let onOpenURL: (URL) -> Void
     let onOpenImages: ([String], Int) -> Void
+    @State private var didCopy = false
+
+    private var copyableText: String {
+        let rich = comment.contentRuns.map(\.plainText).joined()
+        return rich.isEmpty ? comment.content : rich
+    }
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -5678,8 +6548,18 @@ private struct FocusOpusCommentCard: View {
                 Text(comment.author)
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(FocusDesign.primary)
+                    .contextMenu {
+                        if !copyableText.isEmpty {
+                            Button {
+                                UIPasteboard.general.string = copyableText
+                                didCopy = true
+                            } label: {
+                                Label("复制评论", systemImage: "doc.on.doc")
+                            }
+                        }
+                    }
 
-                FocusInlineRichText(runs: comment.contentRuns, onOpenURL: onOpenURL)
+                FocusInlineRichText(runs: comment.contentRuns, onOpenURL: onOpenURL, selectable: true)
 
                 FocusCommentImageStrip(
                     urls: comment.imageURLs.compactMap(URL.init(string:)),
@@ -5688,15 +6568,29 @@ private struct FocusOpusCommentCard: View {
                 )
 
                 ForEach(Array(comment.previewReplies.prefix(2).enumerated()), id: \.offset) { _, reply in
+                    let replyCopyable = {
+                        let rich = reply.contentRuns.map(\.plainText).joined()
+                        return rich.isEmpty ? reply.content : rich
+                    }()
                     HStack(alignment: .top, spacing: 2) {
                         Text("\(reply.author)：")
                             .font(.caption)
                             .foregroundStyle(FocusDesign.primary)
+                            .contextMenu {
+                                if !replyCopyable.isEmpty {
+                                    Button {
+                                        UIPasteboard.general.string = replyCopyable
+                                    } label: {
+                                        Label("复制回复", systemImage: "doc.on.doc")
+                                    }
+                                }
+                            }
                         FocusInlineRichText(
                             runs: reply.contentRuns,
                             font: .caption,
                             foreground: .secondary,
-                            onOpenURL: onOpenURL
+                            onOpenURL: onOpenURL,
+                            selectable: true
                         )
                     }
                     .padding(.leading, 8)
@@ -5711,10 +6605,24 @@ private struct FocusOpusCommentCard: View {
                 let meta = [comment.timeText, comment.likeText, comment.replyText]
                     .filter { !$0.isEmpty }
                     .joined(separator: " · ")
-                if !meta.isEmpty {
-                    Text(meta)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                if !meta.isEmpty || !copyableText.isEmpty {
+                    HStack(spacing: 12) {
+                        if !meta.isEmpty {
+                            Text(meta)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 0)
+                        if !copyableText.isEmpty {
+                            Button(didCopy ? "已复制" : "复制") {
+                                UIPasteboard.general.string = copyableText
+                                didCopy = true
+                            }
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .buttonStyle(.plain)
+                        }
+                    }
                 }
             }
         }
@@ -5724,6 +6632,11 @@ private struct FocusOpusCommentCard: View {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .fill(Color(uiColor: .secondarySystemGroupedBackground))
         )
+        .task(id: didCopy) {
+            guard didCopy else { return }
+            try? await Task.sleep(for: .seconds(1.5))
+            didCopy = false
+        }
     }
 }
 #endif

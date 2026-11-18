@@ -1,6 +1,7 @@
 package org.bilibilifocus.android.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
@@ -97,6 +98,7 @@ fun FocusDynamicFeedScreen(
     onOpenLogin: () -> Unit = {},
     onOpenCard: (DynamicCard) -> Unit = {},
     onOpenUser: (Long) -> Unit = {},
+    onOpenURL: (String) -> Unit = {},
     onOpenSearch: (String) -> Unit = {},
     onSelectedFilterChange: (FocusDynamicFilterKind) -> Unit = {},
     contentPadding: PaddingValues = PaddingValues(),
@@ -372,6 +374,16 @@ fun FocusDynamicFeedScreen(
                                                 referer = card.targetURL,
                                             )
                                         },
+                                        onOpenQuotedCard = { quoted ->
+                                            (quoted.videoURL ?: quoted.targetURL)?.let(onOpenURL)
+                                        },
+                                        onOpenQuotedImage = { urls, index, referer ->
+                                            galleryRequest = FocusImageGalleryRequest(
+                                                images = urls,
+                                                initialIndex = index,
+                                                referer = referer,
+                                            )
+                                        },
                                     )
                                 }
                             }
@@ -468,6 +480,8 @@ private fun FocusDynamicCard(
     imageLayout: FocusDynamicImageLayout,
     onOpenUser: (Long) -> Unit,
     onOpenImage: (Int) -> Unit,
+    onOpenQuotedCard: (DynamicCard.QuotedCard) -> Unit = {},
+    onOpenQuotedImage: (List<String>, Int, String) -> Unit = { _, _, _ -> },
 ) {
     Column(
         modifier = Modifier.padding(16.dp),
@@ -512,6 +526,180 @@ private fun FocusDynamicCard(
 
         if (card.coverURLs.isNotEmpty()) {
             FocusDynamicCardCovers(card = card, imageLayout = imageLayout, onOpenImage = onOpenImage)
+        }
+
+        card.quotedCard?.let { quoted ->
+            FocusQuotedDynamicCard(
+                quoted = quoted,
+                imageLayout = imageLayout,
+                onOpenUser = onOpenUser,
+                onOpenQuoted = { onOpenQuotedCard(quoted) },
+                onOpenImage = { index ->
+                    onOpenQuotedImage(quoted.coverURLs, index, quoted.targetURL ?: card.targetURL)
+                },
+            )
+        }
+    }
+}
+
+@Composable
+private fun FocusQuotedDynamicCard(
+    quoted: DynamicCard.QuotedCard,
+    imageLayout: FocusDynamicImageLayout,
+    onOpenUser: (Long) -> Unit,
+    onOpenQuoted: () -> Unit,
+    onOpenImage: (Int) -> Unit,
+) {
+    val quotedShape = RoundedCornerShape(12.dp)
+    val canOpen = quoted.unavailableTip == null && (quoted.videoURL ?: quoted.targetURL) != null
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(quotedShape)
+            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f))
+            .border(
+                width = 0.5.dp,
+                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f),
+                shape = quotedShape,
+            )
+            .then(if (canOpen) Modifier.clickable(onClick = onOpenQuoted) else Modifier)
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        val unavailableTip = quoted.unavailableTip
+        if (!unavailableTip.isNullOrBlank()) {
+            Text(
+                text = unavailableTip,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            return
+        }
+
+        if (quoted.author.name.isNotBlank() || quoted.publishTime.isNotBlank()) {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                if (quoted.author.name.isNotBlank()) {
+                    Text(
+                        text = "@${quoted.author.name}",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.primary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier
+                            .weight(1f, fill = false)
+                            .then(
+                                if (quoted.author.mid > 0) {
+                                    Modifier.clickable { onOpenUser(quoted.author.mid) }
+                                } else {
+                                    Modifier
+                                },
+                            ),
+                    )
+                }
+                if (quoted.publishTime.isNotBlank()) {
+                    Text(
+                        text = quoted.publishTime,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                FocusKindBadge(kind = quoted.kind)
+            }
+        } else {
+            FocusKindBadge(kind = quoted.kind)
+        }
+
+        if (quoted.title.isNotBlank()) {
+            Text(
+                text = quoted.title,
+                style = MaterialTheme.typography.titleSmall,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+
+        if (quoted.text.isNotBlank()) {
+            Text(
+                text = quoted.text,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 4,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+
+        if (quoted.coverURLs.isNotEmpty()) {
+            FocusQuotedCardCovers(
+                quoted = quoted,
+                imageLayout = imageLayout,
+                onOpenImage = onOpenImage,
+            )
+        }
+    }
+}
+
+@Composable
+private fun FocusQuotedCardCovers(
+    quoted: DynamicCard.QuotedCard,
+    imageLayout: FocusDynamicImageLayout,
+    onOpenImage: (Int) -> Unit,
+) {
+    if (quoted.coverURLs.size == 1) {
+        val url = quoted.coverURLs.first()
+        when (quoted.kind) {
+            DynamicCard.Kind.IMAGE -> {
+                FocusSingleImageCover(
+                    request = imageLayout.quotedCover(quoted, url),
+                    modifier = Modifier.fillMaxWidth(),
+                    onClick = { onOpenImage(0) },
+                )
+            }
+            DynamicCard.Kind.VIDEO,
+            DynamicCard.Kind.ARTICLE_LIKE,
+            DynamicCard.Kind.TEXT,
+            -> {
+                FocusCoverImage(
+                    request = imageLayout.quotedCover(quoted, url),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .aspectRatio(16f / 9f),
+                    contentScale = Crop,
+                    showBackground = true,
+                )
+            }
+        }
+        return
+    }
+
+    val visibleURLs = quoted.coverURLs.take(4)
+    val rows = visibleURLs.chunked(2)
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        rows.forEachIndexed { rowIndex, rowUrls ->
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                rowUrls.forEachIndexed { columnIndex, url ->
+                    FocusCoverImage(
+                        request = imageLayout.quotedCover(quoted, url),
+                        modifier = Modifier
+                            .weight(1f)
+                            .aspectRatio(1f)
+                            .then(
+                                if (quoted.kind == DynamicCard.Kind.IMAGE) {
+                                    Modifier.clickable { onOpenImage(rowIndex * 2 + columnIndex) }
+                                } else {
+                                    Modifier
+                                },
+                            ),
+                        contentScale = Crop,
+                        showBackground = true,
+                    )
+                }
+                repeat(2 - rowUrls.size) {
+                    Spacer(modifier = Modifier.weight(1f))
+                }
+            }
         }
     }
 }

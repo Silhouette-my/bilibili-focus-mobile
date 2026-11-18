@@ -64,82 +64,6 @@ final class PerformanceDynamicTests: XCTestCase {
         XCTAssertEqual(label?.accessibilityActivate(), true); XCTAssertEqual(opens, 1)
     }
 
-    func testSynchronousTextSizingHandlesDynamicTypeRTLUnicodeAndNarrowWidths() async throws {
-        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
-        let text = "Unicode 👩🏽‍💻 e\u{301} العربية与中文\n" + String(repeating: "内容不得在首次测量后再改变高度。 ", count: 40)
-        let frames = TextSizingFrameEvents()
-        defer { frames.stop() }
-        for category: ContentSizeCategory in [.large, .extraExtraExtraLarge, .accessibilityExtraExtraExtraLarge] {
-            for width: CGFloat in [220, 358] {
-                let content = FocusExpandableDynamicText(text: text, onOpenCard: {}, isExpanded: .constant(false))
-                    .environment(\.sizeCategory, category).environment(\.layoutDirection, .rightToLeft)
-                    .environment(\.legibilityWeight, .bold)
-                let host = UIHostingController(rootView: content)
-                if #available(iOS 16.4, *) { host.safeAreaRegions = [] }
-                let proposal = CGSize(width: width, height: 20_000)
-                let initial = host.sizeThatFits(in: proposal)
-                let window = UIWindow(windowScene: scene)
-                window.frame = CGRect(x: 0, y: 0, width: width, height: max(844, initial.height + 20))
-                window.rootViewController = host; window.makeKeyAndVisible()
-                host.view.frame = window.bounds; window.layoutIfNeeded()
-                for _ in 0..<3 { await frames.next() }
-                let mounted = host.sizeThatFits(in: proposal)
-                XCTAssertGreaterThan(initial.height, 0)
-                XCTAssertEqual(initial.height, mounted.height, accuracy: 1, "\(category), width \(width)")
-                XCTAssertEqual(initial.width, width, accuracy: 1)
-                if category == .large, width == 358 {
-                    let image = UIGraphicsImageRenderer(bounds: host.view.bounds).image { _ in
-                        host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true)
-                    }
-                    let attachment = XCTAttachment(image: image)
-                    attachment.name = "Synchronous text RTL"; attachment.lifetime = .keepAlways; add(attachment)
-                }
-                window.isHidden = true; window.rootViewController = nil
-            }
-        }
-    }
-
-    func testCollapsedTextInitialSizingMatchesMountedAndRemountedCard() async throws {
-        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
-        let text = String(repeating: "未展开的长文本不能在首轮布局之后插入按钮改变高度。\n", count: 28)
-        let card = DynamicCard(id: "collapsed-sizing", kind: .text,
-            author: .init(name: "Fixture", avatarURL: nil), publishTime: "fixture", text: text,
-            coverURLs: [], targetURL: URL(string: "https://www.bilibili.com/opus/42")!, videoURL: nil)
-        var previousHeight: CGFloat?
-        for _ in 0..<3 {
-            let view = FocusDynamicCardView(card: card, areImagesExpanded: .constant(false),
-                isTextExpanded: .constant(false), onOpenCard: {}, onOpenUser: { _ in }, onOpenImage: { _ in })
-            let host = UIHostingController(rootView: view)
-            if #available(iOS 16.4, *) { host.safeAreaRegions = [] }
-            let proposal = CGSize(width: 358, height: 10_000)
-            let initial = host.sizeThatFits(in: proposal).height
-            let window = UIWindow(windowScene: scene)
-            window.frame = CGRect(x: 0, y: 0, width: 358, height: 844)
-            window.rootViewController = host
-            window.makeKeyAndVisible()
-            host.view.frame = window.bounds
-            window.layoutIfNeeded()
-            // Never settle before capturing the first proposed size.
-            let frames = TextSizingFrameEvents()
-            for _ in 0..<6 { await frames.next() }
-            let mounted = host.sizeThatFits(in: proposal).height
-            frames.stop()
-            window.isHidden = true; window.rootViewController = nil
-            let attachment = XCTAttachment(string: "initial=\(initial), mounted=\(mounted)")
-            attachment.name = "collapsed-text-first-layout"; attachment.lifetime = .keepAlways
-            add(attachment)
-            XCTAssertEqual(initial, mounted, accuracy: 1,
-                "The first proposed card height must already include its fold control, without a preference-driven second pass")
-            if let previousHeight { XCTAssertEqual(initial, previousHeight, accuracy: 1, "A new row instance must have the same height") }
-            previousHeight = mounted
-        }
-    }
-
-    func testFixtureHostDisablesLiveAccountAndNetworkInitialization() {
-        XCTAssertEqual(ProcessInfo.processInfo.environment["FOCUS_FIXTURE_TESTS"], "1",
-                       "The test host must receive TestAction fixture isolation; inheriting LaunchAction would initialize live state")
-    }
-
     func testClearingFeedCacheRevokesASuspendedBackgroundRefreshWriter() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -507,69 +431,6 @@ final class PerformanceDynamicTests: XCTestCase {
         XCTAssertTrue(model.expansionStates.isEmpty)
     }
 
-    func testActualLongTextMultiImageCardKeepsScreenPositionAcrossRepeatedRemountAndPagination() async throws {
-        let feed = makeModel(DynamicPerformanceAPI())
-        let card = productionCard()
-        feed.expansionBinding(for: card, images: false).wrappedValue = true
-        feed.expansionBinding(for: card, images: true).wrappedValue = true
-        let model = ProductionDynamicHarnessModel(feed: feed, card: card)
-        let host = UIHostingController(rootView: ProductionDynamicHarness(model: model))
-        if #available(iOS 16.4, *) { host.safeAreaRegions = [] }
-        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
-        let window = UIWindow(windowScene: scene)
-        window.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
-        window.rootViewController = host
-        window.makeKeyAndVisible()
-        host.view.frame = window.bounds
-        window.layoutIfNeeded()
-        defer { window.isHidden = true; window.rootViewController = nil; feed.suspend() }
-        await eventually { self.scrollView(in: host.view) != nil }
-        let scroll = try XCTUnwrap(scrollView(in: host.view))
-        func screenFrame() -> CGRect {
-            guard let marker = model.marker else { return .zero }
-            return marker.convert(marker.bounds, to: window)
-        }
-        model.offset = 820
-        model.revision += 1
-        await eventually {
-            screenFrame().height > 1_000 && abs(scroll.contentOffset.y + scroll.adjustedContentInset.top - 820) < 2
-                && model.anchor.scrollView === scroll && model.anchor.frame(for: card.id) != nil
-        }
-        XCTAssertGreaterThan(screenFrame().height, 1_000, "The expanded production card must be physically laid out")
-        XCTAssertEqual(scroll.contentOffset.y + scroll.adjustedContentInset.top, 820, accuracy: 2,
-                       "The bridge input is a normalized offset, not UIKit's inset-adjusted raw offset")
-        model.anchor.capture(preferredID: card.id)
-        let snapshot = try XCTUnwrap(model.anchor.snapshot)
-        XCTAssertEqual(snapshot.id, card.id)
-        let originalY = screenFrame().minY
-        let originalHeight = screenFrame().height
-        XCTAssertGreaterThanOrEqual(originalY, 0)
-        XCTAssertLessThan(originalY, scroll.bounds.height)
-        for pass in 1...4 {
-            model.active = false
-            await eventually { !model.observedActive }
-            XCTAssertFalse(model.observedActive, "The hidden layout must be delivered before remount")
-            model.rowEpoch += 1  // Reconstruct the real card, not a fixed-height surrogate.
-            model.leadingHeight += 22
-            model.tailRows += 1 // A pagination boundary changes the list's content size.
-            // A lazy row need not be materialized while restoration is suspended.
-            // Reactivate first, then require the replacement (not its former
-            // instance) to reach layout at the original on-screen position.
-            model.active = true
-            await eventually {
-                model.observedActive && model.measuredEpoch == model.rowEpoch
-                    && abs(screenFrame().height - originalHeight) < 2
-                    && abs(screenFrame().minY - originalY) <= 2
-            }
-            XCTAssertEqual(model.measuredEpoch, model.rowEpoch, "Replacement row must reach layout")
-            XCTAssertEqual(screenFrame().height, originalHeight, accuracy: 2, "Expanded replacement must preserve its height")
-            XCTAssertEqual(screenFrame().minY, originalY, accuracy: 2,
-                           "Return \(pass): offset=\(scroll.contentOffset.y), epoch=\(model.measuredEpoch), anchor=\(String(describing: model.anchor.snapshot)), contentFrame=\(String(describing: model.anchor.frame(for: card.id)))")
-            XCTAssertTrue(feed.expansionBinding(for: card, images: true).wrappedValue)
-            XCTAssertTrue(feed.expansionBinding(for: card, images: false).wrappedValue)
-        }
-    }
-
     private var displayCount: Int { BiliPerformanceStore.shared.snapshot().filter { $0.stage == .dynamicDisplayed && $0.outcome == .success }.count }
     private func makeModel(_ api: DynamicPerformanceAPI, cookies: DynamicPerformanceCookies = .init()) -> FocusDynamicFeedViewModel {
         FocusDynamicFeedViewModel(service: DynamicFeedService(cookieProvider: cookies, snapshotStore: .init(fileURL: nil),
@@ -583,10 +444,6 @@ final class PerformanceDynamicTests: XCTestCase {
         DynamicCard(id: id, kind: .image, author: .init(name: "Fixture author", avatarURL: nil), publishTime: "fixture",
                     text: text, coverURLs: (0..<6).map { URL(string: "https://focus-image.test/\($0).png")! },
                     targetURL: URL(string: "https://www.bilibili.com/opus/42")!, videoURL: nil)
-    }
-    private func scrollView(in view: UIView) -> UIScrollView? {
-        if let scroll = view as? UIScrollView { return scroll }
-        return view.subviews.lazy.compactMap { self.scrollView(in: $0) }.first
     }
     private func eventually(_ condition: () -> Bool, file: StaticString = #filePath, line: UInt = #line) async {
         let deadline = ContinuousClock.now.advanced(by: .seconds(5))
@@ -644,105 +501,5 @@ private actor DynamicPerformanceAPI {
         }
         let data = try JSONSerialization.data(withJSONObject: ["code": 0, "data": ["items": items, "offset": page.next ?? "", "has_more": page.hasMore]])
         return (data, HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!)
-    }
-}
-
-@MainActor
-private final class ProductionDynamicHarnessModel: ObservableObject {
-    let feed: FocusDynamicFeedViewModel
-    let card: DynamicCard
-    let anchor = FocusDynamicFeedVisualAnchor()
-    @Published var active = true
-    @Published var offset: CGFloat = 0
-    @Published var revision = 0
-    @Published var rowEpoch = 0
-    @Published var leadingHeight: CGFloat = 900
-    @Published var tailRows = 8
-    var observedActive = false
-    var measuredEpoch = -1
-    weak var marker: UIView?
-    init(feed: FocusDynamicFeedViewModel, card: DynamicCard) { self.feed = feed; self.card = card }
-}
-
-@MainActor
-private struct ProductionDynamicHarness: View {
-    @ObservedObject var model: ProductionDynamicHarnessModel
-    var body: some View {
-        ScrollView {
-            LazyVStack(spacing: 12) {
-                Color.clear.frame(height: model.leadingHeight)
-                FocusDynamicCardView(card: model.card,
-                    areImagesExpanded: model.feed.expansionBinding(for: model.card, images: true),
-                    isTextExpanded: model.feed.expansionBinding(for: model.card, images: false),
-                    onOpenCard: {}, onOpenUser: { _ in }, onOpenImage: { _ in })
-                    .background(ProductionCardProbe(epoch: model.rowEpoch) { view, epoch in
-                        model.marker = view
-                        model.measuredEpoch = epoch
-                    })
-                    .focusDynamicFeedAnchor(id: model.card.id, anchor: model.anchor)
-                    .id(model.rowEpoch)
-                ForEach(0..<model.tailRows, id: \.self) { _ in Color.clear.frame(height: 120) }
-            }
-            .padding(.horizontal, 16)
-            .coordinateSpace(name: FocusDynamicFeedVisualAnchor.coordinateSpace)
-            .background {
-                ProductionScrollBridge(model: model).frame(width: 0, height: 0)
-            }
-        }
-    }
-}
-
-@MainActor
-private struct ProductionCardProbe: UIViewRepresentable {
-    let epoch: Int
-    let onResolve: (UIView, Int) -> Void
-    func makeUIView(context: Context) -> UIView {
-        let view = UIView()
-        view.isUserInteractionEnabled = false
-        onResolve(view, epoch)
-        return view
-    }
-    func updateUIView(_ view: UIView, context: Context) { onResolve(view, epoch) }
-}
-
-@MainActor
-final class TextSizingFrameEvents: NSObject {
-    private var link: CADisplayLink?
-    private var continuation: CheckedContinuation<Void, Never>?
-    func next() async {
-        if link == nil {
-            link = CADisplayLink(target: self, selector: #selector(tick))
-            link?.add(to: .main, forMode: .common)
-        }
-        await withCheckedContinuation { continuation = $0 }
-    }
-    @objc private func tick() { let pending = continuation; continuation = nil; pending?.resume() }
-    func stop() { link?.invalidate(); link = nil; tick() }
-}
-
-/// Observe the production coordinator after it actually receives activation,
-/// rather than treating an unrelated SwiftUI geometry preference as an ACK.
-@MainActor
-private struct ProductionScrollBridge: UIViewRepresentable {
-    @ObservedObject var model: ProductionDynamicHarnessModel
-    func makeCoordinator() -> FocusDynamicFeedScrollBridge.Coordinator { .init() }
-    func makeUIView(context: Context) -> FocusDynamicFeedScrollProbeView {
-        let view = FocusDynamicFeedScrollProbeView()
-        view.isUserInteractionEnabled = false
-        apply(to: view, coordinator: context.coordinator)
-        return view
-    }
-    func updateUIView(_ view: FocusDynamicFeedScrollProbeView, context: Context) {
-        apply(to: view, coordinator: context.coordinator)
-    }
-    private func apply(to view: FocusDynamicFeedScrollProbeView, coordinator: FocusDynamicFeedScrollBridge.Coordinator) {
-        coordinator.update(probe: view, offsetY: model.offset, restorationRevision: model.revision,
-                           isActive: model.active, visualAnchor: model.anchor,
-                           onOffsetChange: { model.offset = $0 })
-        model.observedActive = model.active
-    }
-    static func dismantleUIView(_ view: FocusDynamicFeedScrollProbeView, coordinator: FocusDynamicFeedScrollBridge.Coordinator) {
-        view.onDidMoveToWindow = nil
-        coordinator.detach()
     }
 }

@@ -74,26 +74,6 @@ final class FocusDynamicFeedViewModel: ObservableObject {
     func cancelDetailReturn() { scrollAnchor.cancelReturn?() }
     func finishDetailReturnNow() { scrollAnchor.forceReturn?() }
 
-#if DEBUG
-    // Fixture-only observation and seeding; normal launches cannot access user data through this seam.
-    weak var fixtureAnchor: FocusDynamicFeedVisualAnchor?
-    func installFixtureCards(_ cards: [DynamicCard]) {
-        precondition(FocusTestRuntime.isRunningFixtures)
-        suspend()
-        state = .loaded(cards)
-        nextOffset = nil
-        loadedSessionVersion = service.sessionVersion
-        isVisible = true
-        lastRefreshAttempt = now()
-    }
-    func installFixturePendingPage(_ cards: [DynamicCard]) {
-        precondition(FocusTestRuntime.isRunningFixtures)
-        pendingPage = .init(cards: cards, nextOffset: nil)
-        pendingPageSessionVersion = service.sessionVersion
-        applyPendingPageIfPossible()
-    }
-#endif
-
     init(service: DynamicFeedService, now: @escaping () -> Date = Date.init,
          automaticRefreshInterval: TimeInterval = 60) {
         self.service = service
@@ -277,6 +257,7 @@ final class FocusDynamicFeedViewModel: ObservableObject {
         var hash = Hasher()
         hash.combine(card.text)
         hash.combine(card.coverURLs)
+        hash.combine(card.quotedCard)
         return hash.finalize()
     }
 
@@ -578,6 +559,7 @@ struct FocusDynamicFeedView: View {
     let onOpenUser: (Int64) -> Void
     let onOpenLogin: () -> Void
     let onSearch: () -> Void
+    var onOpenQuotedURL: (URL) -> Void = { _ in }
     @State private var galleryRequest: FocusImageGalleryRequest?
     private var scrollAnchor: FocusDynamicFeedVisualAnchor { viewModel.scrollAnchor }
     @State private var prefetchCardID: String?
@@ -586,9 +568,6 @@ struct FocusDynamicFeedView: View {
             .task(id: isActive) {
                 scrollAnchor.onVisibleCard = { [weak viewModel] in viewModel?.markDisplayed() }
                 scrollAnchor.onInteractionEnded = { [weak viewModel] in viewModel?.markDisplayed() }
-#if DEBUG
-                if FocusTestRuntime.isRunningFixtures { viewModel.fixtureAnchor = scrollAnchor }
-#endif
             }
             .onChange(of: viewModel.dataRevision) { _ in scrollAnchor.clear() }
             .onChange(of: galleryRequest != nil) { covered in
@@ -678,6 +657,18 @@ struct FocusDynamicFeedView: View {
                                         urls: card.coverURLs,
                                         initialIndex: index,
                                         referer: card.targetURL.absoluteString
+                                    )
+                                },
+                                onOpenQuotedURL: { url in
+                                    scrollAnchor.capture(preferredID: card.id)
+                                    onOpenQuotedURL(url)
+                                },
+                                onOpenQuotedImage: { index in
+                                    guard let quoted = card.quotedCard else { return }
+                                    galleryRequest = FocusImageGalleryRequest(
+                                        urls: quoted.coverURLs,
+                                        initialIndex: index,
+                                        referer: (quoted.targetURL ?? card.targetURL).absoluteString
                                     )
                                 }
                             )
@@ -784,7 +775,10 @@ struct FocusDynamicFeedView: View {
 
     private func prefetchImages(for cards: [DynamicCard]) async {
         let urls = cards.flatMap { card in
-            ([card.author.avatarURL] + Array(card.coverURLs.prefix(2))).compactMap { $0 }
+            ([card.author.avatarURL]
+                + Array(card.coverURLs.prefix(2))
+                + Array((card.quotedCard?.coverURLs ?? []).prefix(2))
+            ).compactMap { $0 }
         }
         await FocusRemoteImageLoader.prefetch(urls: urls, referer: "https://t.bilibili.com/")
     }
@@ -937,9 +931,6 @@ final class FocusDynamicFeedVisualAnchor {
     var onGeometryChange: (() -> Void)?
     var onVisibleCard: (() -> Void)?
     private var geometryUpdatePending = false
-#if DEBUG
-    weak var fixtureCoordinator: FocusDynamicFeedScrollBridge.Coordinator?
-#endif
 
     func updateFrame(_ frame: CGRect, id: String) {
         frames[id] = frame
@@ -1047,29 +1038,8 @@ extension View {
     func focusDynamicFeedAnchor(id: String, anchor: FocusDynamicFeedVisualAnchor) -> some View {
         background { FocusDynamicFeedAnchorMarker(id: id, anchor: anchor) }
             .background { FocusDynamicLiveAnchorMarker(id: id, anchor: anchor) }
-#if DEBUG
-            .background {
-                if FocusTestRuntime.isRunningFixtures { FocusDynamicFixtureCardProbe(id: id) }
-            }
-#endif
     }
 }
-
-#if DEBUG
-/// An independent UIKit surface for tests; it does not supply recovery geometry.
-private struct FocusDynamicFixtureCardProbe: UIViewRepresentable {
-    let id: String
-    func makeUIView(context: Context) -> UIView {
-        let view = UIView()
-        view.isUserInteractionEnabled = false
-        view.accessibilityIdentifier = "focus-fixture-card:" + id
-        return view
-    }
-    func updateUIView(_ view: UIView, context: Context) {
-        view.accessibilityIdentifier = "focus-fixture-card:" + id
-    }
-}
-#endif
 
 /// Live UIKit geometry is independent of LazyVStack's estimated content-space
 /// CGRect preferences. Only weak references to mounted rows are retained.
@@ -1550,9 +1520,6 @@ struct FocusDynamicFeedScrollBridge: UIViewRepresentable {
                     guard let self else { return false }
                     return self.applyContentUpdate(update)
                 }
-#if DEBUG
-                if FocusTestRuntime.isRunningFixtures { visualAnchor?.fixtureCoordinator = self }
-#endif
                 visualAnchor?.onGeometryChange = { [weak self] in
                     guard let self, self.canOperate, self.maintainsRestorationTarget else { return }
                     self.viewportDidChange()
@@ -2045,6 +2012,8 @@ struct FocusDynamicCardView: View {
     let onOpenCard: () -> Void
     let onOpenUser: (Int64) -> Void
     let onOpenImage: (Int) -> Void
+    var onOpenQuotedURL: (URL) -> Void = { _ in }
+    var onOpenQuotedImage: (Int) -> Void = { _ in }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -2097,6 +2066,22 @@ struct FocusDynamicCardView: View {
 
             if !card.coverURLs.isEmpty {
                 covers
+            }
+
+            if let quoted = card.quotedCard {
+                FocusQuotedDynamicCardView(
+                    quoted: quoted,
+                    fallbackReferer: card.targetURL.absoluteString,
+                    onOpenUser: onOpenUser,
+                    onOpenQuoted: {
+                        if let destination = quoted.videoURL ?? quoted.targetURL {
+                            onOpenQuotedURL(destination)
+                        } else {
+                            onOpenCard()
+                        }
+                    },
+                    onOpenImage: onOpenQuotedImage
+                )
             }
         }
         .padding(16)
@@ -2374,6 +2359,110 @@ final class FocusDynamicTextContentView: UIView {
 
     @objc private func openText() { onOpen?() }
     @objc private func toggle() { guard !foldButton.isHidden else { return }; onToggle?() }
+}
+
+private struct FocusQuotedDynamicCardView: View {
+    let quoted: DynamicCard.QuotedCard
+    let fallbackReferer: String
+    let onOpenUser: (Int64) -> Void
+    let onOpenQuoted: () -> Void
+    let onOpenImage: (Int) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let tip = quoted.unavailableTip, !tip.isEmpty {
+                Text(tip)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                if !quoted.author.name.isEmpty || !quoted.publishTime.isEmpty {
+                    HStack(spacing: 8) {
+                        if !quoted.author.name.isEmpty {
+                            Button {
+                                guard quoted.author.mid > 0 else { return }
+                                onOpenUser(quoted.author.mid)
+                            } label: {
+                                Text("@\(quoted.author.name)")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(FocusDesign.primary)
+                                    .lineLimit(1)
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(quoted.author.mid <= 0)
+                        }
+                        if !quoted.publishTime.isEmpty {
+                            Text(quoted.publishTime)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 0)
+                        FocusKindBadge(kind: quoted.kind)
+                    }
+                } else {
+                    FocusKindBadge(kind: quoted.kind)
+                }
+
+                if !quoted.title.isEmpty {
+                    Text(quoted.title)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(2)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                if !quoted.text.isEmpty {
+                    Text(quoted.text)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(4)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                if !quoted.coverURLs.isEmpty {
+                    quotedCovers
+                }
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color(uiColor: .tertiarySystemGroupedBackground))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color(uiColor: .separator).opacity(0.28), lineWidth: 0.5)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture {
+            guard quoted.unavailableTip == nil else { return }
+            onOpenQuoted()
+        }
+    }
+
+    @ViewBuilder
+    private var quotedCovers: some View {
+        let visibleURLs = Array(quoted.coverURLs.prefix(4))
+        let referer = quoted.targetURL?.absoluteString ?? fallbackReferer
+        if visibleURLs.count == 1, let firstURL = visibleURLs.first {
+            FocusDynamicMediaCover(url: firstURL, referer: referer, height: 156)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    quoted.kind == .image ? onOpenImage(0) : onOpenQuoted()
+                }
+        } else {
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 2), spacing: 8) {
+                ForEach(Array(visibleURLs.enumerated()), id: \.offset) { item in
+                    FocusDynamicMediaCover(url: item.element, referer: referer, height: 112)
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            quoted.kind == .image ? onOpenImage(item.offset) : onOpenQuoted()
+                        }
+                }
+            }
+        }
+    }
 }
 
 private struct FocusDynamicMediaCover: View {

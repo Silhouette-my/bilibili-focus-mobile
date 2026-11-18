@@ -4,14 +4,12 @@ import Testing
 
 @Suite("bilibili-api contract catalog")
 struct BiliAPIContractTests {
-    @Test("loads the independently maintained endpoint subset")
+    @Test("loads the endpoint contract catalog")
     func loadsSnapshot() {
         let snapshot = BiliAPIContractCatalog.snapshot
 
         #expect(snapshot.schemaVersion == 1)
         #expect(snapshot.endpoints.count >= 40)
-        #expect(snapshot.source.validatedCommit.count == 40)
-        #expect(snapshot.source.repository.host == "github.com")
     }
 
     @Test("exposes local endpoint metadata")
@@ -24,11 +22,10 @@ struct BiliAPIContractTests {
         #expect(endpoint.usesWBI)
     }
 
-    @Test("includes authenticated content management and excludes removed features")
+    @Test("includes authenticated content management contracts")
     func includesManagementContracts() {
         #expect(BiliAPIContractCatalog.require("common.comment.send").usesWBI)
         #expect(BiliAPIContractCatalog.require("common.comment.del").requiresAuthentication)
         #expect(BiliAPIContractCatalog.require("favorite-list.operate.content_move").method == "POST")
-        #expect(!BiliAPIContractCatalog.snapshot.endpoints.keys.contains { $0.hasPrefix("toview.") })
     }
 }

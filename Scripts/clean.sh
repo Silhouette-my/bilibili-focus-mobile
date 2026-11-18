@@ -22,7 +22,7 @@ rm -rf build .build .kotlin focus-core/build focus-android/build
 find . -maxdepth 1 -type d -name '.tmp-*' -exec rm -rf {} +
 
 if [[ "$MODE" == "--gradle" ]]; then
-  rm -rf .gradle .gradle-home
+  rm -rf .gradle
 fi
 
 printf 'Cleaned build outputs%s\n' "$([[ "$MODE" == "--gradle" ]] && printf ' and Gradle caches')"

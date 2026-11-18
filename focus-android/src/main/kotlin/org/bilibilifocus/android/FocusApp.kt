@@ -537,6 +537,7 @@ fun FocusApp(
                             onOpenLogin = { showLogin = true },
                             onOpenCard = { card -> openDynamicDetailUrl(card.videoURL ?: card.targetURL) },
                             onOpenUser = openDynamicUser,
+                            onOpenURL = openDynamicDetailUrl,
                             onOpenSearch = { query ->
                                 pendingSearchQuery = query
                                 selectTab(1)
@@ -721,6 +722,7 @@ private fun FocusPrimaryTabContent(
             onOpenLogin = onOpenLogin,
             onOpenCard = { card -> onOpenRouteFromUrl(card.videoURL ?: card.targetURL) },
             onOpenUser = onOpenUser,
+            onOpenURL = onOpenRouteFromUrl,
             onOpenSearch = onSearchQueryFromFeed,
             onSelectedFilterChange = onFeedFilterChange,
             contentPadding = contentPadding,

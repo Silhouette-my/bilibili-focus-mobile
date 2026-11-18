@@ -275,14 +275,10 @@ actor FocusNativePageAugmentService: FocusNativePageAugmentServing {
         let features = "onlyfansVote,onlyfansAssetsV2,decorationCard,htmlNewStyle,ugcDelete,editable,opusPrivateVisible"
         let detailURL = "https://api.bilibili.com/x/polymer/web-dynamic/v1/opus/detail?id=\(opusID)&timezone_offset=-480&features=\(features)"
 
-        guard
-            let detailRoot = try? await requestObject(urlString: detailURL, referer: url.absoluteString),
-            detailRoot.intValue(at: "code") == 0
-        else {
-            return nil
-        }
-
-        let item = detailRoot.dictionaryValue(at: "data", "item")
+        let detailRoot = try? await requestObject(urlString: detailURL, referer: url.absoluteString)
+        let item = (detailRoot?.intValue(at: "code") == 0)
+            ? detailRoot?.dictionaryValue(at: "data", "item")
+            : nil
         let basic = item?.dictionaryValue(at: "basic")
         let commentIdString = basic?.stringValue(at: "comment_id_str")
         let ridString = basic?.stringValue(at: "rid_str")
@@ -304,7 +300,7 @@ actor FocusNativePageAugmentService: FocusNativePageAugmentServing {
         }
         let fallbackID = commentIdString ?? ridString ?? opusID
 
-        let candidates = [commentId > 0 ? String(commentId) : nil, fallbackID]
+        let candidates = [commentId > 0 ? String(commentId) : nil, fallbackID, opusID]
             .compactMap { $0 }
             .reduce(into: [String]()) { partialResult, value in
                 if !partialResult.contains(value) {
@@ -312,8 +308,15 @@ actor FocusNativePageAugmentService: FocusNativePageAugmentServing {
                 }
             }
 
+        let apiCommentType = basic?.intValue(at: "comment_type") ?? 0
+        let typeCandidates: [Int] = if apiCommentType > 0 {
+            [apiCommentType] + [17, 11, 12].filter { $0 != apiCommentType }
+        } else {
+            [17, 11, 12]
+        }
+
         for oid in candidates {
-            for type in [17, 11, 12] {
+            for type in typeCandidates {
                 let comments = (try? await fetchComments(oid: oid, type: type, referer: url.absoluteString)) ?? []
                 if !comments.isEmpty {
                     return FocusNativeOpusAugmentPayload(comments: comments)

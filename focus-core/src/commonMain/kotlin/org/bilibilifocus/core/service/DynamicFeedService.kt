@@ -142,18 +142,19 @@ class DynamicFeedService(
         return FeedPage(cards, nextOffset)
     }
 
-    private fun makeCard(item: JsonObject): DynamicCard? {
+    private fun makeCard(item: JsonObject, allowMissingId: Boolean = false): DynamicCard? {
         val modules = item.dictionaryValueAt("modules") ?: JsonObject(emptyMap())
         val author = modules.dictionaryValueAt("module_author") ?: JsonObject(emptyMap())
         val dynamic = modules.dictionaryValueAt("module_dynamic") ?: JsonObject(emptyMap())
         val major = dynamic.dictionaryValueAt("major") ?: JsonObject(emptyMap())
         val basic = item.dictionaryValueAt("basic") ?: JsonObject(emptyMap())
 
-        val id = item.stringValueAt("id_str")
+        val resolvedId = item.stringValueAt("id_str")
             ?: basic.stringValueAt("comment_id_str")
             ?: basic.stringValueAt("rid_str")
             ?: basic.longValueAt("comment_id")?.toString()
-            ?: return null
+        if (resolvedId == null && !allowMissingId) return null
+        val id = resolvedId ?: ""
 
         val authorName = author.stringValueAt("name") ?: "Bilibili"
         val authorMid = author.longValueAt("mid") ?: 0L
@@ -163,11 +164,15 @@ class DynamicFeedService(
             ?: author.stringValueAt("pub_time_label")
             ?: ""
 
+        val itemType = item.stringValueAt("type") ?: ""
+        val isForwardItem = itemType == "DYNAMIC_TYPE_FORWARD"
         val majorType = major.stringValueAt("type") ?: ""
 
+        val archiveBvid = major.stringValueAt("archive", "bvid")?.trim()?.takeIf { it.isNotEmpty() }
         val primaryJumpCandidates = listOfNotNull(
             normalizedURL(basic.stringValueAt("jump_url")),
             normalizedURL(major.stringValueAt("archive", "jump_url")),
+            archiveBvid?.let { "https://www.bilibili.com/video/$it/" },
             normalizedURL(major.stringValueAt("article", "jump_url")),
             normalizedURL(major.stringValueAt("pgc", "jump_url")),
             normalizedURL(major.stringValueAt("courses", "jump_url")),
@@ -181,14 +186,15 @@ class DynamicFeedService(
 
         val coverURLs = makeCoverURLs(major)
         val text = makeText(dynamic, major)
-        val videoURL = jumpCandidates.firstOrNull { isVideoLikeURL(it) }
-        val kind = makeKind(majorType, item.stringValueAt("type") ?: "", videoURL, coverURLs)
+        val detectedVideoURL = jumpCandidates.firstOrNull { isVideoLikeURL(it) }
+        val videoURL = if (isForwardItem) null else detectedVideoURL
+        val kind = makeKind(majorType, itemType, videoURL, coverURLs)
         val articleCvid = major.stringValueAt("article", "id")?.toLongOrNull()
             ?: major.stringValueAt("article", "id_str")?.toLongOrNull()
             ?: major.stringValueAt("article", "cvid")?.toLongOrNull()
             ?: major.longValueAt("article", "id")
             ?: jumpCandidates.firstNotNullOfOrNull(ArticleURL::extractCvid)
-        val articleURL = if (kind == DynamicCard.Kind.ARTICLE_LIKE) {
+        val articleURL = if (!isForwardItem && kind == DynamicCard.Kind.ARTICLE_LIKE) {
             jumpCandidates.firstOrNull { ArticleURL.extractCvid(it) != null }
                 ?.let(ArticleURL::canonicalURL)
                 ?: articleCvid?.let(ArticleURL::canonicalURL)
@@ -196,19 +202,25 @@ class DynamicFeedService(
             null
         }
         val opusDetailURL = primaryJumpCandidates.firstOrNull(::isOpusLikeURL)
-        val targetURL = when (kind) {
-            DynamicCard.Kind.VIDEO -> videoURL
+        val targetURL = when {
+            isForwardItem -> opusDetailURL ?: fallbackTargetURL(id, kind)
+            kind == DynamicCard.Kind.VIDEO -> videoURL
                 ?: primaryJumpCandidates.firstOrNull()
                 ?: jumpCandidates.firstOrNull()
                 ?: fallbackTargetURL(id, kind)
-            DynamicCard.Kind.ARTICLE_LIKE -> articleURL
+            kind == DynamicCard.Kind.ARTICLE_LIKE -> articleURL
                 ?: opusDetailURL
                 ?: primaryJumpCandidates.firstOrNull()
                 ?: jumpCandidates.firstOrNull()
                 ?: fallbackTargetURL(id, kind)
-            DynamicCard.Kind.TEXT,
-            DynamicCard.Kind.IMAGE,
-            -> opusDetailURL ?: fallbackTargetURL(id, kind)
+            else -> opusDetailURL ?: fallbackTargetURL(id, kind)
+        }
+
+        val quotedCard = if (!allowMissingId) {
+            (item.dictionaryValueAt("orig") ?: item.dictionaryValueAt("origin"))?.let(::makeQuotedCard)
+                ?: dynamic.dictionaryValueAt("additional")?.let(::makeAdditionalQuotedCard)
+        } else {
+            null
         }
 
         return DynamicCard(
@@ -220,10 +232,127 @@ class DynamicFeedService(
             coverURLs = coverURLs,
             targetURL = targetURL,
             videoURL = videoURL,
+            quotedCard = quotedCard,
         )
     }
 
-    private fun makeText(dynamic: JsonObject, major: JsonObject): String {
+    private fun makeQuotedCard(orig: JsonObject): DynamicCard.QuotedCard? {
+        val origType = orig.stringValueAt("type") ?: ""
+        val origModules = orig.dictionaryValueAt("modules") ?: JsonObject(emptyMap())
+        val origDynamic = origModules.dictionaryValueAt("module_dynamic") ?: JsonObject(emptyMap())
+        val origMajor = origDynamic.dictionaryValueAt("major") ?: JsonObject(emptyMap())
+        val origMajorType = origMajor.stringValueAt("type") ?: ""
+
+        if (origType == "DYNAMIC_TYPE_NONE" || origMajorType == "MAJOR_TYPE_NONE") {
+            val tip = origMajor.stringValueAt("none", "tips")?.trim()?.takeIf { it.isNotEmpty() }
+                ?: origDynamic.stringValueAt("desc", "text")?.trim()?.takeIf { it.isNotEmpty() }
+                ?: "源动态已被作者删除"
+            return DynamicCard.QuotedCard(
+                id = orig.stringValueAt("id_str") ?: "",
+                unavailableTip = tip,
+            )
+        }
+
+        val card = makeCard(orig, allowMissingId = true) ?: return null
+        val title = extractMajorTitle(origMajor)
+        val explicitDesc = extractExplicitBodyText(origDynamic, origMajor)
+        val archiveDesc = origMajor.stringValueAt("archive", "desc")?.trim()?.takeIf { it.isNotEmpty() }
+        val articleDesc = origMajor.stringValueAt("article", "desc")?.trim()?.takeIf { it.isNotEmpty() }
+        val bodyText = when {
+            explicitDesc.isNotEmpty() && explicitDesc != title -> explicitDesc
+            card.text.isNotEmpty() && card.text != title -> card.text
+            archiveDesc != null && archiveDesc != title -> archiveDesc
+            articleDesc != null && articleDesc != title -> articleDesc
+            else -> ""
+        }
+        val resolvedTarget = card.targetURL.takeIf { url ->
+            card.id.isNotEmpty() || url != fallbackTargetURL("", card.kind)
+        }
+
+        if (title.isEmpty() && bodyText.isEmpty() && card.coverURLs.isEmpty() && resolvedTarget == null) {
+            return null
+        }
+
+        return DynamicCard.QuotedCard(
+            id = card.id,
+            kind = card.kind,
+            author = card.author,
+            publishTime = card.publishTime,
+            title = title,
+            text = bodyText,
+            coverURLs = card.coverURLs,
+            targetURL = resolvedTarget,
+            videoURL = card.videoURL,
+        )
+    }
+
+    private fun makeAdditionalQuotedCard(additional: JsonObject): DynamicCard.QuotedCard? {
+        val type = additional.stringValueAt("type") ?: ""
+        if (type == "ADDITIONAL_TYPE_UGC" || additional.dictionaryValueAt("ugc") != null) {
+            val ugc = additional.dictionaryValueAt("ugc") ?: return null
+            val title = ugc.stringValueAt("title")?.trim().orEmpty()
+            val text = ugc.stringValueAt("desc_second")?.trim().orEmpty()
+            val cover = normalizedURL(ugc.stringValueAt("cover"))
+            val jumpURL = normalizedURL(ugc.stringValueAt("jump_url"))
+            val videoURL = jumpURL?.takeIf(::isVideoLikeURL)
+            if (title.isEmpty() && text.isEmpty() && cover == null && jumpURL == null) return null
+            return DynamicCard.QuotedCard(
+                id = ugc.stringValueAt("id_str") ?: "",
+                kind = DynamicCard.Kind.VIDEO,
+                title = title,
+                text = text,
+                coverURLs = listOfNotNull(cover),
+                targetURL = jumpURL,
+                videoURL = videoURL,
+            )
+        }
+        if (type == "ADDITIONAL_TYPE_OPUS" || additional.dictionaryValueAt("opus") != null) {
+            val opus = additional.dictionaryValueAt("opus") ?: return null
+            val title = opus.stringValueAt("title")?.trim().orEmpty()
+            val text = (
+                richTextPlainText(opus.arrayValueAt("summary", "rich_text_nodes"))
+                    ?: opus.stringValueAt("summary", "text")
+                    ?: opus.stringValueAt("desc")
+                )?.trim().orEmpty()
+            val covers = buildList {
+                normalizedURL(opus.stringValueAt("cover"))?.let(::add)
+                opus.arrayValueAt("pics")?.forEach { pic ->
+                    val dict = pic as? JsonObject ?: return@forEach
+                    normalizedURL(dict.stringValueAt("url") ?: dict.stringValueAt("src"))?.let(::add)
+                }
+            }.distinct()
+            val jumpURL = normalizedURL(opus.stringValueAt("jump_url"))
+            if (title.isEmpty() && text.isEmpty() && covers.isEmpty() && jumpURL == null) return null
+            return DynamicCard.QuotedCard(
+                kind = if (covers.isEmpty()) DynamicCard.Kind.TEXT else DynamicCard.Kind.IMAGE,
+                title = title,
+                text = text,
+                coverURLs = covers,
+                targetURL = jumpURL,
+            )
+        }
+        if (type == "ADDITIONAL_TYPE_COMMON" || additional.dictionaryValueAt("common") != null) {
+            val common = additional.dictionaryValueAt("common") ?: return null
+            val title = (common.stringValueAt("title") ?: common.stringValueAt("head_text"))?.trim().orEmpty()
+            val text = listOfNotNull(
+                common.stringValueAt("desc1")?.trim()?.takeIf { it.isNotEmpty() },
+                common.stringValueAt("desc2")?.trim()?.takeIf { it.isNotEmpty() },
+            ).joinToString("\n")
+            val cover = normalizedURL(common.stringValueAt("cover"))
+            val jumpURL = normalizedURL(common.stringValueAt("jump_url"))
+            if (title.isEmpty() && text.isEmpty() && cover == null && jumpURL == null) return null
+            return DynamicCard.QuotedCard(
+                kind = DynamicCard.Kind.TEXT,
+                title = title,
+                text = text,
+                coverURLs = listOfNotNull(cover),
+                targetURL = jumpURL,
+            )
+        }
+        return null
+    }
+
+    private fun extractExplicitBodyText(dynamic: JsonObject, major: JsonObject): String {
         val bodyCandidates = listOfNotNull(
             richTextPlainText(dynamic.arrayValueAt("desc", "rich_text_nodes")),
             richTextPlainText(dynamic.arrayValueAt("desc", "rich_text_nodes_v2")),
@@ -233,7 +362,24 @@ class DynamicFeedService(
             major.stringValueAt("opus", "summary", "text"),
         ).mapNotNull { it.trim().takeIf(String::isNotEmpty) }
 
-        bodyCandidates.maxByOrNull(String::length)?.let { return it }
+        return bodyCandidates.maxByOrNull(String::length) ?: ""
+    }
+
+    private fun extractMajorTitle(major: JsonObject): String = listOfNotNull(
+        major.stringValueAt("archive", "title"),
+        major.stringValueAt("article", "title"),
+        major.stringValueAt("pgc", "title"),
+        major.stringValueAt("opus", "title"),
+        major.stringValueAt("courses", "title"),
+        major.stringValueAt("music", "title"),
+        major.stringValueAt("medialist", "title"),
+        major.stringValueAt("live", "title"),
+        major.stringValueAt("common", "title"),
+        major.stringValueAt("ugc_season", "title"),
+    ).map { it.trim() }.firstOrNull { it.isNotEmpty() } ?: ""
+
+    private fun makeText(dynamic: JsonObject, major: JsonObject): String {
+        extractExplicitBodyText(dynamic, major).takeIf { it.isNotEmpty() }?.let { return it }
 
         val candidates = listOfNotNull(
             major.stringValueAt("archive", "title"),
@@ -332,7 +478,7 @@ class DynamicFeedService(
         var value = rawValue.trim()
         if (value.isEmpty()) return null
 
-        canonicalOpusURLFromScheme(value)?.let { return it }
+        canonicalSchemeURL(value)?.let { return it }
 
         value = when {
             value.startsWith("//") -> "https:$value"
@@ -354,9 +500,14 @@ class DynamicFeedService(
         return if (isBiliImageHost) "https:" + url.substringAfter(':') else url
     }
 
-    private fun canonicalOpusURLFromScheme(value: String): String? {
-        val match = opusSchemePattern.find(value) ?: return null
-        return "https://www.bilibili.com/opus/${match.groupValues[1]}"
+    private fun canonicalSchemeURL(value: String): String? {
+        opusSchemePattern.find(value)?.let { match ->
+            return "https://www.bilibili.com/opus/${match.groupValues[1]}"
+        }
+        videoSchemePattern.find(value)?.let { match ->
+            return "https://www.bilibili.com/video/${match.groupValues[1]}/"
+        }
+        return null
     }
 
     private fun isOpusLikeURL(url: String): Boolean {
@@ -496,6 +647,10 @@ class DynamicFeedService(
         )
         private val opusSchemePattern = Regex(
             """^bilibili://(?:following/detail|opus/detail|dynamic)/(\d+)(?:[/?#].*)?$""",
+            RegexOption.IGNORE_CASE,
+        )
+        private val videoSchemePattern = Regex(
+            """^bilibili://video/(BV[0-9A-Za-z]+)(?:[/?#].*)?$""",
             RegexOption.IGNORE_CASE,
         )
         private val urlKeyPatterns = setOf(

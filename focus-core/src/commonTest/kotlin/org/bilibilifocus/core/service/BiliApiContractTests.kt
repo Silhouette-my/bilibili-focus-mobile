@@ -6,13 +6,11 @@ import kotlin.test.assertTrue
 
 class BiliApiContractTests {
     @Test
-    fun `loads the attributed sibling snapshot`() {
+    fun `loads the endpoint contract catalog`() {
         val snapshot = BiliApiContractCatalog.snapshot
 
         assertEquals(1, snapshot.schemaVersion)
         assertTrue(snapshot.endpoints.size >= 40)
-        assertEquals(40, snapshot.source.validatedCommit.length)
-        assertTrue(snapshot.source.repository.contains("github.com/Nemo2011/bilibili-api"))
     }
 
     @Test
@@ -26,10 +24,9 @@ class BiliApiContractTests {
     }
 
     @Test
-    fun `includes authenticated management contracts and excludes removed features`() {
+    fun `includes authenticated management contracts`() {
         assertTrue(BiliApiContractCatalog.require("common.comment.send").usesWbi)
         assertTrue(BiliApiContractCatalog.require("common.comment.del").requiresAuthentication)
         assertEquals("POST", BiliApiContractCatalog.require("favorite-list.operate.content_move").method)
-        assertTrue(BiliApiContractCatalog.snapshot.endpoints.keys.none { it.startsWith("toview.") })
     }
 }

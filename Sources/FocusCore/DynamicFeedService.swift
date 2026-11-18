@@ -246,21 +246,21 @@ public struct DynamicFeedService: Sendable {
         return components.url!
     }
 
-    private static func makeCard(from item: [String: Any]) -> DynamicCard? {
+    private static func makeCard(from item: [String: Any], allowMissingID: Bool = false) -> DynamicCard? {
         let modules = item.dictionaryValue(at: ["modules"]) ?? [:]
         let author = modules.dictionaryValue(at: ["module_author"]) ?? [:]
         let dynamic = modules.dictionaryValue(at: ["module_dynamic"]) ?? [:]
         let major = dynamic.dictionaryValue(at: ["major"]) ?? [:]
         let basic = item.dictionaryValue(at: ["basic"]) ?? [:]
 
-        guard
-            let id = item.stringValue(at: ["id_str"])
-                ?? basic.stringValue(at: ["comment_id_str"])
-                ?? basic.stringValue(at: ["rid_str"])
-                ?? basic.intValue(at: ["comment_id"]).map(String.init)
-        else {
+        let resolvedID = item.stringValue(at: ["id_str"])
+            ?? basic.stringValue(at: ["comment_id_str"])
+            ?? basic.stringValue(at: ["rid_str"])
+            ?? basic.intValue(at: ["comment_id"]).map(String.init)
+        if resolvedID == nil && !allowMissingID {
             return nil
         }
+        let id = resolvedID ?? ""
 
         let authorName = author.stringValue(at: ["name"]) ?? "Bilibili"
         let authorMID = author.intValue(at: ["mid"]).map(Int64.init) ?? 0
@@ -270,10 +270,14 @@ public struct DynamicFeedService: Sendable {
             ?? author.stringValue(at: ["pub_time_label"])
             ?? ""
 
+        let itemType = item.stringValue(at: ["type"]) ?? ""
+        let isForwardItem = itemType == "DYNAMIC_TYPE_FORWARD"
         let majorType = major.stringValue(at: ["type"]) ?? ""
+        let archiveBVID = major.stringValue(at: ["archive", "bvid"])?.trimmingCharacters(in: .whitespacesAndNewlines)
         let primaryJumpCandidates = [
             basic.stringValue(at: ["jump_url"]),
             major.stringValue(at: ["archive", "jump_url"]),
+            archiveBVID.flatMap { $0.isEmpty ? nil : "https://www.bilibili.com/video/\($0)/" },
             major.stringValue(at: ["article", "jump_url"]),
             major.stringValue(at: ["pgc", "jump_url"]),
             major.stringValue(at: ["courses", "jump_url"]),
@@ -288,19 +292,21 @@ public struct DynamicFeedService: Sendable {
 
         let coverURLs = makeCoverURLs(major: major)
         let text = makeText(dynamic: dynamic, major: major)
-        let videoURL = jumpCandidates.first(where: isVideoLikeURL(_:))
+        let detectedVideoURL = jumpCandidates.first(where: isVideoLikeURL(_:))
+        let videoURL = isForwardItem ? nil : detectedVideoURL
         let kind = makeKind(
             majorType: majorType,
-            itemType: item.stringValue(at: ["type"]) ?? "",
+            itemType: itemType,
             videoURL: videoURL,
             coverURLs: coverURLs
         )
-        let articleCVID = major.stringValue(at: ["article", "id"]).flatMap(Int64.init)
-            ?? major.stringValue(at: ["article", "id_str"]).flatMap(Int64.init)
-            ?? major.stringValue(at: ["article", "cvid"]).flatMap(Int64.init)
-            ?? major.intValue(at: ["article", "id"]).map(Int64.init)
+        let articleIDFromString: Int64? = major.stringValue(at: ["article", "id"]).flatMap { Int64($0) }
+            ?? major.stringValue(at: ["article", "id_str"]).flatMap { Int64($0) }
+            ?? major.stringValue(at: ["article", "cvid"]).flatMap { Int64($0) }
+        let articleCVID: Int64? = articleIDFromString
+            ?? major.intValue(at: ["article", "id"]).map { Int64($0) }
             ?? jumpCandidates.compactMap(extractArticleCVID(from:)).first
-        let articleURL: URL? = if kind == .articleLike {
+        let articleURL: URL? = if !isForwardItem && kind == .articleLike {
             jumpCandidates.first(where: { extractArticleCVID(from: $0) != nil })
                 .flatMap { extractArticleCVID(from: $0) }
                 .flatMap { URL(string: "https://www.bilibili.com/read/cv\($0)") }
@@ -310,20 +316,32 @@ public struct DynamicFeedService: Sendable {
         }
         let opusDetailURL = primaryJumpCandidates.first(where: isOpusLikeURL(_:))
         let targetURL: URL
-        switch kind {
-        case .video:
-            targetURL = videoURL
-                ?? primaryJumpCandidates.first
-                ?? jumpCandidates.first
-                ?? fallbackTargetURL(for: id, kind: kind)
-        case .articleLike:
-            targetURL = articleURL
-                ?? opusDetailURL
-                ?? primaryJumpCandidates.first
-                ?? jumpCandidates.first
-                ?? fallbackTargetURL(for: id, kind: kind)
-        case .text, .image:
+        if isForwardItem {
             targetURL = opusDetailURL ?? fallbackTargetURL(for: id, kind: kind)
+        } else {
+            switch kind {
+            case .video:
+                targetURL = videoURL
+                    ?? primaryJumpCandidates.first
+                    ?? jumpCandidates.first
+                    ?? fallbackTargetURL(for: id, kind: kind)
+            case .articleLike:
+                targetURL = articleURL
+                    ?? opusDetailURL
+                    ?? primaryJumpCandidates.first
+                    ?? jumpCandidates.first
+                    ?? fallbackTargetURL(for: id, kind: kind)
+            case .text, .image:
+                targetURL = opusDetailURL ?? fallbackTargetURL(for: id, kind: kind)
+            }
+        }
+
+        let quotedCard: DynamicCard.QuotedCard? = if !allowMissingID {
+            (item.dictionaryValue(at: ["orig"]) ?? item.dictionaryValue(at: ["origin"]))
+                .flatMap(makeQuotedCard(from:))
+                ?? dynamic.dictionaryValue(at: ["additional"]).flatMap(makeAdditionalQuotedCard(from:))
+        } else {
+            nil
         }
 
         return DynamicCard(
@@ -334,11 +352,147 @@ public struct DynamicFeedService: Sendable {
             text: text,
             coverURLs: coverURLs,
             targetURL: targetURL,
-            videoURL: videoURL
+            videoURL: videoURL,
+            quotedCard: quotedCard
         )
     }
 
-    private static func makeText(dynamic: [String: Any], major: [String: Any]) -> String {
+    private static func makeQuotedCard(from orig: [String: Any]) -> DynamicCard.QuotedCard? {
+        let origType = orig.stringValue(at: ["type"]) ?? ""
+        let origModules = orig.dictionaryValue(at: ["modules"]) ?? [:]
+        let origDynamic = origModules.dictionaryValue(at: ["module_dynamic"]) ?? [:]
+        let origMajor = origDynamic.dictionaryValue(at: ["major"]) ?? [:]
+        let origMajorType = origMajor.stringValue(at: ["type"]) ?? ""
+
+        if origType == "DYNAMIC_TYPE_NONE" || origMajorType == "MAJOR_TYPE_NONE" {
+            let tip = [
+                origMajor.stringValue(at: ["none", "tips"]),
+                origDynamic.stringValue(at: ["desc", "text"]),
+            ]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first(where: { !$0.isEmpty }) ?? "源动态已被作者删除"
+            return DynamicCard.QuotedCard(
+                id: orig.stringValue(at: ["id_str"]) ?? "",
+                unavailableTip: tip
+            )
+        }
+
+        guard let card = makeCard(from: orig, allowMissingID: true) else {
+            return nil
+        }
+
+        let title = extractMajorTitle(from: origMajor)
+        let explicitDesc = extractExplicitBodyText(dynamic: origDynamic, major: origMajor)
+        let archiveDesc = origMajor.stringValue(at: ["archive", "desc"])?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let articleDesc = origMajor.stringValue(at: ["article", "desc"])?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let bodyText: String
+        if !explicitDesc.isEmpty, explicitDesc != title {
+            bodyText = explicitDesc
+        } else if !card.text.isEmpty, card.text != title {
+            bodyText = card.text
+        } else if let archiveDesc, !archiveDesc.isEmpty, archiveDesc != title {
+            bodyText = archiveDesc
+        } else if let articleDesc, !articleDesc.isEmpty, articleDesc != title {
+            bodyText = articleDesc
+        } else {
+            bodyText = ""
+        }
+
+        let resolvedTarget: URL? = (!card.id.isEmpty || card.targetURL != fallbackTargetURL(for: "", kind: card.kind))
+            ? card.targetURL
+            : nil
+
+        if title.isEmpty, bodyText.isEmpty, card.coverURLs.isEmpty, resolvedTarget == nil {
+            return nil
+        }
+
+        return DynamicCard.QuotedCard(
+            id: card.id,
+            kind: card.kind,
+            author: card.author,
+            publishTime: card.publishTime,
+            title: title,
+            text: bodyText,
+            coverURLs: card.coverURLs,
+            targetURL: resolvedTarget,
+            videoURL: card.videoURL
+        )
+    }
+
+    private static func makeAdditionalQuotedCard(from additional: [String: Any]) -> DynamicCard.QuotedCard? {
+        let type = additional.stringValue(at: ["type"]) ?? ""
+        if type == "ADDITIONAL_TYPE_UGC" || additional.dictionaryValue(at: ["ugc"]) != nil,
+           let ugc = additional.dictionaryValue(at: ["ugc"])
+        {
+            let title = ugc.stringValue(at: ["title"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let text = ugc.stringValue(at: ["desc_second"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let cover = normalizedURL(ugc.stringValue(at: ["cover"]))
+            let jumpURL = normalizedURL(ugc.stringValue(at: ["jump_url"]))
+            let videoURL = jumpURL.flatMap { isVideoLikeURL($0) ? $0 : nil }
+            if title.isEmpty, text.isEmpty, cover == nil, jumpURL == nil { return nil }
+            return DynamicCard.QuotedCard(
+                id: ugc.stringValue(at: ["id_str"]) ?? "",
+                kind: .video,
+                title: title,
+                text: text,
+                coverURLs: cover.map { [$0] } ?? [],
+                targetURL: jumpURL,
+                videoURL: videoURL
+            )
+        }
+        if type == "ADDITIONAL_TYPE_OPUS" || additional.dictionaryValue(at: ["opus"]) != nil,
+           let opus = additional.dictionaryValue(at: ["opus"])
+        {
+            let title = opus.stringValue(at: ["title"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let text = (
+                richTextPlainText(opus.arrayValue(at: ["summary", "rich_text_nodes"]))
+                    ?? opus.stringValue(at: ["summary", "text"])
+                    ?? opus.stringValue(at: ["desc"])
+            )?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            var covers: [URL] = []
+            if let cover = normalizedURL(opus.stringValue(at: ["cover"])) {
+                covers.append(cover)
+            }
+            for rawPic in opus.arrayValue(at: ["pics"]) ?? [] {
+                guard let pic = rawPic as? [String: Any],
+                      let url = normalizedURL(pic.stringValue(at: ["url"]) ?? pic.stringValue(at: ["src"]))
+                else { continue }
+                if !covers.contains(url) { covers.append(url) }
+            }
+            let jumpURL = normalizedURL(opus.stringValue(at: ["jump_url"]))
+            if title.isEmpty, text.isEmpty, covers.isEmpty, jumpURL == nil { return nil }
+            return DynamicCard.QuotedCard(
+                kind: covers.isEmpty ? .text : .image,
+                title: title,
+                text: text,
+                coverURLs: covers,
+                targetURL: jumpURL
+            )
+        }
+        if type == "ADDITIONAL_TYPE_COMMON" || additional.dictionaryValue(at: ["common"]) != nil,
+           let common = additional.dictionaryValue(at: ["common"])
+        {
+            let title = (common.stringValue(at: ["title"]) ?? common.stringValue(at: ["head_text"]))?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let text = [common.stringValue(at: ["desc1"]), common.stringValue(at: ["desc2"])]
+                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+                .joined(separator: "\n")
+            let cover = normalizedURL(common.stringValue(at: ["cover"]))
+            let jumpURL = normalizedURL(common.stringValue(at: ["jump_url"]))
+            if title.isEmpty, text.isEmpty, cover == nil, jumpURL == nil { return nil }
+            return DynamicCard.QuotedCard(
+                kind: .text,
+                title: title,
+                text: text,
+                coverURLs: cover.map { [$0] } ?? [],
+                targetURL: jumpURL
+            )
+        }
+        return nil
+    }
+
+    private static func extractExplicitBodyText(dynamic: [String: Any], major: [String: Any]) -> String {
         let bodyCandidates = [
             richTextPlainText(dynamic.arrayValue(at: ["desc", "rich_text_nodes"])),
             richTextPlainText(dynamic.arrayValue(at: ["desc", "rich_text_nodes_v2"])),
@@ -350,7 +504,29 @@ public struct DynamicFeedService: Sendable {
         .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
         .filter { !$0.isEmpty }
 
-        if let body = bodyCandidates.max(by: { $0.count < $1.count }) {
+        return bodyCandidates.max(by: { $0.count < $1.count }) ?? ""
+    }
+
+    private static func extractMajorTitle(from major: [String: Any]) -> String {
+        [
+            major.stringValue(at: ["archive", "title"]),
+            major.stringValue(at: ["article", "title"]),
+            major.stringValue(at: ["pgc", "title"]),
+            major.stringValue(at: ["opus", "title"]),
+            major.stringValue(at: ["courses", "title"]),
+            major.stringValue(at: ["music", "title"]),
+            major.stringValue(at: ["medialist", "title"]),
+            major.stringValue(at: ["live", "title"]),
+            major.stringValue(at: ["common", "title"]),
+            major.stringValue(at: ["ugc_season", "title"]),
+        ]
+        .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .first(where: { !$0.isEmpty }) ?? ""
+    }
+
+    private static func makeText(dynamic: [String: Any], major: [String: Any]) -> String {
+        let body = extractExplicitBodyText(dynamic: dynamic, major: major)
+        if !body.isEmpty {
             return body
         }
 
@@ -505,8 +681,8 @@ public struct DynamicFeedService: Sendable {
             return nil
         }
 
-        if let canonicalOpusURL = canonicalOpusURLFromScheme(rawValue) {
-            return canonicalOpusURL
+        if let canonicalURL = canonicalSchemeURL(rawValue) {
+            return canonicalURL
         }
 
         if rawValue.hasPrefix("//") {
@@ -527,7 +703,7 @@ public struct DynamicFeedService: Sendable {
         return FocusNavigationPolicy.canonicalWebURL(for: url)
     }
 
-    private static func canonicalOpusURLFromScheme(_ rawValue: String) -> URL? {
+    private static func canonicalSchemeURL(_ rawValue: String) -> URL? {
         guard
             let url = URL(string: rawValue),
             url.scheme?.lowercased() == "bilibili",
@@ -536,21 +712,28 @@ public struct DynamicFeedService: Sendable {
             return nil
         }
         let pathComponents = url.path.split(separator: "/").map(String.init)
-        let candidate: String?
         switch host {
         case "following", "opus":
-            candidate = pathComponents.count == 2 && pathComponents[0].lowercased() == "detail"
-                ? pathComponents[1]
-                : nil
+            guard pathComponents.count == 2,
+                  pathComponents[0].lowercased() == "detail",
+                  !pathComponents[1].isEmpty,
+                  pathComponents[1].allSatisfy(\.isNumber)
+            else { return nil }
+            return URL(string: "https://www.bilibili.com/opus/\(pathComponents[1])")
         case "dynamic":
-            candidate = pathComponents.count == 1 ? pathComponents[0] : nil
+            guard pathComponents.count == 1,
+                  !pathComponents[0].isEmpty,
+                  pathComponents[0].allSatisfy(\.isNumber)
+            else { return nil }
+            return URL(string: "https://www.bilibili.com/opus/\(pathComponents[0])")
+        case "video":
+            guard pathComponents.count == 1,
+                  pathComponents[0].uppercased().hasPrefix("BV")
+            else { return nil }
+            return URL(string: "https://www.bilibili.com/video/\(pathComponents[0])/")
         default:
-            candidate = nil
-        }
-        guard let candidate, !candidate.isEmpty, candidate.allSatisfy(\.isNumber) else {
             return nil
         }
-        return URL(string: "https://www.bilibili.com/opus/\(candidate)")
     }
 
     private static func isOpusLikeURL(_ url: URL) -> Bool {

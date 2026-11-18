@@ -1,5 +1,10 @@
 package org.bilibilifocus.android.ui.video
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.os.Build
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -29,12 +34,26 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
+import kotlinx.coroutines.delay
 import org.bilibilifocus.android.images.FocusImageCDNRequest
 import org.bilibilifocus.android.ui.FocusImageGalleryRequest
 import org.bilibilifocus.android.ui.FocusRichText
 import org.bilibilifocus.core.model.VideoComment
+import org.bilibilifocus.core.model.plainText
 import org.bilibilifocus.android.FocusVideoViewModel
 import org.bilibilifocus.android.VideoCommentsUiState
+
+internal fun copyableCommentText(comment: VideoComment): String =
+    comment.contentRuns.plainText().ifEmpty { comment.content }
+
+private fun copyTextToClipboard(context: Context, text: String) {
+    if (text.isEmpty()) return
+    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return
+    clipboard.setPrimaryClip(ClipData.newPlainText("bilibili-comment", text))
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+        Toast.makeText(context, "已复制评论", Toast.LENGTH_SHORT).show()
+    }
+}
 
 @Composable
 internal fun CommentItem(
@@ -48,6 +67,16 @@ internal fun CommentItem(
     actionsEnabled: Boolean = true,
     referer: String = "https://www.bilibili.com/",
 ) {
+    val context = LocalContext.current
+    val copyableText = remember(comment) { copyableCommentText(comment) }
+    var copied by remember(comment.rpid, copyableText) { mutableStateOf(false) }
+    LaunchedEffect(copied) {
+        if (copied) {
+            delay(1_500)
+            copied = false
+        }
+    }
+
     val contentStyle = MaterialTheme.typography.bodyMedium.let {
         it.copy(fontSize = it.fontSize * 1.15f)
     }
@@ -68,7 +97,7 @@ internal fun CommentItem(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             AsyncImage(
-                model = ImageRequest.Builder(LocalContext.current)
+                model = ImageRequest.Builder(context)
                     .data(FocusImageCDNRequest.canonicalURL(comment.avatarURL))
                     .crossfade(true)
                     .build(),
@@ -88,12 +117,20 @@ internal fun CommentItem(
             )
             if (onLike == null) Text("${comment.likeCount}赞", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
-        FocusRichText(comment.contentRuns, style = contentStyle, onOpenURL = onOpenURL)
+        FocusRichText(comment.contentRuns, style = contentStyle, onOpenURL = onOpenURL, selectable = true)
         CommentImageStrip(comment.imageURLs, onOpenImage, referer = referer)
 
-        if (onReply != null || onLike != null || onDelete != null) Row {
+        if (onReply != null || onLike != null || onDelete != null || copyableText.isNotEmpty()) Row {
             if (onLike != null) TextButton(onClick = onLike, enabled = actionsEnabled) { Text("${if (comment.isLiked) "已赞" else "赞"} ${comment.likeCount}") }
             if (onReply != null) TextButton(onClick = onReply, enabled = actionsEnabled) { Text("回复") }
+            if (copyableText.isNotEmpty()) {
+                TextButton(onClick = {
+                    copyTextToClipboard(context, copyableText)
+                    copied = true
+                }) {
+                    Text(if (copied) "已复制" else "复制")
+                }
+            }
             if (onDelete != null) TextButton(onClick = onDelete, enabled = actionsEnabled) { Text("删除", color = MaterialTheme.colorScheme.error) }
         }
         if (showReplies) comment.replies.take(3).forEach { reply ->
@@ -105,6 +142,7 @@ internal fun CommentItem(
                         style = replyStyle.copy(color = MaterialTheme.colorScheme.onSurfaceVariant),
                         modifier = Modifier.weight(1f),
                         onOpenURL = onOpenURL,
+                        selectable = true,
                     )
                 }
                 CommentImageStrip(reply.imageURLs, onOpenImage, referer = referer)

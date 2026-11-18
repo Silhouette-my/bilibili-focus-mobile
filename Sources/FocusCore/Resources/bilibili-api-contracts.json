@@ -1,15 +1,5 @@
 {
   "schemaVersion": 1,
-  "source": {
-    "repository": "https://github.com/Nemo2011/bilibili-api",
-    "validatedCommit": "87110fe2db7af77425057e163f064700087a3c35",
-    "strategy": "Independently maintained facts-only subset. Core endpoints are checked against the sibling repository; supplemental endpoints have separately recorded documentation and are not reported as sibling-validated.",
-    "supplementalEndpoints": {
-      "history.info.search": "https://github.com/yearzen1/bilibili-pure-apk/blob/master/app/src/main/java/com/bilibili/pure/data/api/BilibiliApi.kt#L87-L93",
-      "history.operate.delete": "https://github.com/BACNext/bilibili-API-collect-backup/blob/master/docs/historytoview/history.md#删除历史记录",
-      "history.operate.clear": "https://github.com/BACNext/bilibili-API-collect-backup/blob/master/docs/historytoview/history.md#清空历史记录"
-    }
-  },
   "endpoints": {
     "article.info.detail": {
       "url": "https://api.bilibili.com/x/article/view",

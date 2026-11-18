@@ -8,16 +8,16 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.rememberTransformableState
 import androidx.compose.foundation.gestures.transformable
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.text.InlineTextContent
+import androidx.compose.foundation.text.appendInlineContent
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.Icon
@@ -41,11 +41,21 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.LinkAnnotation
+import androidx.compose.ui.text.Placeholder
+import androidx.compose.ui.text.PlaceholderVerticalAlign
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextLinkStyles
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.text.withLink
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import coil.compose.AsyncImage
@@ -60,87 +70,171 @@ data class FocusImageGalleryRequest(
     val referer: String,
 )
 
-@OptIn(ExperimentalLayoutApi::class)
+internal data class RichTextEmoteEntry(
+    val id: String,
+    val run: RichTextRun.Emote,
+)
+
+internal data class RichTextContentModel(
+    val annotatedString: AnnotatedString,
+    val emotes: List<RichTextEmoteEntry>,
+)
+
+internal fun buildRichTextContent(
+    runs: List<RichTextRun>,
+    linkColor: Color,
+    onOpenURL: (String) -> Unit = {},
+): RichTextContentModel {
+    val emotes = mutableListOf<RichTextEmoteEntry>()
+    val annotated = buildAnnotatedString {
+        runs.forEachIndexed { index, run ->
+            when (run) {
+                is RichTextRun.Text -> {
+                    val explicitColor = run.color?.let(::parseRichTextColor)
+                    val spanStyle = SpanStyle(
+                        fontWeight = if (run.bold) FontWeight.Bold else null,
+                        fontStyle = if (run.italic) FontStyle.Italic else null,
+                        textDecoration = when {
+                            run.underline && run.strikethrough -> TextDecoration.combine(
+                                listOf(TextDecoration.Underline, TextDecoration.LineThrough),
+                            )
+                            run.underline -> TextDecoration.Underline
+                            run.strikethrough -> TextDecoration.LineThrough
+                            else -> null
+                        },
+                        color = when {
+                            run.linkUrl != null -> linkColor
+                            explicitColor != null -> explicitColor
+                            else -> Color.Unspecified
+                        },
+                    )
+                    val linkUrl = run.linkUrl
+                    if (linkUrl != null) {
+                        withLink(
+                            LinkAnnotation.Clickable(
+                                tag = "link-$index",
+                                styles = TextLinkStyles(style = spanStyle),
+                                linkInteractionListener = { onOpenURL(linkUrl) },
+                            ),
+                        ) {
+                            append(run.text)
+                        }
+                    } else {
+                        withStyle(spanStyle) {
+                            append(run.text)
+                        }
+                    }
+                }
+
+                is RichTextRun.Emote -> {
+                    val id = "emote-$index"
+                    appendInlineContent(id = id, alternateText = run.alt.ifEmpty { "[表情]" })
+                    emotes += RichTextEmoteEntry(id = id, run = run)
+                }
+
+                is RichTextRun.Resource -> {
+                    withLink(
+                        LinkAnnotation.Clickable(
+                            tag = "resource-$index",
+                            styles = TextLinkStyles(
+                                style = SpanStyle(
+                                    color = linkColor,
+                                    textDecoration = TextDecoration.Underline,
+                                ),
+                            ),
+                            linkInteractionListener = { onOpenURL(run.url) },
+                        ),
+                    ) {
+                        append(run.label)
+                    }
+                }
+            }
+        }
+    }
+    return RichTextContentModel(annotatedString = annotated, emotes = emotes)
+}
+
 @Composable
 fun FocusRichText(
     runs: List<RichTextRun>,
     modifier: Modifier = Modifier,
     style: TextStyle = MaterialTheme.typography.bodyLarge,
     onOpenURL: (String) -> Unit = {},
+    selectable: Boolean = false,
 ) {
-    FlowRow(
-        modifier = modifier,
-        horizontalArrangement = Arrangement.Start,
-        verticalArrangement = Arrangement.Center,
-    ) {
-        runs.forEachIndexed { index, run ->
-            when (run) {
-                is RichTextRun.Text -> {
-                    val explicitColor = run.color?.let(::parseRichTextColor)
-                    Text(
-                        text = run.text,
-                        style = style.copy(
-                            fontWeight = if (run.bold) FontWeight.Bold else style.fontWeight,
-                            fontStyle = if (run.italic) FontStyle.Italic else style.fontStyle,
-                            textDecoration = when {
-                                run.underline && run.strikethrough -> TextDecoration.combine(listOf(TextDecoration.Underline, TextDecoration.LineThrough))
-                                run.underline -> TextDecoration.Underline
-                                run.strikethrough -> TextDecoration.LineThrough
-                                else -> style.textDecoration
-                            },
-                            color = when {
-                                run.linkUrl != null -> MaterialTheme.colorScheme.primary
-                                explicitColor != null -> explicitColor
-                                else -> style.color
-                            },
-                        ),
-                        modifier = if (run.linkUrl != null) Modifier.pointerInput(run.linkUrl) {
-                            detectTapGestures { onOpenURL(requireNotNull(run.linkUrl)) }
-                        } else Modifier,
-                    )
-                }
-
-                is RichTextRun.Emote -> {
-                    var failed by remember(run.url) { mutableStateOf(false) }
-                    if (failed) {
-                        Text(text = run.alt, style = style)
-                    } else {
-                        val cookie = remember(run.url) { CookieManager.getInstance().getCookie(run.url) }
-                        AsyncImage(
-                            model = ImageRequest.Builder(LocalContext.current)
-                                .data(run.url)
-                                .addHeader("Referer", "https://www.bilibili.com/")
-                                .apply { if (!cookie.isNullOrBlank()) addHeader("Cookie", cookie) }
-                                .crossfade(false)
-                                .build(),
-                            contentDescription = run.alt,
-                            modifier = Modifier
-                                .padding(horizontal = 1.dp)
-                                .size(24.dp),
-                            contentScale = ContentScale.Fit,
-                            onError = { failed = true },
-                            onSuccess = { result ->
-                                if (!ValueAnimator.areAnimatorsEnabled()) {
-                                    (result.result.drawable as? Animatable)?.stop()
-                                }
-                            },
-                        )
-                    }
-                }
-
-                is RichTextRun.Resource -> Text(
-                    text = run.label,
-                    style = style.copy(
-                        color = MaterialTheme.colorScheme.primary,
-                        textDecoration = TextDecoration.Underline,
-                    ),
-                    modifier = Modifier.pointerInput("resource-$index-${run.url}") {
-                        detectTapGestures { onOpenURL(run.url) }
-                    },
-                )
+    if (runs.isEmpty()) return
+    val linkColor = MaterialTheme.colorScheme.primary
+    val model = remember(runs, linkColor, onOpenURL) {
+        buildRichTextContent(runs = runs, linkColor = linkColor, onOpenURL = onOpenURL)
+    }
+    val emoteSize = if (style.fontSize.isSp) {
+        (style.fontSize.value * 1.35f).coerceIn(18f, 28f).sp
+    } else {
+        22.sp
+    }
+    val inlineContent = remember(model.emotes, emoteSize, style) {
+        model.emotes.associate { entry ->
+            entry.id to InlineTextContent(
+                placeholder = Placeholder(
+                    width = emoteSize,
+                    height = emoteSize,
+                    placeholderVerticalAlign = PlaceholderVerticalAlign.Center,
+                ),
+            ) {
+                RichTextEmoteImage(run = entry.run, style = style)
             }
         }
     }
+
+    if (selectable) {
+        SelectionContainer {
+            Text(
+                text = model.annotatedString,
+                inlineContent = inlineContent,
+                modifier = modifier,
+                style = style,
+            )
+        }
+    } else {
+        Text(
+            text = model.annotatedString,
+            inlineContent = inlineContent,
+            modifier = modifier,
+            style = style,
+        )
+    }
+}
+
+@Composable
+private fun RichTextEmoteImage(
+    run: RichTextRun.Emote,
+    style: TextStyle,
+) {
+    var failed by remember(run.url) { mutableStateOf(false) }
+    if (failed) {
+        Text(text = run.alt, style = style)
+        return
+    }
+    val cookie = remember(run.url) { CookieManager.getInstance().getCookie(run.url) }
+    AsyncImage(
+        model = ImageRequest.Builder(LocalContext.current)
+            .data(run.url)
+            .addHeader("Referer", "https://www.bilibili.com/")
+            .apply { if (!cookie.isNullOrBlank()) addHeader("Cookie", cookie) }
+            .crossfade(false)
+            .build(),
+        contentDescription = run.alt,
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 1.dp),
+        contentScale = ContentScale.Fit,
+        onError = { failed = true },
+        onSuccess = { result ->
+            if (!ValueAnimator.areAnimatorsEnabled()) {
+                (result.result.drawable as? Animatable)?.stop()
+            }
+        },
+    )
 }
 
 @OptIn(ExperimentalFoundationApi::class)

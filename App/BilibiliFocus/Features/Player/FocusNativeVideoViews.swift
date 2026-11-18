@@ -626,6 +626,12 @@ private struct FocusNativeVideoCommentRow: View {
     let onOpenURL: (URL) -> Void
     let onOpenImages: ([URL], Int) -> Void
     @State private var confirmsDeletion = false
+    @State private var didCopy = false
+
+    private var copyableText: String {
+        let rich = comment.contentRuns.map(\.plainText).joined()
+        return rich.isEmpty ? comment.message : rich
+    }
 
     var body: some View {
         let thread = viewModel.commentThreadState(for: comment.id)
@@ -655,10 +661,21 @@ private struct FocusNativeVideoCommentRow: View {
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                 }
+                .contextMenu {
+                    if !copyableText.isEmpty {
+                        Button {
+                            UIPasteboard.general.string = copyableText
+                            didCopy = true
+                        } label: {
+                            Label("复制评论", systemImage: "doc.on.doc")
+                        }
+                    }
+                }
                 FocusInlineRichText(
                     runs: comment.contentRuns,
                     font: .subheadline,
-                    onOpenURL: onOpenURL
+                    onOpenURL: onOpenURL,
+                    selectable: true
                 )
                 .fixedSize(horizontal: false, vertical: true)
 
@@ -729,6 +746,12 @@ private struct FocusNativeVideoCommentRow: View {
                         comment: comment
                     )
                     Button("回复") { viewModel.composeComment(replyingTo: comment) }
+                    if !copyableText.isEmpty {
+                        Button(didCopy ? "已复制" : "复制") {
+                            UIPasteboard.general.string = copyableText
+                            didCopy = true
+                        }
+                    }
                     if viewModel.canDeleteComment(comment) {
                         Button("删除", role: .destructive) { confirmsDeletion = true }
                             .disabled(viewModel.commentDeletesInFlight.contains(comment.id))
@@ -764,6 +787,11 @@ private struct FocusNativeVideoCommentRow: View {
         }
         .padding(12)
         .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .task(id: didCopy) {
+            guard didCopy else { return }
+            try? await Task.sleep(for: .seconds(1.5))
+            didCopy = false
+        }
         .confirmationDialog("删除这条评论？", isPresented: $confirmsDeletion, titleVisibility: .visible) {
             Button("删除评论", role: .destructive) { viewModel.deleteComment(comment) }
         }
@@ -777,6 +805,12 @@ private struct FocusNativeVideoReplyRow: View {
     let onOpenURL: (URL) -> Void
     let onOpenImages: ([URL], Int) -> Void
     @State private var confirmsDeletion = false
+    @State private var didCopy = false
+
+    private var copyableText: String {
+        let rich = reply.contentRuns.map(\.plainText).joined()
+        return rich.isEmpty ? reply.message : rich
+    }
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
@@ -811,11 +845,22 @@ private struct FocusNativeVideoReplyRow: View {
                         comment: reply
                     )
                 }
+                .contextMenu {
+                    if !copyableText.isEmpty {
+                        Button {
+                            UIPasteboard.general.string = copyableText
+                            didCopy = true
+                        } label: {
+                            Label("复制评论", systemImage: "doc.on.doc")
+                        }
+                    }
+                }
                 FocusInlineRichText(
                     runs: reply.contentRuns,
                     font: .caption,
                     foreground: .secondary,
-                    onOpenURL: onOpenURL
+                    onOpenURL: onOpenURL,
+                    selectable: true
                 )
                 .fixedSize(horizontal: false, vertical: true)
 
@@ -826,6 +871,12 @@ private struct FocusNativeVideoReplyRow: View {
                 )
                 HStack(spacing: 16) {
                     Button("回复") { viewModel.composeComment(replyingTo: reply, rootID: rootCommentID) }
+                    if !copyableText.isEmpty {
+                        Button(didCopy ? "已复制" : "复制") {
+                            UIPasteboard.general.string = copyableText
+                            didCopy = true
+                        }
+                    }
                     if viewModel.canDeleteComment(reply) {
                         Button("删除", role: .destructive) { confirmsDeletion = true }
                             .disabled(viewModel.commentDeletesInFlight.contains(reply.id))
@@ -833,6 +884,11 @@ private struct FocusNativeVideoReplyRow: View {
                 }
                 .font(.caption)
             }
+        }
+        .task(id: didCopy) {
+            guard didCopy else { return }
+            try? await Task.sleep(for: .seconds(1.5))
+            didCopy = false
         }
         .confirmationDialog("删除这条回复？", isPresented: $confirmsDeletion, titleVisibility: .visible) {
             Button("删除回复", role: .destructive) { viewModel.deleteComment(reply) }
@@ -926,9 +982,6 @@ struct FocusNativeSubtitleOverlay: View {
     @ObservedObject private var playbackProgress: FocusNativePlaybackProgress
     let isFullscreen: Bool
     let bottomInset: CGFloat
-    #if DEBUG
-    var onFixtureProgressRender: ((Int64) -> Void)?
-    #endif
 
     init(viewModel: FocusNativeVideoViewModel, isFullscreen: Bool, bottomInset: CGFloat) {
         self.viewModel = viewModel
@@ -938,9 +991,6 @@ struct FocusNativeSubtitleOverlay: View {
     }
 
     var body: some View {
-        #if DEBUG
-        let _ = onFixtureProgressRender?(playbackProgress.positionMilliseconds)
-        #endif
         TimelineView(
             .animation(
                 minimumInterval: 0.1,
@@ -1007,14 +1057,6 @@ struct FocusNativeDanmakuOverlay: View {
         self.viewModel = viewModel
         self.playbackProgress = viewModel.playbackProgress
     }
-    #if DEBUG
-    var onFixtureFrame: ((CFTimeInterval, Int64) -> Void)?
-
-    init(viewModel: FocusNativeVideoViewModel, onFixtureFrame: @escaping (CFTimeInterval, Int64) -> Void) {
-        self.init(viewModel: viewModel)
-        self.onFixtureFrame = onFixtureFrame
-    }
-    #endif
 
     var body: some View {
         GeometryReader { geometry in
@@ -1027,9 +1069,6 @@ struct FocusNativeDanmakuOverlay: View {
                 let playbackMilliseconds = viewModel.danmakuPlaybackPositionMilliseconds
                 Canvas { context, size in
                     guard viewModel.isDanmakuEnabled else { return }
-                    #if DEBUG
-                    onFixtureFrame?(CACurrentMediaTime(), playbackMilliseconds)
-                    #endif
                     for segment in layoutCache.segments {
                         for placement in FocusNativeDanmakuLayout.activePlacements(
                             in: segment.placements, at: playbackMilliseconds

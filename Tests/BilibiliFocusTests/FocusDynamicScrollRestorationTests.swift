@@ -909,3 +909,29 @@ private struct ScrollAnchorFramesPreferenceKey: PreferenceKey {
         value.merge(nextValue(), uniquingKeysWith: { _, latest in latest })
     }
 }
+
+@MainActor
+private final class TextSizingFrameEvents: NSObject {
+    private var link: CADisplayLink?
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func next() async {
+        if link == nil {
+            link = CADisplayLink(target: self, selector: #selector(tick))
+            link?.add(to: .main, forMode: .common)
+        }
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    @objc private func tick() {
+        let pending = continuation
+        continuation = nil
+        pending?.resume()
+    }
+
+    func stop() {
+        link?.invalidate()
+        link = nil
+        tick()
+    }
+}

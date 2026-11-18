@@ -155,4 +155,198 @@ class OpusRichTextTests {
         assertEquals(CommentTarget(5566L, 11), probed)
         assertEquals(listOf("17", "11"), requestedCommentTypes)
     }
+
+    @Test
+    fun `opus detail parses blockquote and link_card reference blocks`() = runTest {
+        val service = OpusService(
+            cookieProvider = object : CookieProvider {
+                override suspend fun loadCookies(): List<Cookie> = emptyList()
+            },
+            httpClient = object : HttpClient {
+                override suspend fun get(url: String, headers: Map<String, String>): HttpResponse {
+                    val body = """
+                        {
+                          "code": 0,
+                          "data": {
+                            "item": {
+                              "id_str": "7788",
+                              "basic": {"comment_id_str": "7788", "comment_type": 11},
+                              "modules": [
+                                {
+                                  "module_type": "MODULE_TYPE_AUTHOR",
+                                  "module_author": {"name": "专栏作者", "mid": 1001, "pub_time": "今天"}
+                                },
+                                {
+                                  "module_type": "MODULE_TYPE_CONTENT",
+                                  "module_content": {
+                                    "paragraphs": [
+                                      {
+                                        "para_type": 4,
+                                        "blockquote": {
+                                          "children": [
+                                            {
+                                              "text": {
+                                                "nodes": [
+                                                  {"type": "TEXT_NODE_TYPE_WORD", "word": {"words": "第一句引用"}},
+                                                  {"type": "TEXT_NODE_TYPE_WORD", "word": {"words": "第二句引用"}}
+                                                ]
+                                              }
+                                            }
+                                          ]
+                                        }
+                                      },
+                                      {
+                                        "para_type": 6,
+                                        "link_card": {
+                                          "card": {
+                                            "card_type": "LINK_CARD_TYPE_OPUS",
+                                            "jump_url": "//www.bilibili.com/opus/8801",
+                                            "opus": {
+                                              "title": "关联动态标题",
+                                              "author": {"name": "原作者", "mid": 42, "face": "//i0.hdslb.com/a.jpg"},
+                                              "summary": {"text": "关联动态摘要"},
+                                              "jump_url": "//www.bilibili.com/opus/8801"
+                                            }
+                                          }
+                                        }
+                                      },
+                                      {
+                                        "para_type": 6,
+                                        "link_card": {
+                                          "card": {
+                                            "card_type": "LINK_CARD_TYPE_UGC",
+                                            "ugc": {
+                                              "title": "关联视频标题",
+                                              "bvid": "BV1zz411c7xy",
+                                              "desc_second": "05:20",
+                                              "cover": "//i0.hdslb.com/v.jpg",
+                                              "jump_url": "//www.bilibili.com/video/BV1zz411c7xy"
+                                            }
+                                          }
+                                        }
+                                      },
+                                      {
+                                        "para_type": 6,
+                                        "link_card": {
+                                          "card": {
+                                            "card_type": "LINK_CARD_TYPE_ITEM_NULL",
+                                            "item_null": {"text": "源内容已被删除"}
+                                          }
+                                        }
+                                      }
+                                    ]
+                                  }
+                                }
+                              ]
+                            }
+                          }
+                        }
+                    """.trimIndent()
+                    return HttpResponse(200, body)
+                }
+
+                override suspend fun post(url: String, body: String, headers: Map<String, String>): HttpResponse =
+                    error("Unexpected POST")
+            },
+        )
+
+        val detail = service.fetchOpusDetail("7788")
+        val blocks = detail.paragraphs.flatMap { it.blocks }
+
+        val quotes = blocks.filterIsInstance<org.bilibilifocus.core.model.OpusBlock.Quote>()
+        assertEquals(1, quotes.size)
+        val quoteText = quotes.single().nodes
+            .filterIsInstance<org.bilibilifocus.core.model.RichTextRun.Text>()
+            .joinToString("") { it.text }
+        assertTrue(quoteText.contains("第一句引用"))
+        assertTrue(quoteText.contains("第二句引用"))
+
+        val refs = blocks.filterIsInstance<org.bilibilifocus.core.model.OpusBlock.Reference>().map { it.reference }
+        assertEquals(3, refs.size)
+        assertEquals("原作者", refs[0].authorName)
+        assertEquals("关联动态标题", refs[0].title)
+        assertEquals("https://www.bilibili.com/opus/8801", refs[0].targetURL)
+        assertEquals("关联视频标题", refs[1].title)
+        assertEquals("https://www.bilibili.com/video/BV1zz411c7xy", refs[1].targetURL)
+        assertEquals("源内容已被删除", refs[2].unavailableTip)
+    }
+
+    @Test
+    fun `opus detail falls back to dynamic detail when opus endpoint returns error on forwarded post`() = runTest {
+        val service = OpusService(
+            cookieProvider = object : CookieProvider {
+                override suspend fun loadCookies(): List<Cookie> = emptyList()
+            },
+            httpClient = object : HttpClient {
+                override suspend fun get(url: String, headers: Map<String, String>): HttpResponse {
+                    val body = when {
+                        "/opus/detail" in url ->
+                            """{"code":-404,"message":"nothing found"}"""
+                        "/x/web-interface/nav" in url ->
+                            """{"code":0,"data":{"wbi_img":{"img_url":"https://i0.hdslb.com/abcdefghijklmnopqrstuvwxyz012345.png","sub_url":"https://i0.hdslb.com/ABCDEFGHIJKLMNOPQRSTUVWXYZ012345.png"}}}"""
+                        else -> """
+                            {
+                              "code": 0,
+                              "data": {
+                                "item": {
+                                  "id_str": "9001",
+                                  "type": "DYNAMIC_TYPE_FORWARD",
+                                  "basic": {"comment_id_str": "9001", "comment_type": 17},
+                                  "modules": {
+                                    "module_author": {"name": "外层转发作者", "mid": 11, "pub_time": "10分钟前"},
+                                    "module_dynamic": {
+                                      "desc": {"text": "转发附言"}
+                                    }
+                                  },
+                                  "orig": {
+                                    "id_str": "8001",
+                                    "type": "DYNAMIC_TYPE_AV",
+                                    "modules": {
+                                      "module_author": {"name": "原动态作者", "mid": 22, "pub_time": "1小时前"},
+                                      "module_dynamic": {
+                                        "major": {
+                                          "type": "MAJOR_TYPE_ARCHIVE",
+                                          "archive": {
+                                            "bvid": "BV1ab411c7cd",
+                                            "title": "原视频",
+                                            "desc": "视频简介",
+                                            "cover": "//i0.hdslb.com/bfs/archive/orig.jpg",
+                                            "jump_url": "//www.bilibili.com/video/BV1ab411c7cd"
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                        """.trimIndent()
+                    }
+                    return HttpResponse(200, body)
+                }
+
+                override suspend fun post(url: String, body: String, headers: Map<String, String>): HttpResponse =
+                    error("Unexpected POST")
+            },
+        )
+
+        val detail = service.fetchOpusDetail("9001")
+        assertEquals("外层转发作者", detail.author.name)
+        assertEquals(9001L, detail.commentId)
+        assertEquals(17, detail.commentType)
+
+        val blocks = detail.paragraphs.flatMap { it.blocks }
+        val textContent = blocks.filterIsInstance<org.bilibilifocus.core.model.OpusBlock.Text>()
+            .flatMap { it.nodes }
+            .filterIsInstance<org.bilibilifocus.core.model.RichTextRun.Text>()
+            .joinToString("") { it.text }
+        assertTrue(textContent.contains("转发附言"))
+
+        val ref = blocks.filterIsInstance<org.bilibilifocus.core.model.OpusBlock.Reference>()
+            .single()
+            .reference
+        assertEquals("原动态作者", ref.authorName)
+        assertEquals("原视频", ref.title)
+        assertEquals("https://www.bilibili.com/video/BV1ab411c7cd", ref.targetURL)
+    }
 }
