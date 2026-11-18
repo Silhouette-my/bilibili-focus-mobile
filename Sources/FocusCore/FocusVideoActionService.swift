@@ -28,7 +28,10 @@ public actor FocusVideoActionService {
 
     public enum ServiceError: Error, Equatable, Sendable, LocalizedError {
         case loginRequired
+        case accountScopeChanged
+        case invalidParameters
         case noFavoriteFolder
+        case httpStatus(code: Int)
         case invalidResponse
         case api(code: Int, message: String)
 
@@ -36,8 +39,14 @@ public actor FocusVideoActionService {
             switch self {
             case .loginRequired:
                 return "需要先登录才能执行此操作"
+            case .accountScopeChanged:
+                return "登录账号已切换，播放历史将在对应账号恢复后重试"
+            case .invalidParameters:
+                return "操作参数无效"
             case .noFavoriteFolder:
                 return "当前账号没有可用的收藏夹"
+            case let .httpStatus(code):
+                return "操作接口请求失败（HTTP \(code)）"
             case .invalidResponse:
                 return "操作接口返回了无效数据"
             case let .api(code, message):
@@ -54,7 +63,7 @@ public actor FocusVideoActionService {
     public init(
         cookieProvider: any CookieSnapshotProvider,
         requestLoader: @escaping RequestLoader = { request in
-            try await URLSession.shared.data(for: request)
+            try await BiliAPINetwork.data(for: request)
         }
     ) {
         self.cookieProvider = cookieProvider
@@ -66,19 +75,28 @@ public actor FocusVideoActionService {
         let referer = "https://www.bilibili.com/video/av\(aid)/"
 
         async let likedResult = interactionFlag(
-            url: URL(string: "https://api.bilibili.com/x/web-interface/archive/has/like?aid=\(aid)")!,
+            url: Self.endpointURL(
+                "video.info.has_liked",
+                queryItems: [URLQueryItem(name: "aid", value: String(aid))]
+            ),
             referer: referer,
             cookies: cookies,
             kind: .liked
         )
         async let coinedResult = interactionFlag(
-            url: URL(string: "https://api.bilibili.com/x/web-interface/archive/coins?aid=\(aid)")!,
+            url: Self.endpointURL(
+                "video.info.get_pay_coins",
+                queryItems: [URLQueryItem(name: "aid", value: String(aid))]
+            ),
             referer: referer,
             cookies: cookies,
             kind: .coined
         )
         async let favoriteResult = interactionFlag(
-            url: URL(string: "https://api.bilibili.com/x/v2/fav/video/favoured?aid=\(aid)")!,
+            url: Self.endpointURL(
+                "video.info.has_favoured",
+                queryItems: [URLQueryItem(name: "aid", value: String(aid))]
+            ),
             referer: referer,
             cookies: cookies,
             kind: .favorited
@@ -102,7 +120,7 @@ public actor FocusVideoActionService {
         let cookies = await authenticatedCookies()
         let csrf = try Self.csrfToken(in: cookies)
         try await postForm(
-            url: URL(string: "https://api.bilibili.com/x/web-interface/archive/like")!,
+            url: BiliAPIContractCatalog.require("video.operate.like").url,
             values: [
                 "aid": String(aid),
                 "like": liked ? "1" : "2",
@@ -118,7 +136,7 @@ public actor FocusVideoActionService {
         let cookies = await authenticatedCookies()
         let csrf = try Self.csrfToken(in: cookies)
         try await postForm(
-            url: URL(string: "https://api.bilibili.com/x/web-interface/coin/add")!,
+            url: BiliAPIContractCatalog.require("video.operate.coin").url,
             values: [
                 "aid": String(aid),
                 "multiply": "1",
@@ -134,10 +152,90 @@ public actor FocusVideoActionService {
     /// Mirrors `bilibili-api`'s `Video.report_watch_history` request.
     /// Calling this periodically keeps the server-side history position in sync.
     public func reportWatchHistory(aid: Int64, cid: Int64, progressSeconds: Int64) async throws {
+        guard aid > 0, cid > 0, progressSeconds >= 0 else {
+            throw ServiceError.invalidParameters
+        }
         let cookies = await authenticatedCookies()
+        try await reportWatchHistory(
+            aid: aid,
+            cid: cid,
+            progressSeconds: progressSeconds,
+            cookies: cookies
+        )
+    }
+
+    public func reportWatchHistory(
+        aid: Int64,
+        cid: Int64,
+        progressSeconds: Int64,
+        expectedAccountScope: FocusPlaybackAccountScope
+    ) async throws {
+        guard aid > 0, cid > 0, progressSeconds >= 0 else {
+            throw ServiceError.invalidParameters
+        }
+        let cookies = await authenticatedCookies()
+        guard FocusPlaybackAccountScope.resolve(cookies: cookies) == expectedAccountScope else {
+            throw ServiceError.accountScopeChanged
+        }
+        try await reportWatchHistory(
+            aid: aid,
+            cid: cid,
+            progressSeconds: progressSeconds,
+            cookies: cookies
+        )
+    }
+
+    public func attemptWatchHistory(
+        _ report: FocusPendingWatchHistoryReport
+    ) async -> FocusHistoryReportAttemptOutcome {
+        do {
+            try await reportWatchHistory(
+                aid: report.aid,
+                cid: report.cid,
+                progressSeconds: report.progressSeconds,
+                expectedAccountScope: report.accountScope
+            )
+            return .delivered
+        } catch {
+            return Self.historyReportAttemptOutcome(for: error)
+        }
+    }
+
+    public nonisolated static func historyReportAttemptOutcome(
+        for error: any Error
+    ) -> FocusHistoryReportAttemptOutcome {
+        guard let serviceError = error as? ServiceError else {
+            return .retryableFailure
+        }
+
+        switch serviceError {
+        case .accountScopeChanged:
+            return .retryableFailure
+        case let .httpStatus(code):
+            return Self.isTransientHTTPStatus(code)
+                ? .retryableFailure
+                : .permanentFailure
+        case let .api(code, _):
+            return Self.isTransientAPICode(code)
+                ? .retryableFailure
+                : .permanentFailure
+        case .loginRequired,
+             .invalidParameters,
+             .noFavoriteFolder,
+             .invalidResponse:
+            return .permanentFailure
+        }
+    }
+
+    private func reportWatchHistory(
+        aid: Int64,
+        cid: Int64,
+        progressSeconds: Int64,
+        cookies: [HTTPCookie]
+    ) async throws {
         let csrf = try Self.csrfToken(in: cookies)
         try await postForm(
-            url: URL(string: "https://api.bilibili.com/x/v2/history/report")!,
+            url: BiliAPIContractCatalog.require("video.operate.report_history").url,
             values: [
                 "aid": String(aid),
                 "cid": String(cid),
@@ -164,7 +262,7 @@ public actor FocusVideoActionService {
         }
         let csrf = try Self.csrfToken(in: cookies)
         try await postForm(
-            url: URL(string: "https://api.bilibili.com/x/v3/fav/resource/deal")!,
+            url: BiliAPIContractCatalog.require("video.operate.favorite").url,
             values: [
                 "rid": String(aid),
                 "type": "2",
@@ -209,7 +307,7 @@ public actor FocusVideoActionService {
     }
 
     private func favoriteFolderID(aid: Int64, cookies: [HTTPCookie]) async throws -> Int64 {
-        let navURL = URL(string: "https://api.bilibili.com/x/web-interface/nav")!
+        let navURL = BiliAPIContractCatalog.require("credential.info.valid").url
         let navRoot = try await requestObject(
             request: makeRequest(url: navURL, referer: "https://www.bilibili.com/", cookies: cookies)
         )
@@ -222,7 +320,10 @@ public actor FocusVideoActionService {
             throw ServiceError.loginRequired
         }
 
-        var components = URLComponents(string: "https://api.bilibili.com/x/v3/fav/folder/created/list-all")!
+        var components = URLComponents(
+            url: BiliAPIContractCatalog.require("video.info.media_list").url,
+            resolvingAgainstBaseURL: false
+        )!
         components.queryItems = [
             URLQueryItem(name: "up_mid", value: String(mid)),
             URLQueryItem(name: "rid", value: String(aid)),
@@ -246,6 +347,18 @@ public actor FocusVideoActionService {
             throw ServiceError.noFavoriteFolder
         }
         return folderID
+    }
+
+    private nonisolated static func endpointURL(
+        _ key: String,
+        queryItems: [URLQueryItem]
+    ) -> URL {
+        var components = URLComponents(
+            url: BiliAPIContractCatalog.require(key).url,
+            resolvingAgainstBaseURL: false
+        )!
+        components.queryItems = queryItems
+        return components.url!
     }
 
     private func postForm(
@@ -280,14 +393,33 @@ public actor FocusVideoActionService {
 
     private func requestObject(request: URLRequest) async throws -> [String: Any] {
         let (data, response) = try await requestLoader(request)
-        guard
-            let response = response as? HTTPURLResponse,
-            (200 ..< 300).contains(response.statusCode),
-            let root = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else {
+        guard let response = response as? HTTPURLResponse else {
+            throw ServiceError.invalidResponse
+        }
+        guard (200 ..< 300).contains(response.statusCode) else {
+            throw ServiceError.httpStatus(code: response.statusCode)
+        }
+        let object: Any
+        do {
+            object = try JSONSerialization.jsonObject(with: data)
+        } catch {
+            throw ServiceError.invalidResponse
+        }
+        guard let root = object as? [String: Any] else {
             throw ServiceError.invalidResponse
         }
         return root
+    }
+
+    private nonisolated static func isTransientHTTPStatus(_ statusCode: Int) -> Bool {
+        statusCode == 408
+            || statusCode == 425
+            || statusCode == 429
+            || (500 ... 599).contains(statusCode)
+    }
+
+    private nonisolated static func isTransientAPICode(_ code: Int) -> Bool {
+        [-500, -503, -504, -509].contains(code)
     }
 
     private nonisolated static func validate(_ root: [String: Any]) throws {

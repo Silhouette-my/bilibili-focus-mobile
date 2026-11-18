@@ -2,9 +2,7 @@ package org.bilibilifocus.core.service
 
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.jsonPrimitive
 import org.bilibilifocus.core.cookie.CookieProvider
-import org.bilibilifocus.core.crypto.md5Hex
 import org.bilibilifocus.core.model.SearchQuery
 import org.bilibilifocus.core.model.SearchResultFilter
 import org.bilibilifocus.core.model.SearchResultItem
@@ -12,11 +10,13 @@ import org.bilibilifocus.core.model.SearchResultPage
 import org.bilibilifocus.core.model.SearchResultSection
 import org.bilibilifocus.core.model.SearchVideoSortOption
 import org.bilibilifocus.core.routing.FocusNavigationPolicy
+import kotlin.math.roundToLong
 
 class SearchResultService(
     private val cookieProvider: CookieProvider,
     private val httpClient: HttpClient,
     private val userAgent: String = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
+    private val wbiSigner: WbiSigner = WbiSigner(cookieProvider, httpClient, userAgent),
 ) {
     sealed class ServiceError(message: String) : Exception(message) {
         data object InvalidResponse : ServiceError("搜索接口返回无效数据")
@@ -26,7 +26,6 @@ class SearchResultService(
     }
 
     private val json = Json { ignoreUnknownKeys = true }
-    private val keyCache = WBIKeyCache()
 
     suspend fun fetchPage(
         query: SearchQuery,
@@ -34,25 +33,47 @@ class SearchResultService(
         page: Int = 1,
         videoSort: SearchVideoSortOption = SearchVideoSortOption.DEFAULT,
     ): SearchResultPage {
-        val cookies = cookieProvider.loadCookies()
-        val mixinKey = keyCache.mixinKey(cookies, userAgent)
-        val url = makeSignedSearchURL(query, filter, page, mixinKey, videoSort)
-        val headers = buildHeaders(query, cookies)
-
-        val response = httpClient.get(url, headers)
+        val parameters = buildMap {
+            put("keyword", query.keyword)
+            if (filter != SearchResultFilter.ALL) {
+                filter.apiSearchType?.let { put("search_type", it) }
+                put("page", maxOf(page, 1).toString())
+            }
+            if (filter == SearchResultFilter.VIDEO) {
+                videoSort.apiOrderValue?.let { put("order", it) }
+            }
+        }
+        val endpoint = if (filter == SearchResultFilter.ALL) {
+            BiliApiContractCatalog.require("search.search.web_search").url
+        } else {
+            BiliApiContractCatalog.require("search.search.web_search_by_type").url
+        }
+        val result = try {
+            wbiSigner.execute(parameters) { signedQuery ->
+                val url = "$endpoint?$signedQuery"
+                val response = httpClient.get(url, buildHeaders(query, url))
+                val apiCode = runCatching {
+                    (json.parseToJsonElement(response.body) as? JsonObject)?.intValueAt("code")
+                }.getOrNull()
+                WbiRequestResult(response, response.statusCode, apiCode)
+            }
+        } catch (_: WbiSigner.SigningUnavailable) {
+            throw ServiceError.SigningUnavailable
+        }
+        val response = result.value
         if (response.statusCode !in 200..299) {
             throw ServiceError.InvalidResponse
         }
         return decodePage(response.body, query, filter, page)
     }
 
-    private fun buildHeaders(query: SearchQuery, cookies: List<org.bilibilifocus.core.cookie.Cookie>): Map<String, String> {
+    private suspend fun buildHeaders(query: SearchQuery, targetUrl: String): Map<String, String> {
         val headers = mutableMapOf(
             "Accept" to "application/json, text/plain, */*",
             "Referer" to query.resultURL,
             "User-Agent" to userAgent,
         )
-        return cookieProvider.attachCookies(headers, cookies)
+        return cookieProvider.attachCookies(headers, targetUrl)
     }
 
     fun decodePage(rawJson: String, query: SearchQuery, filter: SearchResultFilter, requestedPage: Int = 1): SearchResultPage {
@@ -260,46 +281,6 @@ class SearchResultService(
         )
     }
 
-    // WBI Signing
-
-    private fun makeSignedSearchURL(
-        query: SearchQuery, filter: SearchResultFilter, page: Int,
-        mixinKey: String, videoSort: SearchVideoSortOption,
-    ): String {
-        val params = mutableListOf<Pair<String, String>>()
-        params.add("keyword" to query.keyword)
-
-        if (filter != SearchResultFilter.ALL) {
-            filter.apiSearchType?.let { params.add("search_type" to it) }
-            params.add("page" to maxOf(page, 1).toString())
-        }
-
-        if (filter == SearchResultFilter.VIDEO) {
-            videoSort.apiOrderValue?.let { params.add("order" to it) }
-        }
-
-        val wts = currentEpochSeconds().toString()
-        params.add("wts" to wts)
-
-        val filtered = params
-            .map { (k, v) -> k to sanitizeWBIValue(v) }
-            .sortedBy { it.first }
-
-        val queryString = filtered.joinToString("&") { (k, v) -> "$k=$v" }
-        val signature = md5Hex(queryString + mixinKey)
-
-        val path = if (filter == SearchResultFilter.ALL) {
-            "/x/web-interface/wbi/search/all/v2"
-        } else {
-            "/x/web-interface/wbi/search/type"
-        }
-
-        return "https://api.bilibili.com$path?$queryString&w_rid=$signature"
-    }
-
-    private fun sanitizeWBIValue(value: String): String =
-        value.filter { it !in "!'()*" }
-
     // Helper functions
 
     private fun cleanText(rawValue: String?): String {
@@ -355,8 +336,8 @@ class SearchResultService(
         val value = normalized.toDoubleOrNull() ?: return rawText
 
         return when {
-            value >= 100_000_000 -> "%.1f亿".format(value / 100_000_000).replace(".0", "")
-            value >= 10_000 -> "%.1f万".format(value / 10_000).replace(".0", "")
+            value >= 100_000_000 -> "${oneDecimal(value / 100_000_000)}亿"
+            value >= 10_000 -> "${oneDecimal(value / 10_000)}万"
             else -> value.toLong().toString()
         }
     }
@@ -384,11 +365,20 @@ class SearchResultService(
         val remainingSeconds = seconds % 60
 
         return if (hours > 0) {
-            "%d:%02d:%02d".format(hours, minutes, remainingSeconds)
+            "$hours:${minutes.twoDigits()}:${remainingSeconds.twoDigits()}"
         } else {
-            "%02d:%02d".format(minutes, remainingSeconds)
+            "${minutes.twoDigits()}:${remainingSeconds.twoDigits()}"
         }
     }
+
+    private fun oneDecimal(value: Double): String {
+        val tenths = (value * 10).roundToLong()
+        val whole = tenths / 10
+        val fraction = tenths % 10
+        return if (fraction == 0L) whole.toString() else "$whole.$fraction"
+    }
+
+    private fun Int.twoDigits(): String = toString().padStart(2, '0')
 
     private fun mediaScoreText(item: JsonObject): String {
         val rawScore = cleanText(
@@ -406,68 +396,4 @@ class SearchResultService(
         else -> fallback
     }
 
-    // WBI Mixin Key Cache
-
-    private inner class WBIKeyCache {
-        private var cachedKey: String? = null
-        private var expiresAt: Long = 0
-
-        suspend fun mixinKey(cookies: List<org.bilibilifocus.core.cookie.Cookie>, userAgent: String): String {
-            val now = currentEpochSeconds() * 1000
-            if (cachedKey != null && now < expiresAt) {
-                return cachedKey!!
-            }
-
-            val headers = mutableMapOf(
-                "Referer" to "https://www.bilibili.com/",
-                "Accept" to "application/json, text/plain, */*",
-                "User-Agent" to userAgent,
-            )
-            val finalHeaders = cookieProvider.attachCookies(headers, cookies)
-            val response = httpClient.get("https://api.bilibili.com/x/web-interface/nav", finalHeaders)
-
-            if (response.statusCode !in 200..299) {
-                throw ServiceError.SigningUnavailable
-            }
-
-            val payload = json.parseToJsonElement(response.body) as? JsonObject
-                ?: throw ServiceError.SigningUnavailable
-
-            if (payload.intValueAt("code") != 0) throw ServiceError.SigningUnavailable
-
-            val imgURL = payload.stringValueAt("data", "wbi_img", "img_url")
-                ?: throw ServiceError.SigningUnavailable
-            val subURL = payload.stringValueAt("data", "wbi_img", "sub_url")
-                ?: throw ServiceError.SigningUnavailable
-
-            val imgKey = imgURL.substringAfterLast("/").substringBefore(".")
-            val subKey = subURL.substringAfterLast("/").substringBefore(".")
-
-            if (imgKey.isEmpty() || subKey.isEmpty()) {
-                throw ServiceError.SigningUnavailable
-            }
-
-            cachedKey = mixinKey(imgKey, subKey)
-            expiresAt = now + 30 * 60 * 1000
-            return cachedKey!!
-        }
-    }
-
-    companion object {
-        private val shuffleTable = intArrayOf(
-            46, 47, 18, 2, 53, 8, 23, 32,
-            15, 50, 10, 31, 58, 3, 45, 35,
-            27, 43, 5, 49, 33, 9, 42, 19,
-            29, 28, 14, 39, 12, 38, 41, 13,
-            37, 48, 7, 16, 24, 55, 40, 61,
-            26, 17, 0, 1, 60, 51, 30, 4,
-            22, 25, 54, 21, 56, 59, 6, 63,
-            57, 62, 11, 36, 20, 34, 44, 52,
-        )
-
-        fun mixinKey(imgKey: String, subKey: String): String {
-            val combined = imgKey + subKey
-            return shuffleTable.filter { it < combined.length }.map { combined[it] }.take(32).joinToString("")
-        }
-    }
 }

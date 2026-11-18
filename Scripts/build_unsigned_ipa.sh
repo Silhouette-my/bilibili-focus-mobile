@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 APP_NAME="BilibiliFocus"
-BUILD_DIR="$ROOT_DIR/Build"
+BUILD_DIR="$ROOT_DIR/build/dist"
 WORK_DIR="$(mktemp -d "$ROOT_DIR/.tmp-ipa-build-XXXXXX")"
 DERIVED_DATA_PATH="$WORK_DIR/DerivedData"
 PAYLOAD_DIR="$WORK_DIR/Payload"

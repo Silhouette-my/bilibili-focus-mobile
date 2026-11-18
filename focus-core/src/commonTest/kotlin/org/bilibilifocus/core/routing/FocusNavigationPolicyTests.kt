@@ -6,6 +6,17 @@ import kotlin.test.assertEquals
 class FocusNavigationPolicyTests {
 
     @Test
+    fun `download blocking respects domain boundaries`() {
+        val policy = FocusNavigationPolicy()
+        for (host in listOf("bilibili.com", "www.bilibili.com", "static.hdslb.com")) {
+            assertEquals(FocusNavigationPolicy.Decision.Cancel, policy.decision("https://$host/download"))
+        }
+        for (host in listOf("notbilibili.com", "bilibili.com.example.org", "nothdslb.com")) {
+            assertEquals(FocusNavigationPolicy.Decision.Allow, policy.decision("https://$host/download"))
+        }
+    }
+
+    @Test
     fun `canonicalize dynamic detail to desktop opus page`() {
         val url = "https://t.bilibili.com/123456789"
         val result = FocusNavigationPolicy.canonicalWebURL(url)

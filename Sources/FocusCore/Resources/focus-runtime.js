@@ -6,7 +6,7 @@
   const configKey = "__FOCUS_CONFIG__";
   const stylePrefix = "bili-focus-style-";
   const scriptStateKey = "__FOCUS_FEATURE_SCRIPT_STATE__";
-  const runtimeVersion = "2026-06-24-runtime-trace-d-app";
+  const runtimeVersion = "2026-06-24-runtime-trace-d-shared";
 
   function makeStyleId(ruleId, featureId) {
     return (stylePrefix + ruleId + "-" + featureId).replace(/[^a-zA-Z0-9_-]/g, "-");
@@ -17,6 +17,8 @@
       runtimeVersion,
       currentPhase: phase,
       observerInstalled: false,
+      observer: null,
+      documentActive: window.__FOCUS_DOCUMENT_ACTIVE__ !== false,
       historyInstalled: false,
       applyTimer: null,
       applyTimerToken: 0,
@@ -36,11 +38,11 @@
       }
 
       try {
-        if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.logDebug) {
-          window.webkit.messageHandlers.logDebug.postMessage({
+        const debugSink = window.__FOCUS_DEBUG_SINK__;
+        if (typeof debugSink === "function") {
+          debugSink({
             message,
-            extra: extra || null,
-            url: location.href
+            extra: extra || null
           });
         }
       } catch (_) {}
@@ -197,6 +199,7 @@
         executor(currentConfig(), {
           canonicalizeBilibiliURL,
           featureState: featureState(rule.id, feature.featureId),
+          isDocumentActive: () => state.documentActive,
           postDebug,
         });
       } catch (error) {
@@ -255,6 +258,7 @@
     }
 
     function applyPhase(requestedPhase) {
+      if (!state.documentActive) return;
       const applicableRules = (window.__FOCUS_RULES__ || []).filter((rule) => rule.runPhase === requestedPhase);
       applicableRules.forEach(applyRule);
       state.lastAppliedComparableURL = comparableFocusURL(location.href);
@@ -312,6 +316,7 @@
 
     function scheduleApply(reason) {
       clearPendingApplyTimer();
+      if (!state.documentActive) return;
       const now = Date.now();
       const stableState = stableFocusVideoState();
       const isVideoPage = stableState.isVideoPage;
@@ -415,7 +420,8 @@
       return !!element.closest([
         "#focus-native-video-augment",
         "#focus-native-video-loading-mask",
-        "#focus-native-opus-comments"
+        "#focus-native-opus-comments",
+        "[data-focus-search-filter-shell]"
       ].join(","));
     }
 
@@ -495,7 +501,11 @@
       const path = location.pathname || "/";
       const isVideoPage = path.indexOf("/video/") === 0 || path.indexOf("/bangumi/play/") === 0;
       if (!isVideoPage) {
-        return true;
+        return mutations.some((mutation) => {
+          if (isFocusManagedNode(mutation.target)) return false;
+          const changedNodes = [...mutation.addedNodes, ...mutation.removedNodes];
+          return changedNodes.length === 0 || changedNodes.some((node) => !isFocusManagedNode(node));
+        });
       }
 
       if (hasVisiblePrimaryVideo() && hasVisiblePlayerLoadingOverlay()) {
@@ -605,7 +615,7 @@
     }
 
     function installObserver() {
-      if (state.observerInstalled) {
+      if (!state.documentActive || state.observerInstalled) {
         postDebug("installObserver-skipped", runtimeLabel({ reason: "already-installed" }));
         return;
       }
@@ -617,10 +627,28 @@
           scheduleApply("mutation");
         }
       });
+      state.observer = observer;
       observer.observe(document.documentElement, {
         childList: true,
         subtree: true
       });
+    }
+
+    function setDocumentActive(active) {
+      active = !!active;
+      window.__FOCUS_DOCUMENT_ACTIVE__ = active;
+      if (state.documentActive === active) return;
+      state.documentActive = active;
+      clearPendingApplyTimer();
+      if (!active) {
+        state.observer?.disconnect();
+        state.observerInstalled = false;
+        Object.values(state.featureScriptState).forEach((feature) => feature.suspendDocumentWork?.());
+      } else {
+        Object.values(state.featureScriptState).forEach((feature) => feature.resumeDocumentWork?.());
+        applyAll();
+        installObserver();
+      }
     }
 
     return {
@@ -635,7 +663,8 @@
       applyAll,
       cancelPendingApply,
       installHistoryHooks,
-      installObserver
+      installObserver,
+      setDocumentActive
     };
   }
 

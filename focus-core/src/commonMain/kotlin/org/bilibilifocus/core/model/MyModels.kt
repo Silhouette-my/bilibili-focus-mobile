@@ -18,6 +18,9 @@ data class HistoryItem(
     val viewAt: Long,
     val progress: Long,
     val duration: Long,
+    val cid: Long = 0,
+    val page: Int = 0,
+    val historyKey: String = "",
 )
 
 /** 历史记录翻页游标。*/
@@ -44,4 +47,5 @@ data class FavResource(
     val upperName: String,
     val duration: String,
     val playCount: Long,
+    val aid: Long = 0,
 )

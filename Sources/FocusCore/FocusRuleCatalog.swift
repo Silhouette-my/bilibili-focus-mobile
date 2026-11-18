@@ -2559,25 +2559,34 @@ public enum FocusRuleCatalog {
                       state.searchFilterControlCache = {};
                     };
 
+                    const searchObserverOptions = {
+                      childList: true,
+                      subtree: true,
+                      attributes: true,
+                      attributeFilter: ['class', 'style', 'href', 'data-href', 'data-url']
+                    };
+                    const refreshSearchLayout = () => {
+                      if (!helpers.isDocumentActive()) return;
+                      // Our own styles and mirrored controls must not schedule
+                      // another repair. All work here is synchronous.
+                      state.searchObserver?.disconnect();
+                      try {
+                        rewriteAll();
+                        decorateSearchInput();
+                        applySearchVideoGrid();
+                        hidePromotedSearchBlocks();
+                        hideSearchTypeNav();
+                        mirrorSearchFilterBoard();
+                      } finally {
+                        state.searchObserver?.observe(document.body || document.documentElement, searchObserverOptions);
+                      }
+                    };
                     const scheduleSearchFilterRefresh = () => {
+                      if (!helpers.isDocumentActive()) return;
                       clearTimeout(state.searchFilterRefreshTimer);
-                      state.searchFilterRefreshTimer = setTimeout(() => {
-                        rewriteAll();
-                        decorateSearchInput();
-                        applySearchVideoGrid();
-                        hidePromotedSearchBlocks();
-                        hideSearchTypeNav();
-                        mirrorSearchFilterBoard();
-                      }, 18);
+                      state.searchFilterRefreshTimer = setTimeout(refreshSearchLayout, 18);
                       clearTimeout(state.searchFilterRefreshTimerLate);
-                      state.searchFilterRefreshTimerLate = setTimeout(() => {
-                        rewriteAll();
-                        decorateSearchInput();
-                        applySearchVideoGrid();
-                        hidePromotedSearchBlocks();
-                        hideSearchTypeNav();
-                        mirrorSearchFilterBoard();
-                      }, 96);
+                      state.searchFilterRefreshTimerLate = setTimeout(refreshSearchLayout, 96);
                     };
 
                     const triggerFilterSelection = (label) => {
@@ -2715,9 +2724,7 @@ public enum FocusRuleCatalog {
                         shell.appendChild(row);
                       });
 
-                      if (root.parentNode && shell.parentNode !== root.parentNode) {
-                        root.parentNode.insertBefore(shell, root);
-                      } else if (root.parentNode) {
+                      if (root.parentNode) {
                         root.parentNode.insertBefore(shell, root);
                       }
 
@@ -2725,12 +2732,7 @@ public enum FocusRuleCatalog {
                       setOriginalFilterBoardCollapsed(root, true);
                     };
 
-                    rewriteAll();
-                    decorateSearchInput();
-                    applySearchVideoGrid();
-                    hidePromotedSearchBlocks();
-                    hideSearchTypeNav();
-                    mirrorSearchFilterBoard();
+                    refreshSearchLayout();
 
                     if (!state.openWrapped) {
                       state.openWrapped = true;
@@ -2859,13 +2861,17 @@ public enum FocusRuleCatalog {
                         }
                       });
 
-                      observer.observe(document.body || document.documentElement, {
-                        childList: true,
-                        subtree: true,
-                        attributes: true,
-                        attributeFilter: ['class', 'style', 'href', 'data-href', 'data-url']
-                      });
+                      state.searchObserver = observer;
+                      observer.observe(document.body || document.documentElement, searchObserverOptions);
                     }
+                    state.suspendDocumentWork = () => {
+                      state.searchObserver?.disconnect();
+                      clearTimeout(state.searchFilterRefreshTimer);
+                      clearTimeout(state.searchFilterRefreshTimerLate);
+                    };
+                    state.resumeDocumentWork = () => {
+                      state.searchObserver?.observe(document.body || document.documentElement, searchObserverOptions);
+                    };
                     """,
                     settingKey: .searchMaskEnabled
                 ),
@@ -3071,6 +3077,11 @@ public enum FocusRuleCatalog {
                       });
 
                       observer.observe(document.body || document.documentElement, {
+                        childList: true,
+                        subtree: true
+                      });
+                      state.suspendDocumentWork = () => observer.disconnect();
+                      state.resumeDocumentWork = () => observer.observe(document.body || document.documentElement, {
                         childList: true,
                         subtree: true
                       });
@@ -4683,28 +4694,37 @@ public enum FocusRuleCatalog {
                       state.playerHooksInstalled = true;
 
                       let snapshotTimer = null;
+                      let pendingMediaSnapshot = false;
                       let videoPodRefreshTimer = null;
                       let autoplayRefreshTimer = null;
                       let iosPlayerSizingTimer = null;
-                      const scheduleSnapshot = (delay = 80) => {
+                      const scheduleSnapshot = (delay = 80, isMediaEvent = false) => {
+                        // The iOS bridge owns these same media events. Keep one
+                        // scheduled snapshot instead of racing two emitters.
+                        if (isMediaEvent && window.__FOCUS_NATIVE_PLAYER_BRIDGE__?.handlesMediaEvents) return;
+                        pendingMediaSnapshot = pendingMediaSnapshot || isMediaEvent;
                         clearTimeout(snapshotTimer);
                         snapshotTimer = setTimeout(() => {
+                          pendingMediaSnapshot = false;
                           snapshotPlayerState();
                         }, delay);
                       };
                       const scheduleVideoPodRefresh = (delay = 90) => {
+                        if (!helpers.isDocumentActive()) return;
                         clearTimeout(videoPodRefreshTimer);
                         videoPodRefreshTimer = setTimeout(() => {
                           refreshVideoPods();
                         }, delay);
                       };
                       const scheduleAutoplayRefresh = (delay = 90) => {
+                        if (!helpers.isDocumentActive()) return;
                         clearTimeout(autoplayRefreshTimer);
                         autoplayRefreshTimer = setTimeout(() => {
                           disableAutoplayByDefault();
                         }, delay);
                       };
                       const scheduleIOSPlayerSizing = (delay = 90) => {
+                        if (!helpers.isDocumentActive()) return;
                         clearTimeout(iosPlayerSizingTimer);
                         iosPlayerSizingTimer = setTimeout(() => {
                           applyIOSPlayerSizing();
@@ -4757,22 +4777,25 @@ public enum FocusRuleCatalog {
                             }
                           }
                           scheduleIOSPlayerSizing(eventName === 'loadedmetadata' || eventName === 'webkitendfullscreen' ? 30 : 80);
-                          scheduleSnapshot(eventName === 'ratechange' ? 20 : 80);
+                          scheduleSnapshot(eventName === 'ratechange' ? 20 : 80, true);
                         }, true);
                       });
 
                       window.addEventListener('resize', () => {
+                        if (!helpers.isDocumentActive()) return;
                         applyIOSPlayerSizing();
                         scheduleIOSPlayerSizing(30);
                         scheduleSnapshot(60);
                       }, { passive: true });
 
                       window.visualViewport?.addEventListener?.('resize', () => {
+                        if (!helpers.isDocumentActive()) return;
                         applyIOSPlayerSizing();
                         scheduleIOSPlayerSizing(20);
                       }, { passive: true });
 
                       document.addEventListener('click', (event) => {
+                        if (!helpers.isDocumentActive()) return;
                         const target = event.target;
                         if (!target || !target.closest) {
                           return;
@@ -4817,12 +4840,25 @@ public enum FocusRuleCatalog {
                         scheduleSnapshot(120);
                         scheduleVideoPodRefresh(120);
                       });
-                      observer.observe(document.documentElement, {
+                      const observerOptions = {
                         childList: true,
                         subtree: true,
                         attributes: true,
                         attributeFilter: ['class', 'aria-selected', 'aria-checked', 'aria-pressed', 'style']
-                      });
+                      };
+                      observer.observe(document.documentElement, observerOptions);
+                      state.suspendDocumentWork = () => {
+                        observer.disconnect();
+                        if (!pendingMediaSnapshot) clearTimeout(snapshotTimer);
+                        clearTimeout(videoPodRefreshTimer);
+                        clearTimeout(autoplayRefreshTimer);
+                        clearTimeout(iosPlayerSizingTimer);
+                      };
+                      state.resumeDocumentWork = () => {
+                        clearTimeout(snapshotTimer);
+                        pendingMediaSnapshot = false;
+                        observer.observe(document.documentElement, observerOptions);
+                      };
                     }
 
                     disableAutoplayByDefault();

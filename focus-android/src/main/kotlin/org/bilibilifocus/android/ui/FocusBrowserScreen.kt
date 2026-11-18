@@ -16,6 +16,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.unit.dp
 
 @Composable
@@ -23,6 +24,7 @@ fun FocusBrowserScreen(
     initialUrl: String,
     userScript: String? = null,
 ) {
+    val uriHandler = LocalUriHandler.current
     var isLoading by remember { mutableStateOf(true) }
     var currentUrl by remember { mutableStateOf(initialUrl) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
@@ -62,6 +64,9 @@ fun FocusBrowserScreen(
                 onPageStarted = { isLoading = true },
                 onPageFinished = { isLoading = false },
                 onError = { errorMessage = it },
+                onOpenExternal = { externalURL ->
+                    runCatching { uriHandler.openUri(externalURL) }
+                },
             )
 
             if (isLoading) {

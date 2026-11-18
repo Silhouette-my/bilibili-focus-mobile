@@ -1,5 +1,6 @@
 package org.bilibilifocus.core.service
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import org.bilibilifocus.core.cookie.CookieProvider
@@ -22,7 +23,7 @@ class FollowingAuthorsService(
 
     suspend fun fetchFollowingAuthors(): List<DynamicCard.Author> {
         val nav = requestObject(
-            url = "https://api.bilibili.com/x/web-interface/nav",
+            url = BiliApiContractCatalog.require("credential.info.valid").url,
             referer = "https://www.bilibili.com/",
         )
         val navCode = nav.intValueAt("code") ?: -1
@@ -36,9 +37,14 @@ class FollowingAuthorsService(
         }
 
         val authors = linkedMapOf<String, DynamicCard.Author>()
-        runCatching { fetchAttentionAuthors(currentMid) }
-            .getOrDefault(emptyList())
-            .forEach { authors.putIfAbsent(authorKey(it), it) }
+        val attentionAuthors = try {
+            fetchAttentionAuthors(currentMid)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            emptyList()
+        }
+        attentionAuthors.forEach { author -> authors.getOrPut(authorKey(author)) { author } }
 
         val safePageSize = pageSize.coerceIn(1, 100)
         val safeMaxPages = maxPages.coerceAtLeast(1)
@@ -47,7 +53,7 @@ class FollowingAuthorsService(
 
         while (page <= safeMaxPages) {
             val root = requestObject(
-                url = "https://api.bilibili.com/x/relation/followings" +
+                url = BiliApiContractCatalog.require("user.info.followings").url +
                     "?vmid=$currentMid&pn=$page&ps=$safePageSize&order=desc&order_type=attention",
                 referer = "https://space.bilibili.com/$currentMid/fans/follow",
             )
@@ -64,7 +70,7 @@ class FollowingAuthorsService(
             val pageAuthors = root.arrayValueAt("data", "list")
                 .orEmpty()
                 .mapNotNull { (it as? JsonObject)?.let(::makeAuthor) }
-            pageAuthors.forEach { authors.putIfAbsent(authorKey(it), it) }
+            pageAuthors.forEach { author -> authors.getOrPut(authorKey(author)) { author } }
 
             val reachedTotal = expectedTotal?.let { page * safePageSize >= it } ?: false
             if (pageAuthors.isEmpty() || pageAuthors.size < safePageSize || reachedTotal) break
@@ -76,7 +82,7 @@ class FollowingAuthorsService(
 
     private suspend fun fetchAttentionAuthors(mid: Long): List<DynamicCard.Author> {
         val root = requestObject(
-            url = "https://api.bilibili.com/x/web-interface/attentions?mid=$mid",
+            url = BiliApiContractCatalog.require("user.info.all_followings").url + "?mid=$mid",
             referer = "https://space.bilibili.com/$mid/fans/follow",
         )
         val code = root.intValueAt("code") ?: -1
@@ -103,14 +109,13 @@ class FollowingAuthorsService(
     }
 
     private suspend fun requestObject(url: String, referer: String): JsonObject {
-        val cookies = cookieProvider.loadCookies()
         val headers = cookieProvider.attachCookies(
             mapOf(
                 "User-Agent" to userAgent,
                 "Accept" to "application/json, text/plain, */*",
                 "Referer" to referer,
             ),
-            cookies,
+            url,
         )
         val response = httpClient.get(url, headers)
         if (response.statusCode !in 200..299) throw ServiceError.InvalidResponse
@@ -120,9 +125,6 @@ class FollowingAuthorsService(
             null
         } ?: throw ServiceError.InvalidResponse
     }
-
-    private fun JsonObject.longValueAt(vararg path: String): Long? =
-        stringValueAt(*path)?.toLongOrNull()
 
     private fun normalizedURL(raw: String?): String? {
         val value = raw?.trim().orEmpty()

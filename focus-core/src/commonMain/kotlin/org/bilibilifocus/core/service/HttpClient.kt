@@ -22,4 +22,5 @@ interface HttpClient {
         return BinaryHttpResponse(response.statusCode, response.body.encodeToByteArray())
     }
     suspend fun post(url: String, body: String = "", headers: Map<String, String> = emptyMap()): HttpResponse
+    fun close() = Unit
 }

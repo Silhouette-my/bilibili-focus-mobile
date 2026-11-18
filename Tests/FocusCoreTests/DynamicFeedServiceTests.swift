@@ -3,6 +3,81 @@ import Foundation
 import Testing
 
 struct DynamicFeedServiceTests {
+    @Test func cancelledSnapshotWriterCannotOverwriteTheAcceptedFeed() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = DynamicFeedSnapshotStore(fileURL: directory.appendingPathComponent("feed.json"))
+        let cookies = DynamicSnapshotSaveCookies()
+        let service = DynamicFeedService(cookieProvider: cookies, snapshotStore: store)
+        let cards = try DynamicFeedService.decodeCards(from: Data(samplePayload.utf8))
+        let oldSave = Task { try await service.saveSnapshot(cards: [cards[0]], nextOffset: "old", version: 0, revision: 0) }
+        await cookies.waitUntilReading()
+        oldSave.cancel()
+        try await store.save(cards: [cards[1]], nextOffset: "accepted", scope: .accountID(42), revision: 0)
+        await cookies.release()
+        await #expect(throws: CancellationError.self) { try await oldSave.value }
+        #expect(await store.load(scope: .accountID(42))?.nextOffset == "accepted")
+
+        // Also exercise cancellation at the actor boundary, independently of
+        // the service's post-cookie suspension check.
+        let queuedSave = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            try await store.save(cards: [cards[0]], nextOffset: "queued-old", scope: .accountID(42), revision: 0)
+        }
+        await #expect(throws: CancellationError.self) { try await queuedSave.value }
+        #expect(await store.load(scope: .accountID(42))?.nextOffset == "accepted")
+    }
+
+    @Test func persistentSnapshotSurvivesReopenAndExpiresWithoutCrossingAccounts() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("feed.json")
+        let store = DynamicFeedSnapshotStore(fileURL: file)
+        let cards = try DynamicFeedService.decodeCards(from: Data(samplePayload.utf8))
+        let account = FocusPlaybackAccountScope.accountID(42)
+        let now = Date(timeIntervalSince1970: 1_000_000)
+        try await store.save(cards: cards, nextOffset: "next", scope: account, revision: 0, now: now)
+        let reopened = DynamicFeedSnapshotStore(fileURL: file)
+        #expect(await reopened.load(scope: account, now: now)?.cards == cards)
+        #expect(await reopened.load(scope: .accountID(43), now: now) == nil)
+        #expect(await reopened.load(scope: account, now: now.addingTimeInterval(8 * 24 * 3600)) == nil)
+        let bytes = try String(contentsOf: file, encoding: .utf8)
+        #expect(!bytes.contains("SESSDATA"))
+        #expect(!bytes.contains("DedeUserID"))
+    }
+
+    @Test func clearingSnapshotsFencesLateWritesAndCapacityKeepsCompletePages() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("feed.json")
+        let store = DynamicFeedSnapshotStore(fileURL: file)
+        let cards = try DynamicFeedService.decodeCards(from: Data(samplePayload.utf8))
+        let account = FocusPlaybackAccountScope.accountID(42)
+        let oldRevision = await store.writeRevision()
+        try await store.save(cards: cards, nextOffset: "valid", scope: account, revision: oldRevision)
+        try await store.save(cards: Array(repeating: cards[0], count: 301), nextOffset: "gap", scope: account, revision: oldRevision)
+        #expect(await store.load(scope: account)?.nextOffset == "valid")
+        try await store.clear()
+        try await store.save(cards: cards, nextOffset: "late", scope: account, revision: oldRevision)
+        #expect(await store.load(scope: account) == nil)
+        #expect(!FileManager.default.fileExists(atPath: file.path))
+        for id in 1...4 {
+            try await store.save(cards: cards, nextOffset: nil, scope: .accountID(Int64(id)), revision: await store.writeRevision(),
+                                 now: Date().addingTimeInterval(Double(id)))
+        }
+        #expect(await store.load(scope: .accountID(1)) == nil)
+        #expect(await store.load(scope: .accountID(4)) != nil)
+    }
+
+    @Test func terminalHasMoreWinsOverAnEchoedCursor() throws {
+        for flag in ["false", "0"] {
+            let data = Data("{\"code\":0,\"data\":{\"items\":[],\"offset\":\"last\",\"has_more\":\(flag)}}".utf8)
+            #expect(try DynamicFeedService.decodeFeedPage(from: data).nextOffset == nil)
+        }
+        let continuing = Data(#"{"code":0,"data":{"items":[],"offset":"next","has_more":true}}"#.utf8)
+        #expect(try DynamicFeedService.decodeFeedPage(from: continuing).nextOffset == "next")
+    }
+
     @Test
     func decodeCardsMapsVideoAndImageDynamics() throws {
         let data = Data(samplePayload.utf8)
@@ -93,6 +168,39 @@ struct DynamicFeedServiceTests {
         let components = try #require(URLComponents(url: requestedURL, resolvingAgainstBaseURL: false))
         let features = components.queryItems?.first(where: { $0.name == "features" })?.value
         #expect(features == "itemOpusStyle")
+    }
+
+    @Test
+    func feedChainCachesIdenticalPagesAndExplicitRefreshBypassesCache() async throws {
+        let recorder = DynamicFeedRequestRecorder()
+        let responseData = Data(
+            #"{"code":0,"data":{"items":[],"offset":"opaque-next"}}"#.utf8
+        )
+        let service = DynamicFeedService(
+            cookieProvider: LoggedInCookieProvider(),
+            requestLoader: { request in
+                await recorder.record(request.url)
+                let url = request.url ?? URL(string: "https://api.bilibili.com")!
+                return (
+                    responseData,
+                    HTTPURLResponse(
+                        url: url,
+                        statusCode: 200,
+                        httpVersion: nil,
+                        headerFields: nil
+                    )!
+                )
+            }
+        )
+
+        let first = try await service.fetchFollowingFeedPage()
+        let cached = try await service.fetchFollowingFeedPage()
+        #expect(first == cached)
+        #expect(await recorder.requestCount() == 1)
+
+        let refreshed = try await service.refreshFollowingFeedPage()
+        #expect(refreshed == first)
+        #expect(await recorder.requestCount() == 2)
     }
 
     @Test
@@ -190,9 +298,170 @@ struct DynamicFeedServiceTests {
         #expect(card.text == "第一段[doge]\n第二段完整文本")
         #expect(card.coverURLs.count == 1)
     }
+
+    @Test
+    func decodesForwardedVideoAndOpusAndDeletedOrigAndAdditionalUGC() throws {
+        let payload = """
+        {
+          "code": 0,
+          "data": {
+            "has_more": false,
+            "offset": "",
+            "items": [
+              {
+                "id_str": "9001",
+                "type": "DYNAMIC_TYPE_FORWARD",
+                "visible": true,
+                "modules": {
+                  "module_author": { "name": "转发作者", "pub_time": "1小时前" },
+                  "module_dynamic": { "desc": { "text": "转发推荐" } }
+                },
+                "orig": {
+                  "id_str": "8001",
+                  "type": "DYNAMIC_TYPE_AV",
+                  "modules": {
+                    "module_author": { "name": "原视频作者", "pub_time": "2小时前" },
+                    "module_dynamic": {
+                      "major": {
+                        "type": "MAJOR_TYPE_ARCHIVE",
+                        "archive": {
+                          "bvid": "BV1xx411c7mD",
+                          "title": "原视频标题",
+                          "desc": "原视频简介",
+                          "cover": "https://i0.hdslb.com/bfs/archive/orig.jpg",
+                          "jump_url": "//www.bilibili.com/video/BV1xx411c7mD"
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "id_str": "9002",
+                "type": "DYNAMIC_TYPE_FORWARD",
+                "visible": true,
+                "modules": {
+                  "module_author": { "name": "转发甲", "pub_time": "刚刚" },
+                  "module_dynamic": { "desc": { "text": "看看原图文" } }
+                },
+                "orig": {
+                  "id_str": "8002",
+                  "type": "DYNAMIC_TYPE_DRAW",
+                  "modules": {
+                    "module_author": { "name": "原画师", "pub_time": "昨天" },
+                    "module_dynamic": {
+                      "major": {
+                        "type": "MAJOR_TYPE_OPUS",
+                        "opus": {
+                          "title": "原图文标题",
+                          "jump_url": "//www.bilibili.com/opus/8002",
+                          "summary": { "text": "原图文正文" },
+                          "pics": [{ "url": "https://i0.hdslb.com/bfs/new_dyn/pic1.jpg" }]
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "id_str": "9003",
+                "type": "DYNAMIC_TYPE_FORWARD",
+                "visible": true,
+                "modules": {
+                  "module_author": { "name": "转发乙", "pub_time": "刚刚" },
+                  "module_dynamic": { "desc": { "text": "已失效原动态" } }
+                },
+                "orig": {
+                  "id_str": "8003",
+                  "type": "DYNAMIC_TYPE_NONE",
+                  "modules": {
+                    "module_dynamic": {
+                      "major": {
+                        "type": "MAJOR_TYPE_NONE",
+                        "none": { "tips": "源动态已被作者删除" }
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "id_str": "9004",
+                "type": "DYNAMIC_TYPE_WORD",
+                "visible": true,
+                "modules": {
+                  "module_author": { "name": "附加作者", "pub_time": "刚刚" },
+                  "module_dynamic": {
+                    "desc": { "text": "附上相关视频" },
+                    "additional": {
+                      "type": "ADDITIONAL_TYPE_UGC",
+                      "ugc": {
+                        "head_text": "相关视频",
+                        "title": "附加视频标题",
+                        "desc_second": "10万播放",
+                        "cover": "https://i0.hdslb.com/bfs/archive/ugc.jpg",
+                        "jump_url": "//www.bilibili.com/video/BV1yy411c7ab"
+                      }
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+        """
+
+        let cards = try DynamicFeedService.decodeCards(from: Data(payload.utf8))
+        #expect(cards.count == 4)
+
+        #expect(cards[0].targetURL.absoluteString == "https://www.bilibili.com/opus/9001")
+        #expect(cards[0].videoURL == nil)
+        let videoQuoted = try #require(cards[0].quotedCard)
+        #expect(videoQuoted.id == "8001")
+        #expect(videoQuoted.author.name == "原视频作者")
+        #expect(videoQuoted.title == "原视频标题")
+        #expect(videoQuoted.videoURL?.absoluteString == "https://www.bilibili.com/video/BV1xx411c7mD/")
+        #expect(videoQuoted.coverURLs.map(\.absoluteString) == ["https://i0.hdslb.com/bfs/archive/orig.jpg"])
+
+        let opusQuoted = try #require(cards[1].quotedCard)
+        #expect(opusQuoted.author.name == "原画师")
+        #expect(opusQuoted.title == "原图文标题")
+        #expect(opusQuoted.text == "原图文正文")
+        #expect(opusQuoted.targetURL?.absoluteString == "https://www.bilibili.com/opus/8002")
+
+        let deletedQuoted = try #require(cards[2].quotedCard)
+        #expect(deletedQuoted.unavailableTip == "源动态已被作者删除")
+
+        let ugcQuoted = try #require(cards[3].quotedCard)
+        #expect(ugcQuoted.title == "附加视频标题")
+        #expect(ugcQuoted.targetURL?.absoluteString == "https://www.bilibili.com/video/BV1yy411c7ab/")
+        #expect(ugcQuoted.videoURL?.absoluteString == "https://www.bilibili.com/video/BV1yy411c7ab/")
+    }
+
+    @Test
+    func decodesLegacyDynamicCardSnapshotWithoutQuotedCardField() throws {
+        let legacyJSON = """
+        {
+          "id": "5001",
+          "kind": "text",
+          "author": { "mid": 77, "name": "旧快照作者", "avatarURL": null },
+          "publishTime": "昨天",
+          "text": "旧版本缓存动态",
+          "coverURLs": [],
+          "targetURL": "https://www.bilibili.com/opus/5001",
+          "videoURL": null
+        }
+        """
+
+        let decoded = try JSONDecoder().decode(DynamicCard.self, from: Data(legacyJSON.utf8))
+        #expect(decoded.id == "5001")
+        #expect(decoded.text == "旧版本缓存动态")
+        #expect(decoded.quotedCard == nil)
+    }
 }
 
 private struct EmptyCookieProvider: CookieSnapshotProvider {
+    // A completed authoritative empty read, not an uncertain initialization.
+    var sessionReadiness: CookieSessionReadiness { .anonymous }
     func loadCookies() async -> [HTTPCookie] {
         []
     }
@@ -218,13 +487,19 @@ private struct LoggedInCookieProvider: CookieSnapshotProvider {
 
 private actor DynamicFeedRequestRecorder {
     private var url: URL?
+    private var count = 0
 
     func record(_ url: URL?) {
         self.url = url
+        count += 1
     }
 
     func requestedURL() -> URL? {
         url
+    }
+
+    func requestCount() -> Int {
+        count
     }
 }
 
@@ -301,6 +576,27 @@ private let samplePayload = """
   }
 }
 """
+
+private actor DynamicSnapshotSaveCookies: CookieSnapshotProvider {
+    nonisolated var sessionReadiness: CookieSessionReadiness { .authenticated }
+    private var continuation: CheckedContinuation<[HTTPCookie], Never>?
+    private var readerWaiters: [CheckedContinuation<Void, Never>] = []
+    func loadCookies() async -> [HTTPCookie] {
+        await withCheckedContinuation { continuation in
+            self.continuation = continuation
+            readerWaiters.forEach { $0.resume() }
+            readerWaiters.removeAll()
+        }
+    }
+    func waitUntilReading() async {
+        if continuation != nil { return }
+        await withCheckedContinuation { readerWaiters.append($0) }
+    }
+    func release() {
+        continuation?.resume(returning: [HTTPCookie(properties: [.domain: ".bilibili.com", .path: "/", .name: "DedeUserID", .value: "42"])!])
+        continuation = nil
+    }
+}
 
 private let genericMajorPayload = """
 {

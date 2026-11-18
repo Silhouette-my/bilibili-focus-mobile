@@ -117,6 +117,101 @@ struct FocusDOMIntegrationTests {
     }
 
     @Test
+    func searchRepairSettlesAfterOwnMutationsAndStillDecoratesNewResults() async throws {
+        let webView = try await loadFixture(
+            named: "search-rich", url: URL(string: "https://search.bilibili.com/all")!,
+            frame: CGRect(x: 0, y: 0, width: 390, height: 844)
+        )
+        try await Task.sleep(for: .milliseconds(1_200))
+        let saved = try await evaluate("window.__auditFilterChip = document.querySelector('[data-focus-search-filter-chip]'); window.__auditFilterChip ? 'saved' : 'missing';", in: webView)
+        try #require(saved == "saved")
+        let observing = try await evaluate("String(window.__FOCUS_FEATURE_SCRIPT_STATE__['search-repair::search-video-link-rewrite'].searchObserverInstalled)", in: webView)
+        try #require(observing == "true")
+        try await Task.sleep(for: .milliseconds(1_200))
+        let settled = try await evaluate("window.__auditFilterChip === document.querySelector('[data-focus-search-filter-chip]') ? 'true' : 'false'", in: webView)
+        #expect(settled == "true", "Unchanged search results must not continuously rebuild the filter controls")
+
+        _ = try await evaluate("""
+            const list = document.querySelector('.video-list');
+            const added = list.firstElementChild.cloneNode(true);
+            added.id = 'audit-added-result';
+            added.querySelector('a').href = 'https://m.bilibili.com/video/BV5xx411c7mH';
+            list.appendChild(added);
+            'added';
+            """, in: webView)
+        try await Task.sleep(for: .milliseconds(1_200))
+        let decorated = try await evaluate("document.getElementById('audit-added-result').getAttribute('data-focus-search-video-target') || ''", in: webView)
+        #expect(decorated == "https://www.bilibili.com/video/BV5xx411c7mH/")
+    }
+
+    @Test
+    func retainedSearchSuspendsRepairsAndResynchronizesOnResume() async throws {
+        let webView = try await loadFixture(named: "search-rich", url: URL(string: "https://search.bilibili.com/all")!)
+        try await Task.sleep(for: .milliseconds(250))
+        _ = try await evaluate("""
+            window.__lifecyclePasses = 0;
+            window.__FOCUS_RULES__.push({ id: 'lifecycle-audit', runPhase: 'documentEnd', features: [
+              { featureId: 'count', script: 'window.__lifecyclePasses += 1;' }
+            ] });
+            history.replaceState({}, '', '?keyword=queued-before-hide');
+            window.__FOCUS_RUNTIME__.setDocumentActive(false);
+            window.__FOCUS_RUNTIME__.setDocumentActive(false);
+            const list = document.querySelector('.video-list');
+            const added = list.firstElementChild.cloneNode(true);
+            added.id = 'lifecycle-added-result';
+            added.querySelector('a').href = 'https://m.bilibili.com/video/BV5xx411c7mH';
+            list.appendChild(added);
+            history.replaceState({}, '', '?keyword=hidden-change');
+            'hidden';
+            """, in: webView)
+        try await Task.sleep(for: .milliseconds(250))
+        #expect(try await evaluate("String(window.__lifecyclePasses)", in: webView) == "0")
+        #expect(try await evaluate("document.getElementById('lifecycle-added-result').getAttribute('data-focus-search-video-target')", in: webView) != "https://www.bilibili.com/video/BV5xx411c7mH/")
+        _ = try await evaluate("window.__FOCUS_RUNTIME__.setDocumentActive(true); window.__FOCUS_RUNTIME__.setDocumentActive(true); 'visible';", in: webView)
+        try await Task.sleep(for: .milliseconds(250))
+        #expect(try await evaluate("String(window.__lifecyclePasses)", in: webView) == "1")
+        #expect(try await evaluate("document.getElementById('lifecycle-added-result').getAttribute('data-focus-search-video-target')", in: webView) == "https://www.bilibili.com/video/BV5xx411c7mH/")
+        // A second hide/show reconnects the same document, without losing its history.
+        _ = try await evaluate("window.__FOCUS_RUNTIME__.setDocumentActive(false); window.__FOCUS_RUNTIME__.setDocumentActive(true); 'visible';", in: webView)
+        #expect(try await evaluate("String(window.__lifecyclePasses)", in: webView) == "2")
+        #expect(try await evaluate("location.search", in: webView) == "?keyword=hidden-change")
+    }
+
+    @Test
+    func queuedMediaSnapshotSurvivesSuspensionWithoutNativeBridge() async throws {
+        let webView = try await loadFixture(named: "video", url: URL(string: "https://www.bilibili.com/video/BV1xx411c7mD/")!)
+        _ = try await evaluate("""
+            window.__queuedMediaSnapshots = [];
+            window.__FOCUS_PLAYER_STATE_LISTENER__ = (payload) => window.__queuedMediaSnapshots.push(payload);
+            document.querySelector('video').dispatchEvent(new Event('pause'));
+            document.title = 'latest paused state';
+            window.__FOCUS_RUNTIME__.setDocumentActive(false);
+            for (let i = 0; i < 100; i++) document.body.appendChild(document.createElement('div'));
+            true;
+            """, in: webView)
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(try await evaluate("String(window.__queuedMediaSnapshots.length)", in: webView) == "1")
+        #expect(try await evaluate("window.__queuedMediaSnapshots[0].pageTitle", in: webView) == "latest paused state")
+    }
+
+    @Test
+    func suspendedVideoKeepsMediaStateEventsWithoutMutationWork() async throws {
+        let webView = try await loadFixture(named: "video", url: URL(string: "https://www.bilibili.com/video/BV1xx411c7mD/")!)
+        _ = try await evaluate("""
+            window.__FOCUS_RUNTIME__.setDocumentActive(false);
+            window.__focusPlayerMessages = [];
+            window.__FOCUS_PLAYER_STATE_LISTENER__ = (payload) => window.__focusPlayerMessages.push(payload);
+            for (let i = 0; i < 100; i++) document.body.appendChild(document.createElement('div'));
+            'hidden';
+            """, in: webView)
+        try await Task.sleep(for: .milliseconds(250))
+        #expect(try await evaluate("String(window.__focusPlayerMessages.length)", in: webView) == "0")
+        _ = try await evaluate("const video = document.querySelector('video'); video.playbackRate = 2; video.dispatchEvent(new Event('ratechange')); 'media';", in: webView)
+        try await Task.sleep(for: .milliseconds(150))
+        #expect(try await evaluate("String(window.__focusPlayerMessages.at(-1)?.playbackRate)", in: webView) == "2")
+    }
+
+    @Test
     func videoFixtureReflowsDesktopPlaybackPage() async throws {
         let webView = try await loadFixture(named: "video", url: URL(string: "https://www.bilibili.com/video/BV1xx411c7mD/")!)
 
@@ -364,6 +459,9 @@ struct FocusDOMIntegrationTests {
     ) async throws -> WKWebView {
         let htmlURL = try #require(Bundle.module.url(forResource: name, withExtension: "html"))
         let html = try String(contentsOf: htmlURL, encoding: .utf8)
+            .replacingOccurrences(of: "<head>", with: """
+                <head><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline' 'unsafe-eval'; img-src data:">
+                """)
 
         let controller = WKUserContentController()
         if simulatesIOS {

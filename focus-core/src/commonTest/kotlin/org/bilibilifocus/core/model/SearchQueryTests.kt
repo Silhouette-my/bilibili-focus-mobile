@@ -25,4 +25,9 @@ class SearchQueryTests {
         val encoded = urlEncode("测试")
         assertTrue(encoded.all { it == '%' || it in '0'..'9' || it in 'A'..'F' })
     }
+
+    @Test
+    fun `urlEncode preserves supplementary Unicode and escapes query delimiters`() {
+        assertEquals("A%20%F0%9F%98%80%E6%B5%8B%E8%AF%95%26%3D%2B~", urlEncode("A 😀测试&=+~"))
+    }
 }

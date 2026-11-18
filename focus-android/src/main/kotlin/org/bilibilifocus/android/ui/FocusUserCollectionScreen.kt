@@ -35,7 +35,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -47,13 +46,10 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
-import org.bilibilifocus.android.AndroidCookieProvider
 import org.bilibilifocus.android.FocusUserCollectionViewModel
 import org.bilibilifocus.android.UserCollectionUiState
 import org.bilibilifocus.core.model.UserContentCollection
 import org.bilibilifocus.core.model.UserVideo
-import org.bilibilifocus.core.service.KtorHttpClient
-import org.bilibilifocus.core.service.UserService
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -61,18 +57,13 @@ fun FocusUserCollectionScreen(
     collection: UserContentCollection,
     onBack: () -> Unit,
     onOpenVideo: (String) -> Unit,
-    viewModel: FocusUserCollectionViewModel? = null,
+    viewModel: FocusUserCollectionViewModel,
     gridState: LazyGridState = rememberLazyGridState(),
 ) {
-    val resolvedViewModel = viewModel ?: remember(collection.id) {
-        FocusUserCollectionViewModel(
-            UserService(AndroidCookieProvider(), KtorHttpClient()),
-        )
-    }
-    LaunchedEffect(collection.id) { resolvedViewModel.loadIfNeeded(collection) }
+    LaunchedEffect(viewModel, collection.id) { viewModel.loadIfNeeded(collection) }
 
-    val state by resolvedViewModel.state.collectAsState()
-    val isLoadingMore by resolvedViewModel.isLoadingMore.collectAsState()
+    val state by viewModel.state.collectAsState()
+    val isLoadingMore by viewModel.isLoadingMore.collectAsState()
 
     Scaffold(
         topBar = {
@@ -116,7 +107,7 @@ fun FocusUserCollectionScreen(
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             textAlign = TextAlign.Center,
                         )
-                        Button(onClick = { resolvedViewModel.load(collection) }) { Text("重试") }
+                        Button(onClick = { viewModel.load(collection) }) { Text("重试") }
                     }
                 }
             }
@@ -136,7 +127,7 @@ fun FocusUserCollectionScreen(
 
                     items(current.page.videos, key = { it.bvid }) { video ->
                         LaunchedEffect(video.bvid) {
-                            resolvedViewModel.loadMoreIfNeeded(video.bvid)
+                            viewModel.loadMoreIfNeeded(video.bvid)
                         }
                         ElevatedCard(
                             onClick = { onOpenVideo("https://www.bilibili.com/video/${video.bvid}") },

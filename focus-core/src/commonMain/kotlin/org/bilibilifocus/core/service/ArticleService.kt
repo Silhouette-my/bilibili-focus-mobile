@@ -30,9 +30,11 @@ class ArticleService(
 
     suspend fun fetchArticle(cvid: Long): ArticleDetail {
         val originalURL = "https://www.bilibili.com/read/cv$cvid"
+        val endpoint = BiliApiContractCatalog.require("article.info.detail").url +
+            "?id=$cvid&mobi_app=pc&from=web"
         val response = httpClient.get(
-            "https://api.bilibili.com/x/article/view?id=$cvid&mobi_app=pc&from=web",
-            buildHeaders(originalURL),
+            endpoint,
+            buildHeaders(endpoint, originalURL),
         )
         if (response.statusCode !in 200..299) throw ServiceError.InvalidResponse
         val root = runCatching { json.parseToJsonElement(response.body) as? JsonObject }.getOrNull()
@@ -84,15 +86,14 @@ class ArticleService(
         )
     }
 
-    private suspend fun buildHeaders(referer: String): Map<String, String> {
-        val cookies = cookieProvider.loadCookies()
+    private suspend fun buildHeaders(targetUrl: String, referer: String): Map<String, String> {
         return cookieProvider.attachCookies(
             mapOf(
                 "User-Agent" to "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36",
                 "Referer" to referer,
                 "Accept" to "application/json, text/plain, */*",
             ),
-            cookies,
+            targetUrl,
         )
     }
 

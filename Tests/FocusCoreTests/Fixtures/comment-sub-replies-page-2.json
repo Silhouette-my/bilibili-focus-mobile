@@ -1,0 +1,28 @@
+{
+  "code": 0,
+  "message": "0",
+  "data": {
+    "page": {
+      "num": 2,
+      "size": 2,
+      "count": 3
+    },
+    "replies": [
+      {
+        "rpid": 90003,
+        "mid": 1003,
+        "like": 1,
+        "action": 0,
+        "rcount": 0,
+        "ctime": 1710000003,
+        "member": {
+          "uname": "第三位回复者",
+          "avatar": "//i0.hdslb.com/bfs/face/reply-3.jpg"
+        },
+        "content": {
+          "message": "最后一条楼中楼回复"
+        }
+      }
+    ]
+  }
+}

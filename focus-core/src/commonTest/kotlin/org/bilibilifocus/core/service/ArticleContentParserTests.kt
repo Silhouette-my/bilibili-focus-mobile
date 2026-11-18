@@ -12,6 +12,17 @@ import kotlin.test.assertTrue
 
 class ArticleContentParserTests {
     @Test
+    fun `encoded code and numeric entities preserve Chinese and supplementary Unicode`() {
+        val blocks = ArticleContentParser.parse("""
+            <pre codecontent="%E6%B5%8B%E8%AF%95%20%F0%9F%98%80%2B100%"></pre>
+            <p>&#128512; &#x1F600; &#xD800;</p>
+        """.trimIndent())
+        assertEquals("测试 😀+100%", assertIs<ArticleBlock.CodeBlock>(blocks[0]).code)
+        val text = assertIs<ArticleBlock.Paragraph>(blocks[1]).runs.joinToString("") { (it as RichTextRun.Text).text }
+        assertEquals("😀 😀 &#xD800;", text)
+    }
+
+    @Test
     fun `modern ops preserve blocks inline styles images and resources`() {
         val blocks = ArticleContentParser.parse(
             """

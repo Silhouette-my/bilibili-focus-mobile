@@ -14,6 +14,21 @@ import kotlin.test.assertTrue
 
 class VideoDanmakuServiceTests {
     @Test
+    fun `unknown length delimited fields skip to next tag and reject truncation`() {
+        val reader = ProtobufReader(ProtoBuilder()
+            .bytes(99, ByteArray(64 * 1024))
+            .varint(8, 42)
+            .build())
+        reader.skip(reader.readTag()!!)
+        assertEquals(ProtobufTag(8, 0), reader.readTag())
+        assertEquals(42L, reader.readVarint())
+        assertFalse(reader.hasRemaining)
+
+        val truncated = ProtobufReader(byteArrayOf(0x0a, 0x04, 0x01))
+        assertFailsWith<ProtobufDecodingException> { truncated.skip(truncated.readTag()!!) }
+    }
+
+    @Test
     fun `view and segment decoders handle supported modes and unknown fields`() {
         val view = VideoDanmakuDecoder.decodeView(viewFixture())
         val segment = VideoDanmakuDecoder.decodeSegment(segmentFixture())

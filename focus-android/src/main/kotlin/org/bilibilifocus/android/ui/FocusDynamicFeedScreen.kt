@@ -1,7 +1,7 @@
 package org.bilibilifocus.android.ui
 
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
@@ -11,6 +11,7 @@ import androidx.compose.animation.scaleOut
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -53,12 +54,14 @@ import androidx.compose.material3.pulltorefresh.PullToRefreshDefaults
 import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -66,22 +69,24 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.ContentScale.Companion.Crop
 import androidx.compose.ui.layout.ContentScale.Companion.Fit
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.geometry.Size
 import coil.compose.AsyncImage
-import coil.compose.AsyncImagePainter
-import coil.compose.rememberAsyncImagePainter
-import coil.request.ImageRequest
-import org.bilibilifocus.android.AndroidCookieProvider
+import coil.imageLoader
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import kotlinx.coroutines.flow.distinctUntilChanged
 import org.bilibilifocus.android.FocusFeedViewModel
 import org.bilibilifocus.android.FeedUiState
 import org.bilibilifocus.core.model.DynamicCard
 import org.bilibilifocus.core.model.FocusDynamicFilterKind
 import org.bilibilifocus.core.model.FocusSettings
-import org.bilibilifocus.core.service.DynamicFeedService
-import org.bilibilifocus.core.service.KtorHttpClient
+import org.bilibilifocus.android.images.FocusDynamicImageLayout
+import org.bilibilifocus.android.images.FocusDynamicImageRequest
+import org.bilibilifocus.android.images.FocusDynamicImagePrefetcher
 
 private val DynamicCoverCornerRadius = RoundedCornerShape(6.dp)
 
@@ -93,27 +98,63 @@ fun FocusDynamicFeedScreen(
     onOpenLogin: () -> Unit = {},
     onOpenCard: (DynamicCard) -> Unit = {},
     onOpenUser: (Long) -> Unit = {},
+    onOpenURL: (String) -> Unit = {},
     onOpenSearch: (String) -> Unit = {},
     onSelectedFilterChange: (FocusDynamicFilterKind) -> Unit = {},
     contentPadding: PaddingValues = PaddingValues(),
     settings: FocusSettings = FocusSettings.DEFAULTS,
+    isActive: Boolean = true,
 ) {
-    LaunchedEffect(Unit) {
+    LaunchedEffect(viewModel) {
         viewModel.loadIfNeeded()
     }
 
     val state by viewModel.state.collectAsState()
     val isLoadingMore by viewModel.isLoadingMore.collectAsState()
     val selectedFilter by viewModel.selectedFilter.collectAsState()
-    var isRefreshing by remember { mutableStateOf(false) }
+    var isRefreshing by remember(viewModel) { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     var searchQuery by remember { mutableStateOf("") }
-    var galleryRequest by remember { mutableStateOf<FocusImageGalleryRequest?>(null) }
+    var galleryRequest by remember(viewModel) { mutableStateOf<FocusImageGalleryRequest?>(null) }
     val showScrollTop by remember { derivedStateOf { listState.firstVisibleItemIndex > 3 } }
     val topContentPadding = contentPadding.calculateTopPadding()
     val pullToRefreshState = rememberPullToRefreshState()
+    val context = LocalContext.current
+    val imageLoader = context.imageLoader
+    val prefetcher = remember(imageLoader, context) {
+        FocusDynamicImagePrefetcher(scope) { imageLoader.execute(it.build(context)) }
+    }
+    DisposableEffect(prefetcher) { onDispose { prefetcher.close() } }
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    var isForeground by remember(lifecycle) { mutableStateOf(lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) }
+    DisposableEffect(lifecycle) {
+        val observer = LifecycleEventObserver { _, _ -> isForeground = lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED) }
+        lifecycle.addObserver(observer)
+        onDispose { lifecycle.removeObserver(observer) }
+    }
+    val cards = (state as? FeedUiState.Loaded)?.cards.orEmpty()
+    val filteredCards = remember(cards, selectedFilter, settings) { visibleCards(cards, selectedFilter, settings) }
 
-    Box(modifier = Modifier.fillMaxSize()) {
+    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+    val density = LocalDensity.current
+    val imageLayout = with(density) {
+        FocusDynamicImageLayout(
+            contentWidth = (maxWidth - 64.dp).roundToPx().coerceAtLeast(1),
+            avatarSize = 44.dp.roundToPx(), imageGap = 8.dp.roundToPx(),
+        )
+    }
+    LaunchedEffect(prefetcher, imageLayout, filteredCards, isActive, isForeground, galleryRequest != null) {
+        if (!isActive || !isForeground || galleryRequest != null || filteredCards.isEmpty()) {
+            prefetcher.clear()
+            return@LaunchedEffect
+        }
+        val cardIDs = filteredCards.mapTo(hashSetOf()) { it.id }
+        snapshotFlow {
+            listState.layoutInfo.visibleItemsInfo.firstOrNull { it.key in cardIDs }?.key as? String
+        }.distinctUntilChanged().collect { firstVisibleID ->
+            prefetcher.update(imageLayout.prefetchRequests(filteredCards, firstVisibleID))
+        }
+    }
     Column(modifier = Modifier.fillMaxSize()) {
         Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
             when (val s = state) {
@@ -212,12 +253,6 @@ fun FocusDynamicFeedScreen(
                 }
 
                 is FeedUiState.Loaded -> {
-                    val filteredCards = visibleCards(
-                        cards = s.cards,
-                        selectedFilter = selectedFilter,
-                        settings = settings,
-                    )
-
                     LaunchedEffect(s.cards.size, filteredCards.size, selectedFilter, settings) {
                         if (s.cards.isNotEmpty() && filteredCards.isEmpty()) {
                             viewModel.loadMoreIfNeeded(s.cards.last().id)
@@ -330,12 +365,23 @@ fun FocusDynamicFeedScreen(
                                 ) {
                                     FocusDynamicCard(
                                         card = card,
+                                        imageLayout = imageLayout,
                                         onOpenUser = onOpenUser,
                                         onOpenImage = { index ->
                                             galleryRequest = FocusImageGalleryRequest(
                                                 images = card.coverURLs,
                                                 initialIndex = index,
                                                 referer = card.targetURL,
+                                            )
+                                        },
+                                        onOpenQuotedCard = { quoted ->
+                                            (quoted.videoURL ?: quoted.targetURL)?.let(onOpenURL)
+                                        },
+                                        onOpenQuotedImage = { urls, index, referer ->
+                                            galleryRequest = FocusImageGalleryRequest(
+                                                images = urls,
+                                                initialIndex = index,
+                                                referer = referer,
                                             )
                                         },
                                     )
@@ -431,8 +477,11 @@ private fun DynamicFilterRow(
 @Composable
 private fun FocusDynamicCard(
     card: DynamicCard,
+    imageLayout: FocusDynamicImageLayout,
     onOpenUser: (Long) -> Unit,
     onOpenImage: (Int) -> Unit,
+    onOpenQuotedCard: (DynamicCard.QuotedCard) -> Unit = {},
+    onOpenQuotedImage: (List<String>, Int, String) -> Unit = { _, _, _ -> },
 ) {
     Column(
         modifier = Modifier.padding(16.dp),
@@ -440,7 +489,7 @@ private fun FocusDynamicCard(
     ) {
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             FocusAvatar(
-                avatarURL = card.author.avatarURL,
+                request = imageLayout.avatar(card.author.avatarURL),
                 modifier = Modifier
                     .size(44.dp)
                     .clickable(enabled = card.author.mid > 0) {
@@ -476,7 +525,181 @@ private fun FocusDynamicCard(
         }
 
         if (card.coverURLs.isNotEmpty()) {
-            FocusDynamicCardCovers(card = card, onOpenImage = onOpenImage)
+            FocusDynamicCardCovers(card = card, imageLayout = imageLayout, onOpenImage = onOpenImage)
+        }
+
+        card.quotedCard?.let { quoted ->
+            FocusQuotedDynamicCard(
+                quoted = quoted,
+                imageLayout = imageLayout,
+                onOpenUser = onOpenUser,
+                onOpenQuoted = { onOpenQuotedCard(quoted) },
+                onOpenImage = { index ->
+                    onOpenQuotedImage(quoted.coverURLs, index, quoted.targetURL ?: card.targetURL)
+                },
+            )
+        }
+    }
+}
+
+@Composable
+private fun FocusQuotedDynamicCard(
+    quoted: DynamicCard.QuotedCard,
+    imageLayout: FocusDynamicImageLayout,
+    onOpenUser: (Long) -> Unit,
+    onOpenQuoted: () -> Unit,
+    onOpenImage: (Int) -> Unit,
+) {
+    val quotedShape = RoundedCornerShape(12.dp)
+    val canOpen = quoted.unavailableTip == null && (quoted.videoURL ?: quoted.targetURL) != null
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(quotedShape)
+            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f))
+            .border(
+                width = 0.5.dp,
+                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f),
+                shape = quotedShape,
+            )
+            .then(if (canOpen) Modifier.clickable(onClick = onOpenQuoted) else Modifier)
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        val unavailableTip = quoted.unavailableTip
+        if (!unavailableTip.isNullOrBlank()) {
+            Text(
+                text = unavailableTip,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            return
+        }
+
+        if (quoted.author.name.isNotBlank() || quoted.publishTime.isNotBlank()) {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                if (quoted.author.name.isNotBlank()) {
+                    Text(
+                        text = "@${quoted.author.name}",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.primary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier
+                            .weight(1f, fill = false)
+                            .then(
+                                if (quoted.author.mid > 0) {
+                                    Modifier.clickable { onOpenUser(quoted.author.mid) }
+                                } else {
+                                    Modifier
+                                },
+                            ),
+                    )
+                }
+                if (quoted.publishTime.isNotBlank()) {
+                    Text(
+                        text = quoted.publishTime,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                FocusKindBadge(kind = quoted.kind)
+            }
+        } else {
+            FocusKindBadge(kind = quoted.kind)
+        }
+
+        if (quoted.title.isNotBlank()) {
+            Text(
+                text = quoted.title,
+                style = MaterialTheme.typography.titleSmall,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+
+        if (quoted.text.isNotBlank()) {
+            Text(
+                text = quoted.text,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 4,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+
+        if (quoted.coverURLs.isNotEmpty()) {
+            FocusQuotedCardCovers(
+                quoted = quoted,
+                imageLayout = imageLayout,
+                onOpenImage = onOpenImage,
+            )
+        }
+    }
+}
+
+@Composable
+private fun FocusQuotedCardCovers(
+    quoted: DynamicCard.QuotedCard,
+    imageLayout: FocusDynamicImageLayout,
+    onOpenImage: (Int) -> Unit,
+) {
+    if (quoted.coverURLs.size == 1) {
+        val url = quoted.coverURLs.first()
+        when (quoted.kind) {
+            DynamicCard.Kind.IMAGE -> {
+                FocusSingleImageCover(
+                    request = imageLayout.quotedCover(quoted, url),
+                    modifier = Modifier.fillMaxWidth(),
+                    onClick = { onOpenImage(0) },
+                )
+            }
+            DynamicCard.Kind.VIDEO,
+            DynamicCard.Kind.ARTICLE_LIKE,
+            DynamicCard.Kind.TEXT,
+            -> {
+                FocusCoverImage(
+                    request = imageLayout.quotedCover(quoted, url),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .aspectRatio(16f / 9f),
+                    contentScale = Crop,
+                    showBackground = true,
+                )
+            }
+        }
+        return
+    }
+
+    val visibleURLs = quoted.coverURLs.take(4)
+    val rows = visibleURLs.chunked(2)
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        rows.forEachIndexed { rowIndex, rowUrls ->
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                rowUrls.forEachIndexed { columnIndex, url ->
+                    FocusCoverImage(
+                        request = imageLayout.quotedCover(quoted, url),
+                        modifier = Modifier
+                            .weight(1f)
+                            .aspectRatio(1f)
+                            .then(
+                                if (quoted.kind == DynamicCard.Kind.IMAGE) {
+                                    Modifier.clickable { onOpenImage(rowIndex * 2 + columnIndex) }
+                                } else {
+                                    Modifier
+                                },
+                            ),
+                        contentScale = Crop,
+                        showBackground = true,
+                    )
+                }
+                repeat(2 - rowUrls.size) {
+                    Spacer(modifier = Modifier.weight(1f))
+                }
+            }
         }
     }
 }
@@ -535,12 +758,10 @@ private fun visibleCards(
 }
 
 @Composable
-private fun FocusAvatar(avatarURL: String?, modifier: Modifier = Modifier) {
+private fun FocusAvatar(request: FocusDynamicImageRequest?, modifier: Modifier = Modifier) {
+    val context = LocalContext.current
     AsyncImage(
-        model = ImageRequest.Builder(LocalContext.current)
-            .data(avatarURL)
-            .crossfade(true)
-            .build(),
+        model = remember(context, request) { request?.build(context) },
         contentDescription = null,
         modifier = modifier.clip(CircleShape),
         contentScale = ContentScale.Crop,
@@ -548,24 +769,24 @@ private fun FocusAvatar(avatarURL: String?, modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun FocusDynamicCardCovers(card: DynamicCard, onOpenImage: (Int) -> Unit) {
+private fun FocusDynamicCardCovers(card: DynamicCard, imageLayout: FocusDynamicImageLayout, onOpenImage: (Int) -> Unit) {
     if (card.coverURLs.size == 1) {
         val url = card.coverURLs.first()
         when (card.kind) {
             DynamicCard.Kind.VIDEO, DynamicCard.Kind.ARTICLE_LIKE, DynamicCard.Kind.TEXT -> {
                 FocusCoverImage(
-                    url = url,
+                    request = imageLayout.cover(card, url),
                     modifier = Modifier
                         .fillMaxWidth()
                         .aspectRatio(16f / 9f),
                     contentScale = Crop,
-                    showBackground = false,
+                    showBackground = true,
                 )
             }
 
             DynamicCard.Kind.IMAGE -> {
                 FocusSingleImageCover(
-                    url = url,
+                    request = imageLayout.cover(card, url),
                     modifier = Modifier.fillMaxWidth(),
                     onClick = { onOpenImage(0) },
                 )
@@ -587,7 +808,7 @@ private fun FocusDynamicCardCovers(card: DynamicCard, onOpenImage: (Int) -> Unit
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 rowUrls.forEachIndexed { columnIndex, url ->
                     FocusCoverImage(
-                        url = url,
+                        request = imageLayout.cover(card, url),
                         modifier = Modifier
                             .weight(1f)
                             .aspectRatio(1f)
@@ -597,7 +818,7 @@ private fun FocusDynamicCardCovers(card: DynamicCard, onOpenImage: (Int) -> Unit
                                 } else Modifier
                             ),
                         contentScale = Crop,
-                        showBackground = false,
+                        showBackground = true,
                     )
                 }
                 repeat(2 - rowUrls.size) {
@@ -624,30 +845,15 @@ private fun FocusDynamicCardCovers(card: DynamicCard, onOpenImage: (Int) -> Unit
 }
 
 @Composable
-private fun FocusSingleImageCover(url: String, modifier: Modifier = Modifier, onClick: () -> Unit = {}) {
-    val painter = rememberAsyncImagePainter(
-        model = ImageRequest.Builder(LocalContext.current)
-            .data(url)
-            .crossfade(true)
-            .build()
-    )
-    val intrinsicSize = (painter.state as? AsyncImagePainter.State.Success)
-        ?.painter
-        ?.intrinsicSize
-    val ratio = normalizedIntrinsicRatio(intrinsicSize)
-    val widthFraction = when {
-        ratio >= 1.15f -> 1f
-        ratio >= 0.95f -> 0.82f
-        else -> 0.68f
-    }
-
-    Image(
-        painter = painter,
+private fun FocusSingleImageCover(request: FocusDynamicImageRequest, modifier: Modifier = Modifier, onClick: () -> Unit = {}) {
+    val context = LocalContext.current
+    AsyncImage(
+        model = remember(context, request) { request.build(context) },
         contentDescription = null,
         modifier = modifier
             .clickable(onClick = onClick)
-            .fillMaxWidth(widthFraction)
-            .aspectRatio(ratio)
+            .fillMaxWidth()
+            .aspectRatio(4f / 3f)
             .clip(DynamicCoverCornerRadius)
             .background(MaterialTheme.colorScheme.surfaceVariant),
         contentScale = Fit,
@@ -656,16 +862,14 @@ private fun FocusSingleImageCover(url: String, modifier: Modifier = Modifier, on
 
 @Composable
 private fun FocusCoverImage(
-    url: String,
+    request: FocusDynamicImageRequest,
     modifier: Modifier = Modifier,
     contentScale: ContentScale,
     showBackground: Boolean,
 ) {
+    val context = LocalContext.current
     AsyncImage(
-        model = ImageRequest.Builder(LocalContext.current)
-            .data(url)
-            .crossfade(true)
-            .build(),
+        model = remember(context, request) { request.build(context) },
         contentDescription = null,
         modifier = modifier
             .clip(DynamicCoverCornerRadius)
@@ -678,13 +882,6 @@ private fun FocusCoverImage(
             ),
         contentScale = contentScale,
     )
-}
-
-private fun normalizedIntrinsicRatio(size: Size?): Float {
-    if (size == null || size.width <= 0f || size.height <= 0f) {
-        return 4f / 3f
-    }
-    return (size.width / size.height).coerceIn(0.75f, 2f)
 }
 
 @Composable

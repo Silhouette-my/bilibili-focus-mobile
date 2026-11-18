@@ -1,10 +1,18 @@
 package org.bilibilifocus.core.service
 
+import io.ktor.http.parseUrl
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.JsonArray
 import org.bilibilifocus.core.model.RichTextRun
 
 internal object CommentRichTextParser {
+    fun parseImageURLs(content: JsonObject): List<String> =
+        (content["pictures"] as? JsonArray).orEmpty().mapNotNull { rawPicture ->
+            val picture = rawPicture as? JsonObject ?: return@mapNotNull null
+            normalizedImageURL(picture.stringValueAt("img_src"))
+        }
+
     fun parse(content: JsonObject): List<RichTextRun> {
         parseNodes(content)?.takeIf { it.isNotEmpty() }?.let { return it }
 
@@ -110,5 +118,18 @@ internal object CommentRichTextParser {
             value.startsWith("/") -> "https://www.bilibili.com$value"
             else -> value
         }
+    }
+
+    private fun normalizedImageURL(raw: String?): String? {
+        val value = raw?.trim()?.takeIf(String::isNotEmpty) ?: return null
+        val normalized = when {
+            value.startsWith("//") -> "https:$value"
+            value.startsWith("http://", ignoreCase = true) -> "https://${value.substringAfter("://")}"
+            value.startsWith("https://", ignoreCase = true) -> "https://${value.substringAfter("://")}"
+            else -> null
+        } ?: return null
+        val parsed = parseUrl(normalized) ?: return null
+        if (parsed.protocol.name.lowercase() != "https" || parsed.host.isBlank()) return null
+        return normalized
     }
 }

@@ -12,9 +12,27 @@ struct FocusScriptBuilderTests {
             settings: FocusSettings(debugMode: true)
         )
 
+#if DEBUG
         #expect(script.contains("\"debugMode\":true"))
+#else
+        #expect(script.contains("\"debugMode\":false"))
+        #expect(!script.contains("\"debugMode\":true"))
+#endif
         #expect(script.contains("documentStart"))
         #expect(script.contains("width=device-width"))
+    }
+
+    @Test
+    func runtimeSettingsDisableLegacyDebugModeOutsideDebugBuilds() {
+        let settings = FocusSettings(debugMode: true)
+
+#if DEBUG
+        #expect(settings.debugLoggingEnabledForCurrentBuild)
+        #expect(settings.effectiveRuntimeSettings.debugMode)
+#else
+        #expect(!settings.debugLoggingEnabledForCurrentBuild)
+        #expect(!settings.effectiveRuntimeSettings.debugMode)
+#endif
     }
 
     @Test

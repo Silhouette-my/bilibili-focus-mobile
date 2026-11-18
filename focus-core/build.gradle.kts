@@ -19,8 +19,9 @@ kotlin {
         iosSimulatorArm64()
     ).forEach {
         it.binaries.framework {
-            baseName = "FocusCore"
+            baseName = "FocusKMP"
             isStatic = true
+            binaryOption("bundleId", "org.bilibilifocus.core.FocusKMP")
         }
     }
 
@@ -31,7 +32,6 @@ kotlin {
             implementation(libs.ktor.client.core)
             implementation(libs.ktor.client.content.negotiation)
             implementation(libs.ktor.serialization.json)
-            implementation(libs.koin.core)
         }
 
         commonTest.dependencies {
@@ -53,7 +53,7 @@ android {
     namespace = "org.bilibilifocus.core"
     compileSdk = 35
 
-    sourceSets["main"].resources.srcDir("src/commonMain/resources")
+    sourceSets["main"].resources.srcDir("../Sources/FocusCore/Resources")
 
     defaultConfig {
         minSdk = 26

@@ -12,6 +12,7 @@ data class DynamicCard(
     val coverURLs: List<String>,
     val targetURL: String,
     val videoURL: String? = null,
+    val quotedCard: QuotedCard? = null,
 ) {
     @Serializable
     enum class Kind {
@@ -26,5 +27,19 @@ data class DynamicCard(
         val name: String,
         val mid: Long = 0,
         val avatarURL: String? = null,
+    )
+
+    @Serializable
+    data class QuotedCard(
+        val id: String = "",
+        val kind: Kind = Kind.TEXT,
+        val author: Author = Author(name = ""),
+        val publishTime: String = "",
+        val title: String = "",
+        val text: String = "",
+        val coverURLs: List<String> = emptyList(),
+        val targetURL: String? = null,
+        val videoURL: String? = null,
+        val unavailableTip: String? = null,
     )
 }

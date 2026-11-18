@@ -1,0 +1,32 @@
+package org.bilibilifocus.core.service
+
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertTrue
+
+class BiliApiContractTests {
+    @Test
+    fun `loads the endpoint contract catalog`() {
+        val snapshot = BiliApiContractCatalog.snapshot
+
+        assertEquals(1, snapshot.schemaVersion)
+        assertTrue(snapshot.endpoints.size >= 40)
+    }
+
+    @Test
+    fun `exposes verified endpoint metadata`() {
+        val endpoint = BiliApiContractCatalog.require("video.info.get_player_info")
+
+        assertEquals("https://api.bilibili.com/x/player/wbi/v2", endpoint.url)
+        assertEquals("GET", endpoint.method)
+        assertTrue(endpoint.requiresAuthentication)
+        assertTrue(endpoint.usesWbi)
+    }
+
+    @Test
+    fun `includes authenticated management contracts`() {
+        assertTrue(BiliApiContractCatalog.require("common.comment.send").usesWbi)
+        assertTrue(BiliApiContractCatalog.require("common.comment.del").requiresAuthentication)
+        assertEquals("POST", BiliApiContractCatalog.require("favorite-list.operate.content_move").method)
+    }
+}
