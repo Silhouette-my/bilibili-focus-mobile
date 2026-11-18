@@ -5,9 +5,10 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 APP_NAME="BilibiliFocus"
 BUILD_DIR="$ROOT_DIR/build/dist"
 WORK_DIR="$(mktemp -d "$ROOT_DIR/.tmp-ipa-build-XXXXXX")"
-DERIVED_DATA_PATH="$WORK_DIR/DerivedData"
+SYMROOT_DIR="$WORK_DIR/Products"
+OBJROOT_DIR="$WORK_DIR/Intermediates"
 PAYLOAD_DIR="$WORK_DIR/Payload"
-APP_PATH="$DERIVED_DATA_PATH/Build/Products/Release-iphoneos/${APP_NAME}.app"
+APP_PATH="$SYMROOT_DIR/Release-iphoneos/${APP_NAME}.app"
 IPA_PATH="$BUILD_DIR/${APP_NAME}-unsigned.ipa"
 
 cleanup() {
@@ -19,11 +20,11 @@ mkdir -p "$BUILD_DIR" "$PAYLOAD_DIR"
 
 xcodebuild \
   -project "$ROOT_DIR/BilibiliFocus.xcodeproj" \
-  -scheme "$APP_NAME" \
+  -target "$APP_NAME" \
   -configuration Release \
   -sdk iphoneos \
-  -destination generic/platform=iOS \
-  -derivedDataPath "$DERIVED_DATA_PATH" \
+  SYMROOT="$SYMROOT_DIR" \
+  OBJROOT="$OBJROOT_DIR" \
   CODE_SIGNING_ALLOWED=NO \
   CODE_SIGNING_REQUIRED=NO \
   build

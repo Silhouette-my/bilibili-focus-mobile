@@ -30,7 +30,7 @@
 
 ## 🚀 下载与安装
 
-在 GitHub Releases 页面提供已构建的安装包供直接体验（当前线上已发布版本为 **1.0.1**，主干源码持续演进中）：
+在 GitHub Releases 页面提供已构建的安装包供直接体验（当前最新发布版本：**1.0.2**）：
 
 👉 **[前往 Releases 页面下载](https://github.com/Silhouette-my/bilibili-focus-mobile/releases)**
 
@@ -51,7 +51,7 @@
 │   │   ├── Player/             # 原生播放器、控件、弹幕与字幕视图
 │   │   ├── WebBridge/          # WKWebView 兜底容器与页面增强桥接
 │   │   └── Shared/             # 依赖图、路由状态、通用 UI、设置与后台调度
-│   ├── Assets.xcassets         # 应用图标与矢量资源
+│   ├── Resources               # 应用图标与三连图标资源
 │   └── Info.plist
 ├── Sources/FocusCore           # Swift 核心层（API/WBI、缓存分页、续播与共享 Resources/）
 ├── focus-core                  # KMP 跨平台核心层（模型、路由、API 服务、缓存分页与脚本构建）
