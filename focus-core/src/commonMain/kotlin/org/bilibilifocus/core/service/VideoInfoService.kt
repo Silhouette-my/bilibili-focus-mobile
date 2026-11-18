@@ -229,9 +229,11 @@ class VideoInfoService(
         return result.comments to result.totalCount.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
     }
 
+    /** [type] is Bilibili's comment area type: 1 video, 11 image dynamic, 12 article, 17 text dynamic. */
     suspend fun fetchCommentPage(
         oid: Long,
         cursor: CommentCursor = CommentCursor(),
+        type: Int = 1,
     ): CommentPage {
         return run {
             val pagination = buildJsonObject {
@@ -240,7 +242,7 @@ class VideoInfoService(
             val response = executeWbiText(
                 endpoint = BiliApiContractCatalog.require("common.comment.reply_by_session_id").url,
                 parameters = mapOf(
-                    "type" to "1",
+                    "type" to type.toString(),
                     "oid" to oid.toString(),
                     "mode" to "3",
                     "pagination_str" to pagination,
@@ -267,10 +269,10 @@ class VideoInfoService(
     suspend fun currentAccountMid(): Long? = CookieRequestPolicy.matchingCookies(cookieProvider.loadCookies(), "https://api.bilibili.com/")
         .firstOrNull { it.name == "DedeUserID" }?.value?.toLongOrNull()?.takeIf { it > 0 }
 
-    suspend fun fetchCommentReplies(aid: Long, root: Long, page: Int = 1): VideoCommentRepliesPage {
-        require(aid > 0 && root > 0 && page > 0)
+    suspend fun fetchCommentReplies(aid: Long, root: Long, page: Int = 1, type: Int = 1): VideoCommentRepliesPage {
+        require(aid > 0 && root > 0 && page > 0 && type > 0)
         val url = BiliApiContractCatalog.require("common.comment.sub_reply").url +
-            "?type=1&oid=$aid&root=$root&pn=$page&ps=20"
+            "?type=$type&oid=$aid&root=$root&pn=$page&ps=20"
         val response = httpClient.get(url, buildHeaders(url))
         if (response.statusCode !in 200..299) throw ServiceError.InvalidResponse
         val data = parseDataField(response.body)
@@ -279,22 +281,22 @@ class VideoInfoService(
         return VideoCommentRepliesPage(replies, (page + 1).takeIf { replies.isNotEmpty() && page * 20L < count })
     }
 
-    suspend fun setCommentLiked(aid: Long, rpid: Long, liked: Boolean, expectedMid: Long) {
-        commentWrite("common.comment.like", mapOf("oid" to "$aid", "type" to "1", "rpid" to "$rpid", "action" to if (liked) "1" else "0"), expectedMid)
+    suspend fun setCommentLiked(aid: Long, rpid: Long, liked: Boolean, expectedMid: Long, type: Int = 1) {
+        commentWrite("common.comment.like", mapOf("oid" to "$aid", "type" to "$type", "rpid" to "$rpid", "action" to if (liked) "1" else "0"), expectedMid)
     }
 
-    suspend fun sendComment(aid: Long, message: String, root: Long = 0, parent: Long = 0, expectedMid: Long): VideoComment {
+    suspend fun sendComment(aid: Long, message: String, root: Long = 0, parent: Long = 0, expectedMid: Long, type: Int = 1): VideoComment {
         require(message.isNotBlank() && message.length <= 1000)
         val data = commentWrite(
             "common.comment.send",
-            mapOf("oid" to "$aid", "type" to "1", "message" to message, "plat" to "1", "root" to "$root", "parent" to "$parent"),
+            mapOf("oid" to "$aid", "type" to "$type", "message" to message, "plat" to "1", "root" to "$root", "parent" to "$parent"),
             expectedMid,
         )
         return parseComment(data.dictionaryValueAt("reply")) ?: throw ServiceError.InvalidResponse
     }
 
-    suspend fun deleteComment(aid: Long, rpid: Long, expectedMid: Long) {
-        commentWrite("common.comment.del", mapOf("oid" to "$aid", "type" to "1", "rpid" to "$rpid"), expectedMid)
+    suspend fun deleteComment(aid: Long, rpid: Long, expectedMid: Long, type: Int = 1) {
+        commentWrite("common.comment.del", mapOf("oid" to "$aid", "type" to "$type", "rpid" to "$rpid"), expectedMid)
     }
 
     private suspend fun commentWrite(key: String, fields: Map<String, String>, expectedMid: Long): JsonObject {

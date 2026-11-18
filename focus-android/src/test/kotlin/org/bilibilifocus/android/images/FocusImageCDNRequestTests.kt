@@ -23,6 +23,16 @@ class FocusImageCDNRequestTests {
     }
 
     @Test
+    fun upgradesEveryBilibiliImageHostBecauseCleartextIsDisabled() {
+        assertEquals("https://archive.biliimg.com/bfs/archive/a.jpg", FocusImageCDNRequest.canonicalURL("http://archive.biliimg.com/bfs/archive/a.jpg"))
+        assertEquals("https://s1.hdslb.com/bfs/static/a.png", FocusImageCDNRequest.canonicalURL("http://s1.hdslb.com/bfs/static/a.png"))
+        assertNull(FocusImageCDNRequest.thumbnailURL("https://archive.biliimg.com/bfs/archive/a.jpg", 300))
+        kotlin.test.assertTrue(FocusImageHttpClient.isBilibiliImageHost("I0.HDSLB.COM"))
+        kotlin.test.assertFalse(FocusImageHttpClient.isBilibiliImageHost("i0.hdslb.com.evil.test"))
+        kotlin.test.assertFalse(FocusImageHttpClient.isBilibiliImageHost("evilhdslb.com"))
+    }
+
+    @Test
     fun usesSameStableBucketsAndNonCroppingTransformAsIOS() {
         assertEquals(
             "https://i0.hdslb.com/bfs/archive/cover.jpg@384w_384h_0e.webp",

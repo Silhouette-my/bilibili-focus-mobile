@@ -47,6 +47,7 @@ import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
@@ -54,9 +55,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.media3.common.util.UnstableApi
+import coil.compose.AsyncImage
+import coil.request.ImageRequest
 import org.bilibilifocus.android.FocusPictureInPicturePolicy
 import org.bilibilifocus.android.FocusVideoViewModel
 import org.bilibilifocus.android.VideoUiState
+import org.bilibilifocus.android.images.FocusImageCDNRequest
 import org.bilibilifocus.android.playback.FocusPlaybackAccountScopeProvider
 import org.bilibilifocus.android.playback.FocusPlaybackConnection
 import org.bilibilifocus.android.playback.FocusPlaybackProgressStore
@@ -539,6 +543,22 @@ fun FocusVideoScreen(
                                         attachmentKey = playerSurfaceRevision,
                                         modifier = Modifier.fillMaxSize(),
                                     )
+                                    val showCoverPlaceholder = !playbackState.isPlaying &&
+                                        playbackPositionMillis.longValue == 0L &&
+                                        (playbackState.isBuffering || !playbackState.isConnected) &&
+                                        currentState.info.coverURL.isNotBlank()
+                                    if (showCoverPlaceholder) {
+                                        AsyncImage(
+                                            model = ImageRequest.Builder(context)
+                                                .data(FocusImageCDNRequest.canonicalURL(currentState.info.coverURL))
+                                                .crossfade(true)
+                                                .build(),
+                                            contentDescription = null,
+                                            contentScale = ContentScale.Crop,
+                                            alpha = 0.72f,
+                                            modifier = Modifier.fillMaxSize(),
+                                        )
+                                    }
                                     VideoDanmakuOverlay(
                                         state = danmakuState,
                                         enabled = nativeDanmakuEnabled,

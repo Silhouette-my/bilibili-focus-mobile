@@ -6,10 +6,13 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
@@ -19,9 +22,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ElevatedCard
-import androidx.compose.material3.FilterChip
-import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -35,11 +37,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
+import org.bilibilifocus.android.images.FocusImageCDNRequest
 import org.bilibilifocus.core.model.VideoEpisode
 import org.bilibilifocus.core.model.VideoEpisodeGroup
 import org.bilibilifocus.core.model.VideoInfo
@@ -62,42 +66,60 @@ internal fun VideoPageSection(
     }
 
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        Text("分 P", style = MaterialTheme.typography.titleMedium)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("选集", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+            Text("${pages.size}P", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
         LazyRow(
             state = listState,
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             items(pages, key = { it.cid }) { page ->
                 val selected = page.cid == selectedCid
-                val chipShape = RoundedCornerShape(10.dp)
-                FilterChip(
-                    selected = selected,
+                val cardShape = RoundedCornerShape(12.dp)
+                Surface(
                     onClick = { onSelect(page) },
-                    label = {
-                        val label = buildString {
-                            append("P${page.pageNumber}")
-                            if (page.title.isNotBlank()) append(" ${page.title}")
+                    shape = cardShape,
+                    color = if (selected) BilibiliPink.copy(alpha = 0.14f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
+                    modifier = Modifier
+                        .width(156.dp)
+                        .then(
+                            if (selected) {
+                                Modifier.border(1.5.dp, BilibiliPink, cardShape)
+                            } else {
+                                Modifier.border(0.5.dp, MaterialTheme.colorScheme.outlineVariant, cardShape)
+                            },
+                        ),
+                ) {
+                    Column(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = "P${page.pageNumber}",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.SemiBold,
+                                color = if (selected) BilibiliPink else MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Spacer(modifier = Modifier.weight(1f))
+                            if (page.duration > 0) {
+                                Text(
+                                    text = formatPlaybackTime(page.duration * 1_000),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
                         }
                         Text(
-                            label,
-                            maxLines = 1,
+                            text = page.title.ifBlank { "P${page.pageNumber}" },
+                            style = MaterialTheme.typography.labelLarge,
+                            color = if (selected) BilibiliPink else MaterialTheme.colorScheme.onSurface,
+                            maxLines = 2,
                             overflow = TextOverflow.Ellipsis,
-                            textAlign = TextAlign.Center,
                         )
-                    },
-                    colors = FilterChipDefaults.filterChipColors(
-                        selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
-                        selectedLabelColor = MaterialTheme.colorScheme.onPrimaryContainer,
-                    ),
-                    shape = chipShape,
-                    modifier = Modifier.then(
-                        if (selected) {
-                            Modifier.border(2.dp, MaterialTheme.colorScheme.primary, chipShape)
-                        } else {
-                            Modifier
-                        }
-                    ),
-                )
+                    }
+                }
             }
         }
     }
@@ -215,50 +237,89 @@ private fun EpisodeCard(
     onClick: () -> Unit,
 ) {
     val cardShape = RoundedCornerShape(14.dp)
+    val hasCover = episode.coverURL.isNotBlank()
     ElevatedCard(
         onClick = onClick,
         shape = cardShape,
         colors = CardDefaults.elevatedCardColors(
             containerColor = if (selected) {
-                MaterialTheme.colorScheme.primaryContainer
+                BilibiliPink.copy(alpha = 0.14f)
             } else {
                 MaterialTheme.colorScheme.surface
             }
         ),
         elevation = CardDefaults.elevatedCardElevation(defaultElevation = 1.dp),
-        modifier = Modifier
-            .size(width = 156.dp, height = 88.dp)
+        modifier = (if (hasCover) Modifier.width(160.dp) else Modifier.size(width = 156.dp, height = 88.dp))
             .then(
                 if (selected) {
-                    Modifier.border(2.dp, MaterialTheme.colorScheme.primary, cardShape)
+                    Modifier.border(1.5.dp, BilibiliPink, cardShape)
                 } else {
                     Modifier
                 }
             ),
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(12.dp),
-            verticalArrangement = Arrangement.Center,
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-            Text(
-                episode.title,
-                style = MaterialTheme.typography.labelLarge,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-                textAlign = TextAlign.Center,
-            )
-            if (episode.badgeText.isNotBlank()) {
+        if (hasCover) {
+            Column {
+                AsyncImage(
+                    model = ImageRequest.Builder(LocalContext.current)
+                        .data(FocusImageCDNRequest.canonicalURL(episode.coverURL))
+                        .crossfade(true)
+                        .build(),
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .aspectRatio(16f / 9f)
+                        .background(MaterialTheme.colorScheme.surfaceVariant),
+                )
+                Column(
+                    modifier = Modifier.padding(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Text(
+                        episode.title,
+                        style = MaterialTheme.typography.labelLarge,
+                        color = if (selected) BilibiliPink else MaterialTheme.colorScheme.onSurface,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    if (episode.badgeText.isNotBlank()) {
+                        Text(
+                            episode.badgeText,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (selected) BilibiliPink else MaterialTheme.colorScheme.primary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+            }
+        } else {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(12.dp),
+                verticalArrangement = Arrangement.Center,
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
                 Text(
-                    episode.badgeText,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.primary,
-                    maxLines = 1,
+                    episode.title,
+                    style = MaterialTheme.typography.labelLarge,
+                    color = if (selected) BilibiliPink else MaterialTheme.colorScheme.onSurface,
+                    maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
                     textAlign = TextAlign.Center,
                 )
+                if (episode.badgeText.isNotBlank()) {
+                    Text(
+                        episode.badgeText,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (selected) BilibiliPink else MaterialTheme.colorScheme.primary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        textAlign = TextAlign.Center,
+                    )
+                }
             }
         }
     }
@@ -320,11 +381,14 @@ internal fun AuthorCard(info: VideoInfo, onClick: () -> Unit = {}) {
     ) {
         AsyncImage(
             model = ImageRequest.Builder(LocalContext.current)
-                .data(info.author.avatarURL)
+                .data(FocusImageCDNRequest.canonicalURL(info.author.avatarURL))
                 .crossfade(true)
                 .build(),
             contentDescription = null,
-            modifier = Modifier.size(44.dp).clip(CircleShape),
+            modifier = Modifier
+                .size(44.dp)
+                .clip(CircleShape)
+                .background(MaterialTheme.colorScheme.surfaceVariant),
             contentScale = ContentScale.Crop,
         )
         Column(modifier = Modifier.weight(1f)) {

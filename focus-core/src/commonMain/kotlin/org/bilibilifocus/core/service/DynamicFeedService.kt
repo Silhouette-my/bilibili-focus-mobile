@@ -339,10 +339,19 @@ class DynamicFeedService(
             value.startsWith("/opus/") || value.startsWith("/video/") ||
                 value.startsWith("/bangumi/play/") -> "https://www.bilibili.com$value"
             value.startsWith("/") -> "https://t.bilibili.com$value"
-            else -> value
+            else -> upgradeBilibiliCdnHttp(value)
         }
 
         return org.bilibilifocus.core.routing.FocusNavigationPolicy.canonicalWebURL(value)
+    }
+
+    private fun upgradeBilibiliCdnHttp(url: String): String {
+        if (!url.startsWith("http://", ignoreCase = true)) return url
+        val parsed = org.bilibilifocus.core.routing.BiliUrl.parse(url)
+        val host = parsed.host?.lowercase() ?: return url
+        if ('@' in host || ':' in host) return url
+        val isBiliImageHost = host.endsWith(".hdslb.com") || host == "hdslb.com" || host.endsWith(".biliimg.com")
+        return if (isBiliImageHost) "https:" + url.substringAfter(':') else url
     }
 
     private fun canonicalOpusURLFromScheme(value: String): String? {

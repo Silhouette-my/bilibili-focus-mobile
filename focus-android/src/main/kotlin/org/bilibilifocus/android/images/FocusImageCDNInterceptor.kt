@@ -26,7 +26,7 @@ internal object FocusImageCDNRequest {
         } catch (_: java.net.URISyntaxException) {
             return source
         }
-        if (uri.rawUserInfo != null || uri.port != -1 || !imageHost.matches(uri.host.orEmpty().lowercase())) return source
+        if (uri.rawUserInfo != null || uri.port != -1 || !FocusImageHttpClient.isBilibiliImageHost(uri.host.orEmpty())) return source
         return when (uri.scheme?.lowercase()) {
             "http" -> "https:" + source.substringAfter(':')
             null -> if (source.startsWith("//")) "https:$source" else source
@@ -89,12 +89,12 @@ internal class FocusImageCDNInterceptor : Interceptor {
         val result = try {
             chain.proceed(request)
         } catch (error: HttpException) {
-            if (error.response.code !in setOf(403, 404)) throw error
+            if (error.response.code !in setOf(400, 403, 404)) throw error
             // A derivative rejected by the CDN may still have a valid original.
             // Offline, timeout, TLS and 5xx failures never cause a second fetch.
             return chain.proceed(normalized)
         }
-        return if (result is ErrorResult && (result.throwable as? HttpException)?.response?.code in setOf(403, 404)) {
+        return if (result is ErrorResult && (result.throwable as? HttpException)?.response?.code in setOf(400, 403, 404)) {
             chain.proceed(normalized)
         } else {
             result

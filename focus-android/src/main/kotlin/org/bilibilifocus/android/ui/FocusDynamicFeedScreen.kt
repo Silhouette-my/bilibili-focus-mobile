@@ -592,7 +592,7 @@ private fun FocusDynamicCardCovers(card: DynamicCard, imageLayout: FocusDynamicI
                         .fillMaxWidth()
                         .aspectRatio(16f / 9f),
                     contentScale = Crop,
-                    showBackground = false,
+                    showBackground = true,
                 )
             }
 
@@ -630,7 +630,7 @@ private fun FocusDynamicCardCovers(card: DynamicCard, imageLayout: FocusDynamicI
                                 } else Modifier
                             ),
                         contentScale = Crop,
-                        showBackground = false,
+                        showBackground = true,
                     )
                 }
                 repeat(2 - rowUrls.size) {

@@ -4,6 +4,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import org.bilibilifocus.core.cookie.CookieProvider
+import org.bilibilifocus.core.model.CommentTarget
 import org.bilibilifocus.core.model.OpusAuthor
 import org.bilibilifocus.core.model.OpusBlock
 import org.bilibilifocus.core.model.OpusDetail
@@ -67,7 +68,7 @@ class OpusService(
         }
 
         val basic = item.dictionaryValueAt("basic") ?: JsonObject(emptyMap())
-        val modules = item.dictionaryValueAt("modules") ?: JsonObject(emptyMap())
+        val modules = normalizeModules(item)
 
         val opusId = basic.stringValueAt("comment_id_str")
             ?: basic.stringValueAt("rid_str")
@@ -76,17 +77,18 @@ class OpusService(
             ?: basic.stringValueAt("comment_id_str")?.toLongOrNull()
             ?: id.toLongOrNull()
             ?: 0L
+        val commentType = basic.intValueAt("comment_type") ?: 0
 
         val authorModule = modules.dictionaryValueAt("module_author")
         val authorName = authorModule?.stringValueAt("name")?.ifEmpty { null } ?: "用户"
         val authorMid = authorModule?.longValueAt("mid") ?: 0L
-        val authorAvatar = authorModule?.stringValueAt("face") ?: ""
+        val authorAvatar = normalizedURL(authorModule?.stringValueAt("face")) ?: ""
         val publishTime = authorModule?.stringValueAt("pub_time")
             ?: authorModule?.stringValueAt("pub_time_text")
             ?: authorModule?.longValueAt("pub_ts")?.toString()
             ?: ""
 
-        val paragraphs = parseParagraphs(modules)
+        val paragraphs = parseOpusModulesParagraphs(modules)
 
         // 如果解析不到段落，先尝试动态详情接口（普通图片/文字动态），再退化为空结果
         if (paragraphs.isEmpty()) {
@@ -94,6 +96,7 @@ class OpusService(
             return OpusDetail(
                 id = opusId,
                 commentId = commentId,
+                commentType = commentType,
                 author = OpusAuthor(name = authorName, mid = authorMid, avatarURL = authorAvatar),
                 publishTime = publishTime,
                 paragraphs = listOf(
@@ -107,6 +110,7 @@ class OpusService(
         return OpusDetail(
             id = opusId,
             commentId = commentId,
+            commentType = commentType,
             author = OpusAuthor(name = authorName, mid = authorMid, avatarURL = authorAvatar),
             publishTime = publishTime,
             paragraphs = paragraphs,
@@ -151,9 +155,15 @@ class OpusService(
 
         val blocks = mutableListOf<OpusBlock>()
 
+        major?.stringValueAt("opus", "title")?.trim()?.takeIf { it.isNotEmpty() }?.let { opusTitle ->
+            blocks.add(OpusBlock.Text(listOf(RichTextRun.Text(text = opusTitle, bold = true))))
+        }
+
         val richTextRuns = parseOpusTextNodes(
             dynamic.arrayValueAt("desc", "rich_text_nodes")
                 ?: dynamic.arrayValueAt("desc", "rich_text_nodes_v2")
+                ?: major?.arrayValueAt("opus", "summary", "rich_text_nodes")
+                ?: major?.arrayValueAt("opus", "summary", "rich_text_nodes_v2")
                 ?: emptyList()
         )
         val text = dynamic.stringValueAt("desc", "text") ?: major?.stringValueAt("opus", "summary", "text")
@@ -166,7 +176,7 @@ class OpusService(
         val pics = mutableListOf<OpusImage>()
         fun addPic(d: JsonObject, vararg keys: String) {
             val raw = keys.firstNotNullOfOrNull { d.stringValueAt(it) } ?: return
-            val u = if (raw.startsWith("//")) "https:$raw" else raw
+            val u = normalizedURL(raw) ?: return
             pics.add(OpusImage(url = u, width = d.intValueAt("width") ?: 0, height = d.intValueAt("height") ?: 0))
         }
         major?.arrayValueAt("opus", "pics")?.forEach { (it as? JsonObject)?.let { d -> addPic(d, "url", "src") } }
@@ -177,19 +187,53 @@ class OpusService(
 
         if (blocks.isEmpty()) return null
 
+        // Image dynamics comment on (rid, 11), text dynamics on (dynamic id, 17).
+        val basic = item.dictionaryValueAt("basic")
+        val basicCommentId = basic?.stringValueAt("comment_id_str")?.toLongOrNull()
+            ?: basic?.longValueAt("comment_id")
+        val basicCommentType = basic?.intValueAt("comment_type") ?: 0
+
         return OpusDetail(
             id = id,
-            commentId = id.toLongOrNull() ?: 0L,
+            commentId = basicCommentId ?: id.toLongOrNull() ?: 0L,
+            commentType = if (basicCommentId != null) basicCommentType else 0,
             author = OpusAuthor(
                 name = author?.stringValueAt("name")?.ifEmpty { null } ?: "用户",
                 mid = author?.longValueAt("mid") ?: 0L,
-                avatarURL = author?.stringValueAt("face") ?: "",
+                avatarURL = normalizedURL(author?.stringValueAt("face")) ?: "",
             ),
             publishTime = author?.stringValueAt("pub_time")
                 ?: author?.stringValueAt("pub_time_text")
                 ?: "",
             paragraphs = listOf(OpusDetail.Paragraph(blocks)),
         )
+    }
+
+    /**
+     * The comment area of [detail]. Uses the API's own `comment_type` when present;
+     * otherwise probes the historical (oid, type) candidates once and keeps the first
+     * area that actually has comments. Returns null when no area can be identified.
+     */
+    suspend fun resolveCommentTarget(detail: OpusDetail): CommentTarget? {
+        if (detail.commentType > 0 && detail.commentId > 0) return CommentTarget(detail.commentId, detail.commentType)
+        val oidCandidates = buildList {
+            if (detail.commentId > 0) add(detail.commentId)
+            detail.id.toLongOrNull()?.takeIf { it > 0 && it !in this }?.let(::add)
+        }
+        for (oid in oidCandidates) {
+            for (type in listOf(17, 11, 12)) {
+                val result = try {
+                    fetchCommentsByType(oid.toString(), type)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    null
+                }
+                if (result != null && (result.first.isNotEmpty() || result.second > 0)) return CommentTarget(oid, type)
+            }
+        }
+        // Long ids are dynamic ids: their (empty) area is still the text-dynamic one.
+        return oidCandidates.firstOrNull { it > 1_000_000_000_000L }?.let { CommentTarget(it, 17) }
     }
 
     suspend fun fetchComments(commentId: Long, fallbackId: String, page: Int = 1): Pair<List<VideoComment>, Int> {
@@ -266,6 +310,47 @@ class OpusService(
         )
     }
 
+    private fun normalizeModules(item: JsonObject): JsonObject {
+        item.dictionaryValueAt("modules")?.let { return it }
+        val array = item.arrayValueAt("modules") ?: return JsonObject(emptyMap())
+        val merged = linkedMapOf<String, kotlinx.serialization.json.JsonElement>()
+        array.forEach { element ->
+            val entry = element as? JsonObject ?: return@forEach
+            val mappedKey = when (entry.stringValueAt("module_type")) {
+                "MODULE_TYPE_AUTHOR" -> "module_author"
+                "MODULE_TYPE_CONTENT" -> "module_content"
+                "MODULE_TYPE_TITLE" -> "module_title"
+                "MODULE_TYPE_TOP" -> "module_top"
+                else -> null
+            }
+            if (mappedKey != null && entry[mappedKey] != null) {
+                merged[mappedKey] = entry[mappedKey]!!
+            }
+            entry.forEach { (key, value) ->
+                if (key != "module_type" && key !in merged) merged[key] = value
+            }
+        }
+        return JsonObject(merged)
+    }
+
+    private fun parseOpusModulesParagraphs(modules: JsonObject): List<OpusDetail.Paragraph> {
+        val result = mutableListOf<OpusDetail.Paragraph>()
+        modules.stringValueAt("module_title", "text")?.trim()?.takeIf { it.isNotEmpty() }?.let { title ->
+            result.add(OpusDetail.Paragraph(listOf(OpusBlock.Text(listOf(RichTextRun.Text(text = title, bold = true))))))
+        }
+        val topPics = modules.dictionaryValueAt("module_top", "display", "album")?.arrayValueAt("pics").orEmpty()
+            .mapNotNull { element ->
+                val pic = element as? JsonObject ?: return@mapNotNull null
+                val url = normalizedURL(pic.stringValueAt("url") ?: pic.stringValueAt("src")) ?: return@mapNotNull null
+                OpusImage(url = url, width = pic.intValueAt("width") ?: 0, height = pic.intValueAt("height") ?: 0)
+            }
+        if (topPics.isNotEmpty()) {
+            result.add(OpusDetail.Paragraph(listOf(OpusBlock.Image(topPics))))
+        }
+        result.addAll(parseParagraphs(modules))
+        return result
+    }
+
     private fun parseParagraphs(modules: JsonObject): List<OpusDetail.Paragraph> {
         val contentModule = modules.dictionaryValueAt("module_content")
             ?: modules.dictionaryValueAt("content")
@@ -305,8 +390,7 @@ class OpusService(
 
                 val pics = picsArray.mapNotNull { pic ->
                     val dict = pic as? JsonObject ?: return@mapNotNull null
-                    val url = dict.stringValueAt("url")
-                        ?: dict.stringValueAt("src")
+                    val url = normalizedURL(dict.stringValueAt("url") ?: dict.stringValueAt("src"))
                         ?: return@mapNotNull null
                     OpusImage(
                         url = url,

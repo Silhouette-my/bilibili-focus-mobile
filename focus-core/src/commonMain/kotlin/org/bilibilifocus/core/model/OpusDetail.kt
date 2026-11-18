@@ -6,6 +6,8 @@ data class OpusDetail(
     val author: OpusAuthor,
     val publishTime: String,
     val paragraphs: List<Paragraph>,
+    /** Comment area type from `basic.comment_type`; 0 when the API did not say. */
+    val commentType: Int = 0,
 ) {
     data class Paragraph(val blocks: List<OpusBlock>)
 }

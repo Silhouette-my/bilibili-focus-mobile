@@ -90,13 +90,6 @@ internal fun VideoPlaybackOverlay(
     val duration = player?.duration?.coerceAtLeast(0) ?: 0L
     val sliderPosition = (if (scrubbing) seekPosition else positionMillis())
         .toFloat().coerceIn(0f, duration.coerceAtLeast(1).toFloat())
-    val sliderColors = SliderDefaults.colors(
-        thumbColor = Color.White,
-        activeTrackColor = Color.White,
-        inactiveTrackColor = Color.White.copy(alpha = 0.45f),
-        activeTickColor = Color.Transparent,
-        inactiveTickColor = Color.Transparent,
-    )
     val originalBrightness = remember(playbackWindow) { playbackWindow?.attributes?.screenBrightness ?: -1f }
     DisposableEffect(playbackWindow) {
         onDispose {
@@ -141,8 +134,8 @@ internal fun VideoPlaybackOverlay(
                         },
                     )
                 }
-                .pointerInput(player, locked, duration, isFullscreen) {
-                    if (locked || !isFullscreen || duration <= 0) return@pointerInput
+                .pointerInput(player, locked, duration) {
+                    if (locked || duration <= 0) return@pointerInput
                     var dragStart = 0L
                     var drag = 0f
                     detectHorizontalDragGestures(
@@ -150,7 +143,6 @@ internal fun VideoPlaybackOverlay(
                         onHorizontalDrag = { change, amount ->
                             change.consume(); drag += amount
                             seekPosition = (dragStart + (drag / gestureWidth * 90_000).toLong()).coerceIn(0, duration)
-                            gestureMessage = "定位 ${formatPlaybackTime(seekPosition)}"
                         },
                         onDragEnd = { currentPlayer?.seekTo(seekPosition); scrubbing = false },
                         onDragCancel = { scrubbing = false },
@@ -204,7 +196,7 @@ internal fun VideoPlaybackOverlay(
         )
 
         if (locked) {
-            IconButton(onClick = { locked = false; visible = true }, modifier = Modifier.align(Alignment.CenterEnd).padding(12.dp).background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(14.dp))) {
+            IconButton(onClick = { locked = false; visible = true }, modifier = Modifier.align(Alignment.CenterStart).padding(start = 12.dp).background(Color.Black.copy(alpha = 0.55f), CircleShape)) {
                 Icon(Icons.Filled.Lock, "解锁播放器", tint = Color.White)
             }
         } else if (visible) {
@@ -223,15 +215,38 @@ internal fun VideoPlaybackOverlay(
                     }
                     IconButton(onClick = { settingsOpen = true }) { Icon(Icons.Filled.Tune, "播放设置", tint = Color.White) }
                     IconButton(onClick = { subtitleMenu = true }) {
-                        Icon(Icons.Filled.ClosedCaption, "字幕设置", tint = if (subtitleEnabled) Color.White else Color.White.copy(alpha = 0.58f))
+                        val subtitleTint = when {
+                            subtitleEnabled && subtitleState.selectedTrack != null -> BilibiliPink
+                            subtitleEnabled -> Color.White
+                            else -> Color.White.copy(alpha = 0.58f)
+                        }
+                        Icon(Icons.Filled.ClosedCaption, "字幕设置", tint = subtitleTint)
                     }
                     DropdownMenu(expanded = subtitleMenu, onDismissRequest = { subtitleMenu = false }) {
-                        DropdownMenuItem(text = { Text(if (!subtitleEnabled) "✓ 关闭字幕" else "关闭字幕") }, onClick = { onSubtitleEnabledChange(false); subtitleMenu = false })
-                        subtitleState.tracks.forEach { track -> DropdownMenuItem(
-                            text = { Text("${if (subtitleEnabled && subtitleState.selectedTrack?.id == track.id) "✓ " else ""}${track.displayName}${if (track.isLocked) "（不可用）" else ""}") },
-                            enabled = !track.isLocked,
-                            onClick = { onSubtitleLanguageChange(track.languageCode); onSubtitleEnabledChange(true); subtitleMenu = false },
-                        ) }
+                        DropdownMenuItem(
+                            text = {
+                                Text(
+                                    text = "关闭字幕",
+                                    color = if (!subtitleEnabled) BilibiliPink else Color.Unspecified,
+                                    fontWeight = if (!subtitleEnabled) androidx.compose.ui.text.font.FontWeight.SemiBold else null,
+                                )
+                            },
+                            onClick = { onSubtitleEnabledChange(false); subtitleMenu = false },
+                        )
+                        subtitleState.tracks.forEach { track ->
+                            val isSelected = subtitleEnabled && subtitleState.selectedTrack?.id == track.id
+                            DropdownMenuItem(
+                                text = {
+                                    Text(
+                                        text = "${track.displayName}${if (track.isLocked) "（不可用）" else ""}",
+                                        color = if (isSelected) BilibiliPink else Color.Unspecified,
+                                        fontWeight = if (isSelected) androidx.compose.ui.text.font.FontWeight.SemiBold else null,
+                                    )
+                                },
+                                enabled = !track.isLocked,
+                                onClick = { onSubtitleLanguageChange(track.languageCode); onSubtitleEnabledChange(true); subtitleMenu = false },
+                            )
+                        }
                         if (subtitleState.isLoading) DropdownMenuItem(text = { Text("正在加载字幕…") }, enabled = false, onClick = {})
                         else if (subtitleState.error != null) DropdownMenuItem(text = { Text("字幕加载失败，重试") }, onClick = { onRetrySubtitle(); subtitleMenu = false })
                         else if (subtitleState.tracks.isEmpty()) DropdownMenuItem(text = { Text("此分 P 暂无字幕") }, enabled = false, onClick = {})
@@ -239,59 +254,80 @@ internal fun VideoPlaybackOverlay(
                 }
                 Spacer(Modifier.weight(1f))
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(formatPlaybackTime(if (scrubbing) sliderPosition.toLong() else positionMillis()), color = Color.White, style = MaterialTheme.typography.labelSmall)
-                    Slider(
-                        value = sliderPosition,
-                        onValueChange = { value ->
-                            scrubbing = true
-                            seekPosition = value.toLong()
-                        },
-                        onValueChangeFinished = {
-                            if (scrubbing) currentPlayer?.seekTo(seekPosition)
-                            scrubbing = false
-                        },
+                    Text(formatPlaybackTime(if (scrubbing) sliderPosition.toLong() else positionMillis()), color = Color.White, fontSize = if (isFullscreen) 13.sp else 11.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.Medium, fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace)
+                    VideoSeekBar(
+                        positionMillis = sliderPosition.toLong(),
+                        bufferedMillis = player?.bufferedPosition?.coerceAtLeast(0) ?: 0L,
+                        durationMillis = duration,
                         enabled = duration > 0,
-                        valueRange = 0f..duration.coerceAtLeast(1).toFloat(),
-                        colors = sliderColors,
-                        modifier = Modifier.weight(1f).height(44.dp),
-                        thumb = { Box(Modifier.size(10.dp).clip(CircleShape).background(Color.White)) },
-                        track = { state -> SliderDefaults.Track(
-                            sliderState = state,
-                            modifier = Modifier.height(3.dp),
-                            colors = sliderColors,
-                            thumbTrackGapSize = 0.dp,
-                            drawStopIndicator = {},
-                        ) },
+                        onScrubStart = { value -> scrubbing = true; seekPosition = value },
+                        onScrub = { value -> scrubbing = true; seekPosition = value },
+                        onScrubEnd = { value -> currentPlayer?.seekTo(value); scrubbing = false },
+                        modifier = Modifier.weight(1f),
                     )
-                    Text(formatPlaybackTime(duration), color = Color.White, style = MaterialTheme.typography.labelSmall)
+                    Text(formatPlaybackTime(duration), color = Color.White, fontSize = if (isFullscreen) 13.sp else 11.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.Medium, fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace)
                 }
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     IconButton(onClick = { player?.let { if (state.hasEnded) { it.seekTo(0); it.play() } else if (it.playWhenReady) it.pause() else it.play() } }) {
-                        Icon(if (state.isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow, if (state.isPlaying) "暂停" else "播放", tint = Color.White)
+                        Icon(if (state.hasEnded) Icons.Filled.Replay else if (state.isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow, if (state.hasEnded) "重新播放" else if (state.isPlaying) "暂停" else "播放", tint = Color.White)
                     }
                     Spacer(Modifier.weight(1f))
                     IconButton(onClick = { onDanmakuEnabledChange(!danmakuEnabled); visible = true }) {
-                        Icon(Icons.AutoMirrored.Filled.Comment, if (danmakuEnabled) "关闭弹幕" else "开启弹幕", tint = if (danmakuEnabled) Color.White else Color.White.copy(alpha = 0.58f))
+                        Icon(Icons.AutoMirrored.Filled.Comment, if (danmakuEnabled) "关闭弹幕" else "开启弹幕", tint = if (danmakuEnabled) BilibiliPink else Color.White)
                     }
                     Box {
-                        TextButton(onClick = { speedMenu = true }, contentPadding = PaddingValues(horizontal = 4.dp)) { Text(formatPlaybackRate(state.playbackSpeed), color = Color.White) }
+                        TextButton(onClick = { speedMenu = true }, contentPadding = PaddingValues(horizontal = 4.dp)) { Text(formatPlaybackRate(state.playbackSpeed), color = Color.White, fontSize = 13.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold) }
                         DropdownMenu(expanded = speedMenu, onDismissRequest = { speedMenu = false }) {
-                            playbackRates.forEach { rate -> DropdownMenuItem(text = { Text(formatPlaybackRate(rate)) }, onClick = { player?.setPlaybackSpeed(rate); onPreferencesChange(preferences.copy(preferredRate = rate)); speedMenu = false }) }
+                            playbackRates.forEach { rate -> DropdownMenuItem(text = { Text(formatPlaybackRate(rate), color = if (kotlin.math.abs(rate - state.playbackSpeed) < 0.01f) BilibiliPink else Color.Unspecified) }, onClick = { player?.setPlaybackSpeed(rate); onPreferencesChange(preferences.copy(preferredRate = rate)); speedMenu = false }) }
                         }
                     }
                     Box {
+                        val qualityLabel = if (preferredQuality == null) {
+                            state.availableQualities.firstOrNull { it.id == state.deliveredQuality }?.title ?: "自动"
+                        } else {
+                            state.availableQualities.firstOrNull { it.id == preferredQuality }?.title ?: "画质"
+                        }
                         TextButton(onClick = { qualityMenu = true }, contentPadding = PaddingValues(horizontal = 4.dp)) {
-                            Text(if (preferredQuality == null) "自动" else state.availableQualities.firstOrNull { it.id == preferredQuality }?.title ?: "画质", color = Color.White, maxLines = 1)
+                            Text(qualityLabel, color = Color.White, maxLines = 1, fontSize = 13.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold)
                         }
                         DropdownMenu(expanded = qualityMenu, onDismissRequest = { qualityMenu = false }) {
                             if (state.deliveredQuality > 0) DropdownMenuItem(text = { Text("当前播放：${state.availableQualities.firstOrNull { it.id == state.deliveredQuality }?.title ?: state.deliveredQuality}") }, enabled = false, onClick = {})
-                            DropdownMenuItem(text = { Text(if (preferredQuality == null) "✓ 自动" else "自动") }, onClick = { onQualityChange(null); qualityMenu = false })
-                            state.availableQualities.forEach { quality -> DropdownMenuItem(text = { Text("${if (preferredQuality == quality.id) "✓ " else ""}${quality.title}") }, onClick = { onQualityChange(quality.id); qualityMenu = false }) }
+                            DropdownMenuItem(
+                                text = {
+                                    Text(
+                                        text = "自动",
+                                        color = if (preferredQuality == null) BilibiliPink else Color.Unspecified,
+                                        fontWeight = if (preferredQuality == null) androidx.compose.ui.text.font.FontWeight.SemiBold else null,
+                                    )
+                                },
+                                onClick = { onQualityChange(null); qualityMenu = false },
+                            )
+                            state.availableQualities.forEach { quality ->
+                                val isSelected = preferredQuality == quality.id
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            text = quality.title,
+                                            color = if (isSelected) BilibiliPink else Color.Unspecified,
+                                            fontWeight = if (isSelected) androidx.compose.ui.text.font.FontWeight.SemiBold else null,
+                                        )
+                                    },
+                                    onClick = { onQualityChange(quality.id); qualityMenu = false },
+                                )
+                            }
                         }
                     }
                     IconButton(onClick = onToggleFullscreen) { Icon(if (isFullscreen) Icons.Filled.CloseFullscreen else Icons.Filled.OpenInFull, if (isFullscreen) "退出全屏" else "全屏", tint = Color.White) }
                 }
             }
+        }
+        if (!controlsVisible && duration > 0) {
+            VideoMiniProgress(
+                positionMillis = if (scrubbing) seekPosition else positionMillis(),
+                bufferedMillis = player?.bufferedPosition?.coerceAtLeast(0) ?: 0L,
+                durationMillis = duration,
+                modifier = Modifier.align(Alignment.BottomCenter),
+            )
         }
         if (state.isRecovering || (state.isBuffering && player?.playWhenReady == true)) {
             Column(Modifier.align(Alignment.Center).background(Color.Black.copy(alpha = 0.65f), RoundedCornerShape(12.dp)).padding(12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -305,8 +341,29 @@ internal fun VideoPlaybackOverlay(
                 TextButton(onClick = onRetryPlayback) { Text("重试", color = Color.White) }
             }
         }
-        val transient = if (holding) "3× 快进中" else gestureMessage
-        transient?.let { Text(it, color = Color.White, modifier = Modifier.align(Alignment.TopCenter).padding(top = 52.dp).background(Color.Black.copy(alpha = 0.65f), RoundedCornerShape(8.dp)).padding(8.dp)) }
+        if (holding) {
+            Row(
+                Modifier.align(Alignment.TopCenter).padding(top = if (isFullscreen) 20.dp else 12.dp)
+                    .background(Color.Black.copy(alpha = 0.65f), RoundedCornerShape(50)).padding(horizontal = 12.dp, vertical = 7.dp),
+                verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Icon(Icons.Filled.FastForward, null, tint = BilibiliPink, modifier = Modifier.size(16.dp))
+                Text("3× 倍速播放中", color = Color.White, fontSize = 13.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold)
+            }
+        }
+        if (scrubbing) {
+            Text(
+                "${formatPlaybackTime(seekPosition)} / ${formatPlaybackTime(duration)}",
+                color = Color.White,
+                fontSize = if (isFullscreen) 22.sp else 16.sp,
+                fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold,
+                fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                modifier = Modifier.align(Alignment.Center).background(Color.Black.copy(alpha = 0.7f), RoundedCornerShape(12.dp)).padding(horizontal = 16.dp, vertical = 10.dp),
+            )
+        }
+        gestureMessage?.takeIf { !scrubbing }?.let { message ->
+            Text(message, color = Color.White, fontSize = 14.sp, modifier = Modifier.align(Alignment.Center).background(Color.Black.copy(alpha = 0.65f), RoundedCornerShape(10.dp)).padding(horizontal = 14.dp, vertical = 10.dp))
+        }
     }
     if (settingsOpen) {
         ModalBottomSheet(onDismissRequest = { settingsOpen = false }) {

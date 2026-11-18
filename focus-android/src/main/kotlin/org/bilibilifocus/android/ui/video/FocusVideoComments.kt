@@ -1,5 +1,6 @@
 package org.bilibilifocus.android.ui.video
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -28,6 +29,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
+import org.bilibilifocus.android.images.FocusImageCDNRequest
 import org.bilibilifocus.android.ui.FocusImageGalleryRequest
 import org.bilibilifocus.android.ui.FocusRichText
 import org.bilibilifocus.core.model.VideoComment
@@ -44,6 +46,7 @@ internal fun CommentItem(
     onLike: (() -> Unit)? = null,
     onDelete: (() -> Unit)? = null,
     actionsEnabled: Boolean = true,
+    referer: String = "https://www.bilibili.com/",
 ) {
     val contentStyle = MaterialTheme.typography.bodyMedium.let {
         it.copy(fontSize = it.fontSize * 1.15f)
@@ -66,11 +69,14 @@ internal fun CommentItem(
         ) {
             AsyncImage(
                 model = ImageRequest.Builder(LocalContext.current)
-                    .data(comment.avatarURL)
+                    .data(FocusImageCDNRequest.canonicalURL(comment.avatarURL))
                     .crossfade(true)
                     .build(),
                 contentDescription = null,
-                modifier = Modifier.size(28.dp).clip(CircleShape),
+                modifier = Modifier
+                    .size(28.dp)
+                    .clip(CircleShape)
+                    .background(MaterialTheme.colorScheme.surfaceVariant),
                 contentScale = ContentScale.Crop,
             )
             Text(comment.authorName, style = authorStyle, color = MaterialTheme.colorScheme.primary)
@@ -83,7 +89,7 @@ internal fun CommentItem(
             if (onLike == null) Text("${comment.likeCount}赞", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         FocusRichText(comment.contentRuns, style = contentStyle, onOpenURL = onOpenURL)
-        CommentImageStrip(comment.imageURLs, onOpenImage, referer = "https://www.bilibili.com/")
+        CommentImageStrip(comment.imageURLs, onOpenImage, referer = referer)
 
         if (onReply != null || onLike != null || onDelete != null) Row {
             if (onLike != null) TextButton(onClick = onLike, enabled = actionsEnabled) { Text("${if (comment.isLiked) "已赞" else "赞"} ${comment.likeCount}") }
@@ -101,7 +107,7 @@ internal fun CommentItem(
                         onOpenURL = onOpenURL,
                     )
                 }
-                CommentImageStrip(reply.imageURLs, onOpenImage, referer = "https://www.bilibili.com/")
+                CommentImageStrip(reply.imageURLs, onOpenImage, referer = referer)
             }
         }
     }
@@ -115,37 +121,78 @@ internal fun VideoCommentsSection(
     onOpenURL: (String) -> Unit,
     onOpenImage: (List<String>, Int) -> Unit,
 ) {
+    VideoCommentsSection(
+        comments = comments,
+        state = state,
+        onOpenURL = onOpenURL,
+        onOpenImage = onOpenImage,
+        onToggleLike = viewModel::toggleCommentLike,
+        onDelete = viewModel::deleteComment,
+        onLoadReplies = viewModel::loadReplies,
+        onLoadComments = viewModel::loadComments,
+        onSendComment = { message, root, parent, onSent ->
+            viewModel.sendComment(message, root, parent, onSent)
+        },
+    )
+}
+
+@Composable
+internal fun VideoCommentsSection(
+    comments: List<VideoComment>,
+    state: VideoCommentsUiState,
+    onOpenURL: (String) -> Unit,
+    onOpenImage: (List<String>, Int) -> Unit,
+    onToggleLike: (VideoComment) -> Unit,
+    onDelete: (VideoComment) -> Unit,
+    onLoadReplies: (VideoComment) -> Unit,
+    onLoadComments: (Boolean) -> Unit,
+    onSendComment: (String, VideoComment?, VideoComment?, () -> Unit) -> Unit,
+    totalCount: Int = 0,
+    referer: String = "https://www.bilibili.com/",
+) {
     var composing by remember { mutableStateOf(false) }
     var replyTarget by remember { mutableStateOf<Pair<VideoComment, VideoComment>?>(null) }
     var message by remember { mutableStateOf("") }
     var deleting by remember { mutableStateOf<VideoComment?>(null) }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("评论", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+            Text(
+                text = if (totalCount > 0) "评论 ($totalCount)" else "评论",
+                style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier.weight(1f),
+            )
             TextButton(onClick = { replyTarget = null; composing = true }) { Text("发表评论") }
         }
         comments.forEach { root ->
             CommentItem(
-                root, onOpenURL, onOpenImage, showReplies = false,
+                comment = root,
+                onOpenURL = onOpenURL,
+                onOpenImage = onOpenImage,
+                showReplies = false,
                 onReply = { replyTarget = root to root; composing = true },
-                onLike = { viewModel.toggleCommentLike(root) },
+                onLike = { onToggleLike(root) },
                 onDelete = if (state.accountMid == root.mid && root.mid > 0) ({ deleting = root }) else null,
                 actionsEnabled = root.rpid !in state.actionsInFlight,
+                referer = referer,
             )
             val replies = state.replies[root.rpid]
             (replies?.replies ?: root.replies.take(3)).forEach { reply ->
                 Column(Modifier.padding(start = 28.dp)) {
                     CommentItem(
-                        reply, onOpenURL, onOpenImage, showReplies = false,
+                        comment = reply,
+                        onOpenURL = onOpenURL,
+                        onOpenImage = onOpenImage,
+                        showReplies = false,
                         onReply = { replyTarget = root to reply; composing = true },
-                        onLike = { viewModel.toggleCommentLike(reply) },
+                        onLike = { onToggleLike(reply) },
                         onDelete = if (state.accountMid == reply.mid && reply.mid > 0) ({ deleting = reply }) else null,
                         actionsEnabled = reply.rpid !in state.actionsInFlight,
+                        referer = referer,
                     )
                 }
             }
             if (root.replyCount > 0 && (replies == null || replies.nextPage != null)) {
-                TextButton(onClick = { viewModel.loadReplies(root) }, enabled = replies?.isLoading != true) {
+                TextButton(onClick = { onLoadReplies(root) }, enabled = replies?.isLoading != true) {
                     Text(when { replies?.isLoading == true -> "加载回复中…"; replies?.error != null -> "回复加载失败，重试"; replies == null -> "展开 ${root.replyCount} 条回复"; else -> "更多回复" })
                 }
             }
@@ -155,9 +202,9 @@ internal fun VideoCommentsSection(
             state.isLoading -> CircularProgressIndicator(Modifier.size(24.dp))
             state.error != null -> {
                 Text(state.error, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
-                TextButton(onClick = { viewModel.loadComments(append = comments.isNotEmpty()) }) { Text("重试评论") }
+                TextButton(onClick = { onLoadComments(comments.isNotEmpty()) }) { Text("重试评论") }
             }
-            state.hasMore -> TextButton(onClick = { viewModel.loadComments(append = true) }) { Text("加载更多评论") }
+            state.hasMore -> TextButton(onClick = { onLoadComments(true) }) { Text("加载更多评论") }
             comments.isEmpty() -> Text("还没有评论", color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
@@ -172,14 +219,14 @@ internal fun VideoCommentsSection(
             )
         },
         confirmButton = { TextButton(
-            onClick = { viewModel.sendComment(message, replyTarget?.first, replyTarget?.second) { message = ""; composing = false; replyTarget = null } },
+            onClick = { onSendComment(message, replyTarget?.first, replyTarget?.second) { message = ""; composing = false; replyTarget = null } },
             enabled = message.isNotBlank() && !state.isSending,
         ) { Text(if (state.isSending) "发送中…" else "发送") } },
         dismissButton = { TextButton(onClick = { composing = false }, enabled = !state.isSending) { Text("取消") } },
     )
     deleting?.let { comment -> AlertDialog(
         onDismissRequest = { deleting = null }, title = { Text("删除这条评论？") },
-        confirmButton = { TextButton(onClick = { viewModel.deleteComment(comment); deleting = null }) { Text("删除", color = MaterialTheme.colorScheme.error) } },
+        confirmButton = { TextButton(onClick = { onDelete(comment); deleting = null }) { Text("删除", color = MaterialTheme.colorScheme.error) } },
         dismissButton = { TextButton(onClick = { deleting = null }) { Text("取消") } },
     ) }
 }
@@ -200,7 +247,7 @@ internal fun CommentImageStrip(
         imageURLs.forEachIndexed { index, imageURL ->
             AsyncImage(
                 model = ImageRequest.Builder(LocalContext.current)
-                    .data(imageURL)
+                    .data(FocusImageCDNRequest.canonicalURL(imageURL))
                     .addHeader("Referer", referer)
                     .crossfade(true)
                     .build(),
@@ -208,6 +255,7 @@ internal fun CommentImageStrip(
                 modifier = Modifier
                     .size(thumbnailWidth, thumbnailHeight)
                     .clip(RoundedCornerShape(8.dp))
+                    .background(MaterialTheme.colorScheme.surfaceVariant)
                     .clickable { onOpenImage(imageURLs, index) },
                 contentScale = ContentScale.Crop,
             )

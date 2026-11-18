@@ -8,6 +8,7 @@ import coil.ImageLoaderFactory
 import coil.decode.GifDecoder
 import coil.decode.ImageDecoderDecoder
 import org.bilibilifocus.android.images.FocusImageCDNInterceptor
+import org.bilibilifocus.android.images.FocusImageHttpClient
 import org.bilibilifocus.android.playback.AndroidFocusPlaybackPersistence
 import org.bilibilifocus.android.playback.FocusPlaybackProgressStore
 import org.bilibilifocus.android.playback.FocusPlaybackHistoryWorkScheduler
@@ -34,6 +35,7 @@ class FocusApplication : Application(), ImageLoaderFactory {
     }
 
     override fun newImageLoader(): ImageLoader = ImageLoader.Builder(this)
+        .okHttpClient { FocusImageHttpClient.create() }
         .components {
             add(FocusImageCDNInterceptor())
             if (Build.VERSION.SDK_INT >= 28) {

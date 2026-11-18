@@ -376,7 +376,10 @@ fun FocusApp(
 
             is OverlayRoute.Opus -> {
                 val viewModel = opusViewModels.getOrPut(route.id) {
-                    FocusOpusViewModel(service = appGraph.opusService)
+                    FocusOpusViewModel(
+                        service = appGraph.opusService,
+                        commentService = appGraph.videoInfoService,
+                    )
                 }
                 val listState = opusListStates.getOrPut(route.id) { LazyListState() }
                 FocusOpusScreen(
